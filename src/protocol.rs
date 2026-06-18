@@ -30,6 +30,7 @@ pub mod opcode {
     pub const AUTH_REQUEST: u16 = 17;
     pub const AUTH: u16 = 18;
     pub const LOGIN: u16 = 19;
+    pub const AUTH_CAPTCHA_REQUEST: u16 = 224;
     pub const MSG_SEND: u16 = 64;
     pub const MSG_TYPING: u16 = 65;
     pub const FILE_UPLOAD: u16 = 87;

@@ -1,7 +1,7 @@
 //! The asynchronous Max client.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +34,7 @@ struct Inner {
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
     seq: AtomicU32,
     cid: AtomicI64,
+    session_initialized: AtomicBool,
     user_agent: UserAgent,
     http: reqwest::Client,
 }
@@ -146,6 +147,7 @@ impl MaxClient {
             file_waiters: Mutex::new(HashMap::new()),
             seq: AtomicU32::new(1),
             cid: AtomicI64::new(chrono_millis()),
+            session_initialized: AtomicBool::new(false),
             user_agent,
             http,
         });
@@ -179,12 +181,57 @@ impl MaxClient {
     /// Sends the `SESSION_INIT` handshake. Called automatically by the auth
     /// helpers, but exposed for completeness.
     pub async fn session_init(&self) -> Result<()> {
+        if self
+            .inner
+            .session_initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
         let payload = json!({
             "userAgent": self.inner.user_agent,
             "deviceId": uuid::Uuid::new_v4().to_string(),
         });
-        self.inner.invoke(opcode::SESSION_INIT, payload).await?;
-        Ok(())
+        match self.inner.invoke(opcode::SESSION_INIT, payload).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.inner
+                    .session_initialized
+                    .store(false, Ordering::Release);
+                Err(err)
+            }
+        }
+    }
+
+    /// Requests a captcha challenge URL for SMS authentication.
+    ///
+    /// Browser-based callers can show this link in a VK captcha widget and pass
+    /// the resulting token to [`MaxClient::request_sms_code_with_captcha_token`].
+    pub async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
+        self.session_init().await?;
+        let payload = json!({
+            "source": "auth",
+            "identifier": phone,
+        });
+        match self
+            .inner
+            .invoke(opcode::AUTH_CAPTCHA_REQUEST, payload)
+            .await
+        {
+            Ok(response) => Ok(response.payload["link"].as_str().map(str::to_string)),
+            Err(Error::Server { opcode, message })
+                if message == "captcha.create-session-failed" =>
+            {
+                tracing::debug!(
+                    opcode,
+                    "captcha session creation failed; continuing without token"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Step 1 of SMS auth: requests that the server send an SMS code to `phone`.
@@ -192,11 +239,26 @@ impl MaxClient {
     /// Returns a short-lived token that must be passed to
     /// [`MaxClient::verify_sms_code`] together with the received code.
     pub async fn request_sms_code(&self, phone: &str) -> Result<String> {
+        if let Some(link) = self.request_auth_captcha(phone).await? {
+            return Err(Error::CaptchaRequired { link });
+        }
+
+        self.request_sms_code_with_captcha_token(phone, "").await
+    }
+
+    /// Step 1 of SMS auth with a captcha token obtained from
+    /// [`MaxClient::request_auth_captcha`].
+    pub async fn request_sms_code_with_captcha_token(
+        &self,
+        phone: &str,
+        captcha_token: &str,
+    ) -> Result<String> {
         self.session_init().await?;
         let payload = json!({
             "phone": phone,
             "type": "START_AUTH",
             "language": "ru",
+            "captchaToken": captcha_token,
         });
         let response = self.inner.invoke(opcode::AUTH_REQUEST, payload).await?;
         response.payload["token"]

@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cppvsdbg",
+            "request": "launch",
+            "name": "Debug maxrs CLI",
+            "program": "${workspaceFolder}/target/debug/examples/cli.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build --example cli",
+            "environment": [
+                {
+                    "name": "RUST_BACKTRACE",
+                    "value": "1"
+                }
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}

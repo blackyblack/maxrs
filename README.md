@@ -10,6 +10,8 @@ needed to build a minimal custom client.
 
 ## Features
 
+- Captcha-aware SMS authentication preflight for the current web auth flow
+
 - SMS authentication (request code → verify code → login)
 - Re-login with an in-memory session token (no SMS)
 - Send text messages
@@ -39,10 +41,17 @@ The handshake/auth sequence is:
 
 ```
 SESSION_INIT (6)
+  -> AUTH_CAPTCHA_REQUEST (224, phone) -> captcha link
   → AUTH_REQUEST (17, phone)   → sms token
   → AUTH (18, sms token, code) → session token
   → LOGIN (19, session token)  → profile + chats
 ```
+
+`AUTH_REQUEST` includes `captchaToken` in the current web flow. If
+`request_sms_code` returns `Error::CaptchaRequired`, a browser-capable caller
+must render the returned captcha link with the VK captcha widget and call
+`request_sms_code_with_captcha_token` with the resulting token. The terminal demo
+cannot render that widget.
 
 Incoming messages arrive as server-initiated `NOTIF_MESSAGE` (128) frames and are
 forwarded to an async channel.

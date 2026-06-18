@@ -35,6 +35,7 @@ the server does not drop the connection.
 | ------ | ------------- | --------------- |
 | 1      | PING          | client → server |
 | 6      | SESSION_INIT  | client → server |
+| 224    | AUTH_CAPTCHA_REQUEST | client -> server |
 | 17     | AUTH_REQUEST  | client → server |
 | 18     | AUTH          | client → server |
 | 19     | LOGIN         | client → server |
@@ -52,10 +53,26 @@ the server does not drop the connection.
    { "userAgent": { "deviceType": "WEB", "...": "..." }, "deviceId": "<uuid>" }
    ```
 
+   Current web auth then performs **AUTH_CAPTCHA_REQUEST (224)** before
+   requesting the SMS code:
+
+   ```json
+   { "source": "auth", "identifier": "+79990000000" }
+   ```
+
+   Response payload may contain `link`. The official web client renders that
+   link in a VK captcha widget and passes the resulting `captchaToken` to
+   AUTH_REQUEST.
+
 2. **AUTH_REQUEST (17)** — asks the server to send an SMS code.
 
    ```json
-   { "phone": "+79990000000", "type": "START_AUTH", "language": "ru" }
+   {
+     "phone": "+79990000000",
+     "type": "START_AUTH",
+     "language": "ru",
+     "captchaToken": "<captcha token or empty string>"
+   }
    ```
 
    Response payload contains a short-lived `token` (the "SMS token").

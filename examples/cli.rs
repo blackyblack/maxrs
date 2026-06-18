@@ -14,7 +14,7 @@
 
 use std::io::Write;
 
-use maxrs::MaxClient;
+use maxrs::{Error, MaxClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,7 +41,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let phone = prompt("Phone number (e.g. +79990000000): ").await?;
-    let sms_token = client.request_sms_code(phone.trim()).await?;
+    let sms_token = match client.request_sms_code(phone.trim()).await {
+        Ok(token) => token,
+        Err(Error::CaptchaRequired { link }) => {
+            eprintln!("SMS login requires a captcha challenge first.");
+            eprintln!("Captcha URL: {link}");
+            eprintln!(
+                "This terminal example cannot render the VK captcha widget. \
+                 Use a saved session token with login_with_token, or complete \
+                 this captcha in a browser-capable integration and call \
+                 request_sms_code_with_captcha_token."
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     println!("SMS code requested.");
 
     let code = prompt("Enter the SMS code: ").await?;

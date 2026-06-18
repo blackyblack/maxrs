@@ -19,6 +19,10 @@ pub enum Error {
     #[error("server error (opcode {opcode}): {message}")]
     Server { opcode: u16, message: String },
 
+    /// SMS authentication requires completing a captcha challenge in a browser.
+    #[error("captcha required before requesting SMS code: {link}")]
+    CaptchaRequired { link: String },
+
     /// A response did not arrive within the configured timeout.
     #[error("timed out waiting for response to opcode {0}")]
     Timeout(u16),
