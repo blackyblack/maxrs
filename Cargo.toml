@@ -1,0 +1,26 @@
+[package]
+name = "maxrs"
+version = "0.1.0"
+edition = "2021"
+description = "Proof-of-concept async Rust client for the Max (OneMe) messenger WebSocket API"
+license = "MIT"
+repository = "https://github.com/blackyblack/maxrs"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-std", "io-util", "fs", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "cli"
+path = "examples/cli.rs"

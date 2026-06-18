@@ -1,0 +1,494 @@
+//! The asynchronous Max client.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+use crate::error::{Error, Result};
+use crate::models::{IncomingMessage, Session, UserAgent, BROWSER_USER_AGENT};
+use crate::protocol::{opcode, Packet, CMD_ERROR};
+
+const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
+const ORIGIN: &str = "https://web.max.ru";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsSink = SplitSink<WsStream, Message>;
+
+struct Inner {
+    sink: Mutex<WsSink>,
+    pending: Mutex<HashMap<u32, oneshot::Sender<Packet>>>,
+    file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
+    seq: AtomicU32,
+    cid: AtomicI64,
+    user_agent: UserAgent,
+    http: reqwest::Client,
+}
+
+impl Inner {
+    fn next_seq(&self) -> u32 {
+        self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn next_cid(&self) -> i64 {
+        let now = chrono_millis();
+        // Ensure strictly increasing, unique client ids.
+        let mut prev = self.cid.load(Ordering::Relaxed);
+        loop {
+            let next = now.max(prev + 1);
+            match self
+                .cid
+                .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return next,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    async fn send_packet(&self, packet: &Packet) -> Result<()> {
+        let text = serde_json::to_string(packet)?;
+        let mut sink = self.sink.lock().await;
+        sink.send(Message::text(text)).await?;
+        Ok(())
+    }
+
+    async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
+        let seq = self.next_seq();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(seq, tx);
+        }
+
+        let packet = Packet::request(seq, opcode, payload);
+        if let Err(err) = self.send_packet(&packet).await {
+            self.pending.lock().await.remove(&seq);
+            return Err(err);
+        }
+
+        match tokio::time::timeout(DEFAULT_TIMEOUT, rx).await {
+            Ok(Ok(response)) => {
+                if response.cmd == CMD_ERROR {
+                    return Err(Error::Server {
+                        opcode,
+                        message: error_message(&response.payload),
+                    });
+                }
+                Ok(response)
+            }
+            // Sender dropped -> connection closed.
+            Ok(Err(_)) => Err(Error::ConnectionClosed),
+            Err(_) => {
+                self.pending.lock().await.remove(&seq);
+                Err(Error::Timeout(opcode))
+            }
+        }
+    }
+}
+
+/// An asynchronous client for the Max (OneMe) WebSocket API.
+///
+/// The client is cheap to clone (`Arc` inside); clones share the same
+/// connection, so you can move one clone into a background task to listen for
+/// messages while sending from another.
+#[derive(Clone)]
+pub struct MaxClient {
+    inner: Arc<Inner>,
+}
+
+impl MaxClient {
+    /// Opens a WebSocket connection and starts the background read and
+    /// keepalive tasks.
+    ///
+    /// Returns the client together with a receiver of [`IncomingMessage`]s that
+    /// the server pushes (`NOTIF_MESSAGE`). Authenticate next with
+    /// [`MaxClient::request_sms_code`] / [`MaxClient::verify_sms_code`] or
+    /// [`MaxClient::login_with_token`].
+    pub async fn connect() -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
+        Self::connect_with(UserAgent::default()).await
+    }
+
+    /// Like [`MaxClient::connect`] but with a custom [`UserAgent`].
+    pub async fn connect_with(
+        user_agent: UserAgent,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
+        let mut request = WS_URL.into_client_request()?;
+        {
+            let headers = request.headers_mut();
+            headers.insert("Origin", HeaderValue::from_static(ORIGIN));
+            headers.insert("User-Agent", HeaderValue::from_static(BROWSER_USER_AGENT));
+        }
+
+        let (stream, _response) = connect_async(request).await?;
+        let (sink, read) = stream.split();
+
+        let http = reqwest::Client::builder()
+            .user_agent(BROWSER_USER_AGENT)
+            .build()?;
+
+        let inner = Arc::new(Inner {
+            sink: Mutex::new(sink),
+            pending: Mutex::new(HashMap::new()),
+            file_waiters: Mutex::new(HashMap::new()),
+            seq: AtomicU32::new(1),
+            cid: AtomicI64::new(chrono_millis()),
+            user_agent,
+            http,
+        });
+
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(read_loop(read, Arc::clone(&inner), msg_tx));
+
+        let client = MaxClient { inner };
+        client.spawn_keepalive();
+
+        Ok((client, msg_rx))
+    }
+
+    fn spawn_keepalive(&self) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+                if inner
+                    .invoke(opcode::PING, json!({ "interactive": false }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Sends the `SESSION_INIT` handshake. Called automatically by the auth
+    /// helpers, but exposed for completeness.
+    pub async fn session_init(&self) -> Result<()> {
+        let payload = json!({
+            "userAgent": self.inner.user_agent,
+            "deviceId": uuid::Uuid::new_v4().to_string(),
+        });
+        self.inner.invoke(opcode::SESSION_INIT, payload).await?;
+        Ok(())
+    }
+
+    /// Step 1 of SMS auth: requests that the server send an SMS code to `phone`.
+    ///
+    /// Returns a short-lived token that must be passed to
+    /// [`MaxClient::verify_sms_code`] together with the received code.
+    pub async fn request_sms_code(&self, phone: &str) -> Result<String> {
+        self.session_init().await?;
+        let payload = json!({
+            "phone": phone,
+            "type": "START_AUTH",
+            "language": "ru",
+        });
+        let response = self.inner.invoke(opcode::AUTH_REQUEST, payload).await?;
+        response.payload["token"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::UnexpectedResponse("missing auth token".into()))
+    }
+
+    /// Step 2 of SMS auth: verifies the code and logs in.
+    ///
+    /// On success the long-lived session token (kept in memory) is returned in
+    /// [`Session`]; store it to re-login later via
+    /// [`MaxClient::login_with_token`] without a new SMS.
+    pub async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
+        let payload = json!({
+            "token": sms_token,
+            "verifyCode": code,
+            "authTokenType": "CHECK_CODE",
+        });
+        let response = self.inner.invoke(opcode::AUTH, payload).await?;
+        let token = response.payload["tokenAttrs"]["LOGIN"]["token"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))?;
+
+        self.login(&token).await
+    }
+
+    /// Logs in with a previously obtained session token.
+    pub async fn login_with_token(&self, token: &str) -> Result<Session> {
+        self.session_init().await?;
+        self.login(token).await
+    }
+
+    async fn login(&self, token: &str) -> Result<Session> {
+        let payload = json!({
+            "interactive": true,
+            "token": token,
+            "chatsSync": 0,
+            "contactsSync": 0,
+            "presenceSync": 0,
+            "draftsSync": 0,
+            "chatsCount": 40,
+        });
+        let response = self.inner.invoke(opcode::LOGIN, payload).await?;
+        Ok(Session {
+            token: token.to_string(),
+            login_payload: response.payload,
+        })
+    }
+
+    /// Sends a plain text message to `chat_id`.
+    pub async fn send_text(&self, chat_id: i64, text: &str) -> Result<()> {
+        let payload = json!({
+            "chatId": chat_id,
+            "message": {
+                "text": text,
+                "cid": self.inner.next_cid(),
+                "elements": [],
+                "attaches": [],
+            },
+            "notify": true,
+        });
+        self.inner.invoke(opcode::MSG_SEND, payload).await?;
+        Ok(())
+    }
+
+    /// Sends a "typing..." notification to `chat_id`.
+    pub async fn send_typing(&self, chat_id: i64) -> Result<()> {
+        let payload = json!({
+            "chatId": chat_id,
+            "type": "TYPING",
+        });
+        self.inner.invoke(opcode::MSG_TYPING, payload).await?;
+        Ok(())
+    }
+
+    /// Uploads a local file and sends it to `chat_id` with an optional caption.
+    ///
+    /// Implements the three-step flow: request an upload URL (`FILE_UPLOAD`),
+    /// HTTP `POST` the bytes, wait for the server's `NOTIF_ATTACH`
+    /// confirmation, then send a message referencing the uploaded file.
+    pub async fn send_file(
+        &self,
+        chat_id: i64,
+        path: impl AsRef<std::path::Path>,
+        caption: &str,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let bytes = tokio::fs::read(path).await?;
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+
+        let response = self
+            .inner
+            .invoke(opcode::FILE_UPLOAD, json!({ "count": 1 }))
+            .await?;
+        let info = response.payload["info"]
+            .get(0)
+            .ok_or_else(|| Error::UnexpectedResponse("empty file upload info".into()))?;
+        let url = info["url"]
+            .as_str()
+            .ok_or_else(|| Error::UnexpectedResponse("missing upload url".into()))?
+            .to_string();
+        let file_id = info["fileId"]
+            .as_i64()
+            .ok_or_else(|| Error::UnexpectedResponse("missing fileId".into()))?;
+
+        // Register a waiter for the NOTIF_ATTACH confirmation before uploading.
+        let (tx, rx) = oneshot::channel();
+        self.inner.file_waiters.lock().await.insert(file_id, tx);
+
+        let size = bytes.len();
+        let result = self
+            .inner
+            .http
+            .post(&url)
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename={file_name}"),
+            )
+            .header("Content-Length", size.to_string())
+            .header(
+                "Content-Range",
+                format!("0-{}/{}", size.saturating_sub(1), size),
+            )
+            .body(bytes)
+            .send()
+            .await;
+
+        if let Err(err) = result {
+            self.inner.file_waiters.lock().await.remove(&file_id);
+            return Err(err.into());
+        }
+
+        // Best effort: wait for processing confirmation, but proceed on timeout.
+        let _ = tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx).await;
+        self.inner.file_waiters.lock().await.remove(&file_id);
+
+        let payload = json!({
+            "chatId": chat_id,
+            "message": {
+                "text": caption,
+                "cid": self.inner.next_cid(),
+                "elements": [],
+                "attaches": [{ "_type": "FILE", "fileId": file_id }],
+            },
+            "notify": true,
+        });
+        self.inner.invoke(opcode::MSG_SEND, payload).await?;
+        Ok(())
+    }
+
+    /// Sends a single keepalive ping. Mostly useful for tests; the background
+    /// task pings automatically.
+    pub async fn ping(&self) -> Result<()> {
+        self.inner
+            .invoke(opcode::PING, json!({ "interactive": false }))
+            .await?;
+        Ok(())
+    }
+}
+
+async fn read_loop(
+    mut read: SplitStream<WsStream>,
+    inner: Arc<Inner>,
+    msg_tx: mpsc::UnboundedSender<IncomingMessage>,
+) {
+    while let Some(frame) = read.next().await {
+        let text = match frame {
+            Ok(Message::Text(text)) => text.to_string(),
+            Ok(Message::Binary(bin)) => match String::from_utf8(bin.to_vec()) {
+                Ok(text) => text,
+                Err(_) => continue,
+            },
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => continue,
+        };
+
+        let packet: Packet = match serde_json::from_str(&text) {
+            Ok(packet) => packet,
+            Err(err) => {
+                tracing::warn!(%err, "failed to parse frame");
+                continue;
+            }
+        };
+
+        if packet.is_request() {
+            handle_server_request(&inner, &msg_tx, packet).await;
+        } else if let Some(tx) = inner.pending.lock().await.remove(&packet.seq) {
+            let _ = tx.send(packet);
+        }
+    }
+
+    // Connection ended: drop all pending senders so callers get ConnectionClosed.
+    inner.pending.lock().await.clear();
+    inner.file_waiters.lock().await.clear();
+}
+
+async fn handle_server_request(
+    inner: &Arc<Inner>,
+    msg_tx: &mpsc::UnboundedSender<IncomingMessage>,
+    packet: Packet,
+) {
+    match packet.opcode {
+        opcode::NOTIF_MESSAGE => {
+            if let Some(message) = parse_incoming(&packet.payload) {
+                // Acknowledge the push, mirroring the official web client.
+                let ack = Packet::response(
+                    packet.seq,
+                    packet.opcode,
+                    json!({ "chatId": message.chat_id, "messageId": message.message_id }),
+                );
+                let _ = inner.send_packet(&ack).await;
+                let _ = msg_tx.send(message);
+            }
+        }
+        opcode::NOTIF_ATTACH => {
+            if let Some(file_id) = packet.payload["fileId"].as_i64() {
+                if let Some(tx) = inner.file_waiters.lock().await.remove(&file_id) {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_incoming(payload: &Value) -> Option<IncomingMessage> {
+    let chat_id = payload["chatId"].as_i64()?;
+    let message = &payload["message"];
+    Some(IncomingMessage {
+        chat_id,
+        message_id: message["id"].as_i64().unwrap_or_default(),
+        sender: message["sender"].as_i64().unwrap_or_default(),
+        text: message["text"].as_str().unwrap_or_default().to_string(),
+        time: message["time"].as_i64().unwrap_or_default(),
+    })
+}
+
+fn error_message(payload: &Value) -> String {
+    payload["error"]
+        .as_str()
+        .or_else(|| payload["message"].as_str())
+        .or_else(|| payload["localizedMessage"].as_str())
+        .unwrap_or("unknown error")
+        .to_string()
+}
+
+fn chrono_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_incoming_notif_message() {
+        let payload = json!({
+            "chatId": -100,
+            "message": {
+                "id": 555,
+                "sender": 777,
+                "text": "hi there",
+                "time": 1_700_000_000_000i64,
+            }
+        });
+        let msg = parse_incoming(&payload).expect("should parse");
+        assert_eq!(msg.chat_id, -100);
+        assert_eq!(msg.message_id, 555);
+        assert_eq!(msg.sender, 777);
+        assert_eq!(msg.text, "hi there");
+        assert_eq!(msg.time, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn missing_chat_id_is_not_a_message() {
+        assert!(parse_incoming(&json!({ "message": { "text": "x" } })).is_none());
+    }
+
+    #[test]
+    fn extracts_error_message() {
+        assert_eq!(error_message(&json!({ "error": "boom" })), "boom");
+        assert_eq!(error_message(&json!({ "message": "m" })), "m");
+        assert_eq!(error_message(&json!({})), "unknown error");
+    }
+}
