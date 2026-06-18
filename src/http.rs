@@ -9,6 +9,8 @@ use tokio::net::TcpListener;
 
 use crate::error::{Error, Result};
 
+const MAX_HEADER_SIZE: usize = 16 * 1024;
+
 type RouteHandler = Arc<
     dyn Fn(HttpRequest) -> Pin<Box<dyn Future<Output = Result<HttpResponse>> + Send>> + Send + Sync,
 >;
@@ -144,8 +146,8 @@ async fn read_request(
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > max_body_size {
-            return Err(Error::UnexpectedResponse("HTTP request too large".into()));
+        if buffer.len() > MAX_HEADER_SIZE {
+            return Err(Error::UnexpectedResponse("HTTP headers too large".into()));
         }
         header_end = find_header_end(&buffer);
     }
@@ -195,10 +197,8 @@ async fn read_request(
                 "unexpected EOF while reading HTTP body".into(),
             ));
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > body_start + content_length {
-            buffer.truncate(body_start + content_length);
-        }
+        let remaining = body_start + content_length - buffer.len();
+        buffer.extend_from_slice(&chunk[..read.min(remaining)]);
     }
 
     Ok(HttpRequest {
@@ -233,4 +233,35 @@ async fn write_response(stream: &mut tokio::net::TcpStream, response: HttpRespon
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepts_large_headers_with_small_body_limit() {
+        let mut server =
+            HttpServer::bind(HttpServerConfig::new("127.0.0.1:0").with_max_body_size(8))
+                .await
+                .unwrap();
+        server.route("POST", "/callback", |_request| async {
+            Ok(HttpResponse::no_content())
+        });
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/callback"))
+            .header("X-Test", "a".repeat(256))
+            .body("ok")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
 }
