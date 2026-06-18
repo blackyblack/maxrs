@@ -6,6 +6,7 @@
 //! and expire after the configured timeout (one hour by default).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::models::BROWSER_USER_AGENT;
+use crate::http::{HttpResponse, HttpServer};
 
 const DEFAULT_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -26,17 +27,14 @@ pub struct CaptchaSolverConfig {
     /// Public callback URL that the solver should `POST` to when the challenge
     /// is solved. If unset, the field is omitted from `/solve` requests.
     pub callback_url: Option<String>,
-    /// How long unfinished in-memory challenges may wait for a callback.
-    pub challenge_timeout: Duration,
 }
 
 impl CaptchaSolverConfig {
-    /// Builds enabled solver configuration with the default one-hour timeout.
+    /// Builds enabled solver configuration.
     pub fn new(solver_url: impl Into<String>, callback_url: impl Into<String>) -> Self {
         Self {
             solver_url: Some(solver_url.into()),
             callback_url: Some(callback_url.into()),
-            challenge_timeout: DEFAULT_CHALLENGE_TIMEOUT,
         }
     }
 
@@ -45,12 +43,6 @@ impl CaptchaSolverConfig {
     pub fn disabled() -> Self {
         Self::default()
     }
-
-    /// Overrides the unfinished challenge timeout.
-    pub fn with_challenge_timeout(mut self, timeout: Duration) -> Self {
-        self.challenge_timeout = timeout;
-        self
-    }
 }
 
 impl Default for CaptchaSolverConfig {
@@ -58,7 +50,6 @@ impl Default for CaptchaSolverConfig {
         Self {
             solver_url: None,
             callback_url: None,
-            challenge_timeout: DEFAULT_CHALLENGE_TIMEOUT,
         }
     }
 }
@@ -86,12 +77,9 @@ struct PendingChallenge {
 impl CaptchaSolver {
     /// Creates a solver integration from configuration.
     pub fn new(config: CaptchaSolverConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(BROWSER_USER_AGENT)
-            .build()?;
         Ok(Self {
             config,
-            http,
+            http: reqwest::Client::new(),
             pending: Mutex::new(HashMap::new()),
         })
     }
@@ -104,9 +92,8 @@ impl CaptchaSolver {
     /// Starts solving `captcha_url` and waits for the callback token.
     ///
     /// The `/solve` request returns immediately, while this method waits up to
-    /// [`CaptchaSolverConfig::challenge_timeout`] for
-    /// [`CaptchaSolver::handle_callback_json`] to receive an `ok` or `failed`
-    /// callback for the generated challenge id.
+    /// one hour for [`CaptchaSolver::handle_callback_json`] to receive an `ok`
+    /// or `failed` callback for the generated challenge id.
     pub async fn solve(&self, captcha_url: &str) -> Result<String> {
         self.cleanup_expired().await;
 
@@ -126,9 +113,9 @@ impl CaptchaSolver {
         );
 
         let request = SolveRequest {
-            challenge_id: &challenge_id,
-            captcha_url,
-            callback_url: self.config.callback_url.as_deref(),
+            challenge_id: challenge_id.clone(),
+            captcha_url: captcha_url.to_string(),
+            callback_url: self.config.callback_url.clone(),
         };
         let result = self
             .http
@@ -143,7 +130,7 @@ impl CaptchaSolver {
             return Err(err.into());
         }
 
-        let callback = match tokio::time::timeout(self.config.challenge_timeout, rx).await {
+        let callback = match tokio::time::timeout(DEFAULT_CHALLENGE_TIMEOUT, rx).await {
             Ok(Ok(callback)) => callback,
             Ok(Err(_)) => return Err(Error::CaptchaFailed("callback waiter dropped".into())),
             Err(_) => {
@@ -174,8 +161,25 @@ impl CaptchaSolver {
         self.handle_callback(callback).await
     }
 
+    /// Registers a `POST` callback route on an HTTP server.
+    pub fn register_callback_route(
+        self: &Arc<Self>,
+        server: &mut HttpServer,
+        path: impl Into<String>,
+    ) {
+        let solver = Arc::clone(self);
+        let path = path.into();
+        server.route("POST", path, move |request| {
+            let solver = Arc::clone(&solver);
+            async move {
+                solver.handle_callback_json(&request.body).await?;
+                Ok(HttpResponse::no_content())
+            }
+        });
+    }
+
     /// Handles an already decoded solver callback payload.
-    pub async fn handle_callback(&self, callback: CaptchaCallback) -> Result<()> {
+    async fn handle_callback(&self, callback: CaptchaCallback) -> Result<()> {
         self.cleanup_expired().await;
         let challenge_id = callback.challenge_id.clone();
         let pending = self.pending.lock().await.remove(&challenge_id);
@@ -190,21 +194,20 @@ impl CaptchaSolver {
 
     /// Removes expired unfinished challenges from memory.
     pub async fn cleanup_expired(&self) {
-        let timeout = self.config.challenge_timeout;
         self.pending
             .lock()
             .await
-            .retain(|_, pending| pending.created_at.elapsed() < timeout);
+            .retain(|_, pending| pending.created_at.elapsed() < DEFAULT_CHALLENGE_TIMEOUT);
     }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SolveRequest<'a> {
-    challenge_id: &'a str,
-    captcha_url: &'a str,
+struct SolveRequest {
+    challenge_id: String,
+    captcha_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    callback_url: Option<&'a str>,
+    callback_url: Option<String>,
 }
 
 /// Payload posted by `max_captcha_solver` to the configured callback URL.
@@ -220,14 +223,15 @@ pub struct CaptchaCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::{HttpServer, HttpServerConfig};
     use serde_json::json;
 
     #[test]
     fn solve_request_serializes_solver_payload() {
         let request = SolveRequest {
-            challenge_id: "id-1",
-            captcha_url: "https://id.vk.ru/not_robot_captcha",
-            callback_url: Some("https://max-login.example/captcha-callback"),
+            challenge_id: "id-1".into(),
+            captcha_url: "https://id.vk.ru/not_robot_captcha".into(),
+            callback_url: Some("https://max-login.example/captcha-callback".into()),
         };
 
         let value = serde_json::to_value(request).unwrap();
@@ -244,8 +248,8 @@ mod tests {
     #[test]
     fn solve_request_omits_optional_callback_url() {
         let request = SolveRequest {
-            challenge_id: "id-1",
-            captcha_url: "https://id.vk.ru/not_robot_captcha",
+            challenge_id: "id-1".into(),
+            captcha_url: "https://id.vk.ru/not_robot_captcha".into(),
             callback_url: None,
         };
 
@@ -271,5 +275,44 @@ mod tests {
             err,
             Error::UnknownCaptchaChallenge { challenge_id } if challenge_id == "missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn callback_route_forwards_http_posts_to_solver() {
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
+        let (tx, rx) = oneshot::channel();
+        solver.pending.lock().await.insert(
+            "challenge-1".into(),
+            PendingChallenge {
+                created_at: Instant::now(),
+                tx,
+            },
+        );
+
+        let mut server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
+            .await
+            .unwrap();
+        solver.register_callback_route(&mut server, "/captcha-callback");
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/captcha-callback"))
+            .json(&json!({
+                "challengeId": "challenge-1",
+                "status": "ok",
+                "token": "session",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let callback = rx.await.unwrap();
+        assert_eq!(callback.challenge_id, "challenge-1");
+        assert_eq!(callback.token.as_deref(), Some("session"));
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 }

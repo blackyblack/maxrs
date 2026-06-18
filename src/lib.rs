@@ -44,10 +44,12 @@
 pub mod captcha;
 mod client;
 mod error;
+pub mod http;
 pub mod models;
 pub mod protocol;
 
 pub use captcha::{CaptchaCallback, CaptchaChallenge, CaptchaSolver, CaptchaSolverConfig};
 pub use client::MaxClient;
 pub use error::{Error, Result};
+pub use http::{HttpRequest, HttpResponse, HttpServer, HttpServerConfig};
 pub use models::{IncomingMessage, Session, UserAgent};

@@ -11,7 +11,7 @@ needed to build a minimal custom client.
 ## Features
 
 - Captcha-aware SMS authentication preflight for the current web auth flow
-- Optional external captcha solver integration with an in-memory callback registry
+- Optional external captcha solver integration with a small configurable HTTP callback server
 
 - SMS authentication (request code → verify code → login)
 - Re-login with an in-memory session token (no SMS)
@@ -53,10 +53,10 @@ SESSION_INIT (6)
 must render the returned captcha link with the VK captcha widget and call
 `request_sms_code_with_captcha_token` with the resulting token. Alternatively,
 configure `CaptchaSolver` with a `max_captcha_solver` service URL and a public
-callback URL, expose an HTTP `POST` route that forwards the request body to
-`CaptchaSolver::handle_callback_json`, and call `request_sms_code_with_solver`.
-Unfinished solver challenges are kept in memory and time out after one hour by
-default. The terminal demo cannot render that widget.
+callback URL, register its callback route on `HttpServer`, and call
+`request_sms_code_with_solver`. Unfinished solver challenges are kept in memory
+and time out after one hour by default. The terminal demo cannot render that
+widget.
 
 Incoming messages arrive as server-initiated `NOTIF_MESSAGE` (128) frames and are
 forwarded to an async channel.
