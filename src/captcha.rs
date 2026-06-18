@@ -165,11 +165,11 @@ impl CaptchaSolver {
     pub fn register_callback_route(
         self: &Arc<Self>,
         server: &mut HttpServer,
-        path: impl Into<String>,
+        route_path: impl Into<String>,
     ) {
         let solver = Arc::clone(self);
-        let path = path.into();
-        server.route("POST", path, move |request| {
+        let route_path = route_path.into();
+        server.route("POST", route_path, move |request| {
             let solver = Arc::clone(&solver);
             async move {
                 solver.handle_callback_json(&request.body).await?;
