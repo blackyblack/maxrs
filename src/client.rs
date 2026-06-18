@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+use crate::captcha::CaptchaSolver;
 use crate::error::{Error, Result};
 use crate::models::{IncomingMessage, Session, UserAgent, BROWSER_USER_AGENT};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
@@ -244,6 +245,26 @@ impl MaxClient {
         }
 
         self.request_sms_code_with_captcha_token(phone, "").await
+    }
+
+    /// Step 1 of SMS auth using an optional external captcha solver.
+    ///
+    /// If Max returns a captcha URL, it is sent to `captcha_solver`; this method
+    /// then waits for the solver callback token and retries the SMS request with
+    /// that token. If no captcha is returned, it behaves like
+    /// [`MaxClient::request_sms_code`].
+    pub async fn request_sms_code_with_solver(
+        &self,
+        phone: &str,
+        captcha_solver: &CaptchaSolver,
+    ) -> Result<String> {
+        let captcha_token = match self.request_auth_captcha(phone).await? {
+            Some(link) => captcha_solver.solve(&link).await?,
+            None => String::new(),
+        };
+
+        self.request_sms_code_with_captcha_token(phone, &captcha_token)
+            .await
     }
 
     /// Step 1 of SMS auth with a captcha token obtained from
