@@ -1,24 +1,25 @@
-use std::collections::HashMap;
-use std::future::Future;
+use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use crate::captcha::CaptchaSolver;
 use crate::error::{Error, Result};
 
-const MAX_HEADER_SIZE: usize = 16 * 1024;
-
-type RouteHandler = Arc<
-    dyn Fn(HttpRequest) -> Pin<Box<dyn Future<Output = Result<HttpResponse>> + Send>> + Send + Sync,
->;
+const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
     pub bind_addr: String,
     pub max_body_size: usize,
+    pub captcha_callback_path: String,
 }
 
 impl HttpServerConfig {
@@ -26,6 +27,7 @@ impl HttpServerConfig {
         Self {
             bind_addr: bind_addr.into(),
             max_body_size: 1024 * 1024,
+            captcha_callback_path: DEFAULT_CAPTCHA_CALLBACK_PATH.into(),
         }
     }
 
@@ -33,50 +35,17 @@ impl HttpServerConfig {
         self.max_body_size = max_body_size;
         self
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct HttpRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    status_code: u16,
-    body: Vec<u8>,
-    content_type: String,
-}
-
-impl HttpResponse {
-    pub fn new(status_code: u16, body: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status_code,
-            body: body.into(),
-            content_type: "text/plain; charset=utf-8".into(),
-        }
-    }
-
-    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
-        self.content_type = content_type.into();
+    pub fn with_captcha_callback_path(mut self, captcha_callback_path: impl Into<String>) -> Self {
+        self.captcha_callback_path = captcha_callback_path.into();
         self
-    }
-
-    pub fn no_content() -> Self {
-        Self {
-            status_code: 204,
-            body: Vec::new(),
-            content_type: "text/plain; charset=utf-8".into(),
-        }
     }
 }
 
 pub struct HttpServer {
     listener: TcpListener,
     config: HttpServerConfig,
-    routes: HashMap<(String, String), RouteHandler>,
+    captcha_solver: Option<Arc<CaptchaSolver>>,
 }
 
 impl HttpServer {
@@ -85,181 +54,160 @@ impl HttpServer {
         Ok(Self {
             listener,
             config,
-            routes: HashMap::new(),
+            captcha_solver: None,
         })
+    }
+
+    pub fn with_captcha_solver(mut self, captcha_solver: Arc<CaptchaSolver>) -> Self {
+        self.captcha_solver = Some(captcha_solver);
+        self
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    pub fn route<F, Fut>(&mut self, method: impl Into<String>, path: impl Into<String>, handler: F)
-    where
-        F: Fn(HttpRequest) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<HttpResponse>> + Send + 'static,
-    {
-        self.routes.insert(
-            (method.into().to_ascii_uppercase(), path.into()),
-            Arc::new(move |request| Box::pin(handler(request))),
-        );
-    }
-
     pub async fn serve(self) -> Result<()> {
-        let routes = Arc::new(self.routes);
         loop {
-            let (mut stream, _) = self.listener.accept().await?;
-            let routes = Arc::clone(&routes);
-            let max_body_size = self.config.max_body_size;
+            let (stream, _) = self.listener.accept().await?;
+            let config = self.config.clone();
+            let captcha_solver = self.captcha_solver.clone();
             tokio::spawn(async move {
-                let response = match read_request(&mut stream, max_body_size).await {
-                    Ok(request) => {
-                        match routes.get(&(request.method.clone(), request.path.clone())) {
-                            Some(handler) => match handler(request).await {
-                                Ok(response) => response,
-                                Err(err) => HttpResponse::new(500, err.to_string()),
-                            },
-                            None => HttpResponse::new(404, "Not Found"),
-                        }
-                    }
-                    Err(err) => HttpResponse::new(400, err.to_string()),
-                };
-
-                let _ = write_response(&mut stream, response).await;
+                let service = service_fn(move |request| {
+                    handle_request(request, config.clone(), captcha_solver.clone())
+                });
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::debug!(?err, "http callback connection failed");
+                }
             });
         }
     }
 }
 
-async fn read_request(
-    stream: &mut tokio::net::TcpStream,
-    max_body_size: usize,
-) -> Result<HttpRequest> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    let mut header_end = None;
-
-    while header_end.is_none() {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(Error::UnexpectedResponse(
-                "unexpected EOF while reading HTTP request".into(),
-            ));
+async fn handle_request(
+    request: Request<Incoming>,
+    config: HttpServerConfig,
+    captcha_solver: Option<Arc<CaptchaSolver>>,
+) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
+    let response = match (request.method(), request.uri().path(), captcha_solver) {
+        (&Method::POST, path, Some(captcha_solver)) if path == config.captcha_callback_path => {
+            match read_body(request.into_body(), config.max_body_size).await {
+                Ok(body) => match captcha_solver.handle_callback_json(&body).await {
+                    Ok(()) => response(StatusCode::NO_CONTENT, Vec::new()),
+                    Err(err) => error_response(err),
+                },
+                Err(err) => error_response(err),
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > MAX_HEADER_SIZE {
-            return Err(Error::UnexpectedResponse("HTTP headers too large".into()));
-        }
-        header_end = find_header_end(&buffer);
-    }
-
-    let header_end = header_end.unwrap();
-    let header_text = std::str::from_utf8(&buffer[..header_end])
-        .map_err(|_| Error::UnexpectedResponse("invalid HTTP header encoding".into()))?;
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| Error::UnexpectedResponse("missing HTTP request line".into()))?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts
-        .next()
-        .ok_or_else(|| Error::UnexpectedResponse("missing HTTP method".into()))?
-        .to_ascii_uppercase();
-    let path = request_parts
-        .next()
-        .ok_or_else(|| Error::UnexpectedResponse("missing HTTP path".into()))?
-        .to_string();
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| Error::UnexpectedResponse("invalid HTTP header".into()))?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = headers
-        .get("content-length")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|_| Error::UnexpectedResponse("invalid Content-Length".into()))?
-        .unwrap_or(0);
-    if content_length > max_body_size {
-        return Err(Error::UnexpectedResponse("HTTP request too large".into()));
-    }
-
-    let body_start = header_end + 4;
-    while buffer.len() < body_start + content_length {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Err(Error::UnexpectedResponse(
-                "unexpected EOF while reading HTTP body".into(),
-            ));
-        }
-        let remaining = body_start + content_length - buffer.len();
-        buffer.extend_from_slice(&chunk[..read.min(remaining)]);
-    }
-
-    Ok(HttpRequest {
-        method,
-        path,
-        headers,
-        body: buffer[body_start..body_start + content_length].to_vec(),
-    })
-}
-
-async fn write_response(stream: &mut tokio::net::TcpStream, response: HttpResponse) -> Result<()> {
-    let status_text = match response.status_code {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "OK",
+        _ => response(StatusCode::NOT_FOUND, b"Not Found".to_vec()),
     };
-    let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
-        response.status_code,
-        status_text,
-        response.body.len(),
-        response.content_type,
-    );
-    stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(&response.body).await?;
-    stream.shutdown().await?;
-    Ok(())
+    Ok(response)
 }
 
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+async fn read_body(mut body: Incoming, max_body_size: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| {
+            Error::UnexpectedResponse(format!("failed reading HTTP request body: {err}"))
+        })?;
+        if let Some(chunk) = frame.data_ref() {
+            if bytes.len() + chunk.len() > max_body_size {
+                return Err(Error::UnexpectedResponse("HTTP request too large".into()));
+            }
+            bytes.extend_from_slice(chunk);
+        }
+    }
+    Ok(bytes)
+}
+
+fn error_response(err: Error) -> Response<Full<Bytes>> {
+    match err {
+        Error::Json(_)
+        | Error::UnexpectedResponse(_)
+        | Error::UnknownCaptchaChallenge { .. }
+        | Error::CaptchaFailed(_) => {
+            response(StatusCode::BAD_REQUEST, err.to_string().into_bytes())
+        }
+        other => response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            other.to_string().into_bytes(),
+        ),
+    }
+}
+
+fn response(status: StatusCode, body: Vec<u8>) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from(body)))
+        .expect("valid HTTP response")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::time::Instant;
+    use tokio::sync::oneshot;
+
+    use crate::captcha::{CaptchaSolver, CaptchaSolverConfig};
 
     #[tokio::test]
-    async fn accepts_large_headers_with_small_body_limit() {
-        let mut server =
-            HttpServer::bind(HttpServerConfig::new("127.0.0.1:0").with_max_body_size(8))
-                .await
-                .unwrap();
-        server.route("POST", "/callback", |_request| async {
-            Ok(HttpResponse::no_content())
-        });
+    async fn optional_server_forwards_captcha_callbacks() {
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
+        let (tx, rx) = oneshot::channel();
+        solver
+            .insert_pending_for_test("challenge-1".into(), Instant::now(), tx)
+            .await;
+
+        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
+            .await
+            .unwrap()
+            .with_captcha_solver(Arc::clone(&solver));
         let addr = server.local_addr().unwrap();
         let server_task = tokio::spawn(server.serve());
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/callback"))
-            .header("X-Test", "a".repeat(256))
-            .body("ok")
+            .post(format!("http://{addr}/captcha-callback"))
+            .json(&json!({
+                "challengeId": "challenge-1",
+                "status": "ok",
+                "token": "session",
+            }))
             .send()
             .await
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let callback = rx.await.unwrap();
+        assert_eq!(callback.challenge_id, "challenge-1");
+        assert_eq!(callback.token.as_deref(), Some("session"));
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn body_limit_is_enforced() {
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
+        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0").with_max_body_size(8))
+            .await
+            .unwrap()
+            .with_captcha_solver(solver);
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/captcha-callback"))
+            .body("this body is too large")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 
         server_task.abort();
         let _ = server_task.await;
