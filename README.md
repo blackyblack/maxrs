@@ -54,12 +54,11 @@ must render the returned captcha link with the VK captcha widget and call
 `request_sms_code_with_captcha_token` with the resulting token. Alternatively,
 configure `CaptchaSolver` with a `max_captcha_solver` service URL and a public
 callback URL, then either forward callback `POST` bodies from your own web
-server to `CaptchaSolver::handle_callback_json` or run `HttpServer` with that
-solver attached to serve `POST /captcha-callback`. `request_sms_code_with_solver`
-posts the captcha URL to the solver and waits up to one hour total for the
-`/solve` response plus callback. Unfinished solver challenges are kept in memory
-and time out after one hour by default. The terminal demo cannot render that
-widget.
+server to `CaptchaSolver::handle_callback_json` or run `captcha::HttpServer`
+with that solver attached to serve `POST /captcha-callback`.
+`request_sms_code_with_solver` posts the captcha URL to the solver and waits up
+to one hour total for the `/solve` response plus callback. Unfinished solver
+challenges are kept in memory and time out after one hour by default.
 
 Incoming messages arrive as server-initiated `NOTIF_MESSAGE` (128) frames and are
 forwarded to an async channel.
@@ -112,7 +111,10 @@ cargo run --example cli
 
 It performs an interactive SMS login, prints incoming messages, and sends a
 message you type. It talks to the **real** Max servers, so you need a phone
-number that can receive the SMS code.
+number that can receive the SMS code. If Max requires captcha, the demo uses
+`max_captcha_solver` at `http://127.0.0.1:3000` by default and serves callbacks
+on `127.0.0.1:3002`; override those with `MAX_SOLVER_URL`, `MAX_CALLBACK_BIND`,
+and `MAX_CALLBACK_URL_BASE`.
 
 ## Disclaimer
 

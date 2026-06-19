@@ -1,11 +1,3 @@
-//! Captcha solver integration for authentication challenges.
-//!
-//! The module is intentionally transport-agnostic for inbound callbacks:
-//! applications can either forward a request body from their own web server or
-//! use [`crate::http::HttpServer`] to receive `POST`s at
-//! [`CaptchaSolverConfig::callback_url`]. Pending challenges are kept in memory
-//! and expire after the configured timeout (one hour by default).
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
