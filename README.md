@@ -1,95 +1,141 @@
 # maxrs
 
-A small **proof-of-concept** async Rust client for the [Max](https://max.ru)
-messenger (internal code name *OneMe*), talking to the web WebSocket API at
-`wss://ws-api.oneme.ru/websocket`.
+`maxrs` is an unofficial asynchronous Rust client for the Max messenger web
+WebSocket API at `wss://ws-api.oneme.ru/websocket`.
 
-All existing community clients are written in Python (PyMax, vkmax, MadMax,
-maxbridge-client, ...). This is a focused Rust port of the slice of the protocol
-needed to build a minimal custom client.
+The crate is a proof of concept for the parts of the reverse-engineered web
+protocol that are useful for a minimal custom client: SMS authentication,
+session-token login, incoming message notifications, typing notifications, text
+messages, file upload, and optional captcha solving for the current web auth
+flow.
+
+This project is not affiliated with Max or VK. The internal API can change
+without notice.
 
 ## Features
 
-- Captcha-aware SMS authentication preflight for the current web auth flow
-- Optional external captcha solver integration, with either your own web server or the built-in callback helper
+- WebSocket connection and protocol request/response correlation
+- SMS authentication and re-login with a saved session token
+- Auth captcha preflight and optional `max_captcha_solver` integration
+- Incoming message channel for server-pushed `NOTIF_MESSAGE` frames
+- Text messages, file messages, typing notifications, and keepalive pings
 
-- SMS authentication (request code → verify code → login)
-- Re-login with an in-memory session token (no SMS)
-- Send text messages
-- Send files (`FILE_UPLOAD` → HTTP upload → attach)
-- Typing notifications
-- Asynchronous receiving of incoming messages
-- Background keepalive
+The session token is kept in memory by the library. Store it yourself if your
+application needs to log in again without requesting another SMS code.
 
-The session token is kept **in memory only** (no SQLite/persistence).
+## Prerequisites
 
-This is a proof of concept, not a production-ready library: only a handful of
-opcodes are implemented and error handling is intentionally simple.
+Install a current stable Rust toolchain from <https://rustup.rs/>.
 
-## Protocol
+SMS login talks to the real Max service, so you need a phone number that can
+receive the verification SMS.
 
-Every frame is JSON over a single WebSocket connection:
+Captcha solving is optional, but Max may require it before sending an SMS. For
+the ready-to-use helper, run
+[`blackyblack/max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver)
+and configure the env variables below.
 
-```json
-{ "ver": 11, "cmd": 0, "seq": 1, "opcode": 6, "payload": { } }
+## Installation
+
+Clone this repository and run the included example:
+
+```bash
+cargo run --example cli
 ```
 
-- `cmd`: `0` request, `1` response, `3` error
-- `seq`: request/response correlation id
-- `opcode`: operation code (see [`protocol::opcode`](src/protocol.rs))
+## Configuration
 
-The handshake/auth sequence is:
+The example CLI loads `.env` from the current directory before reading the
+process environment. Copy `.env.template` to `.env` and fill only the values you
+need. Empty values in `.env.template` mean "use the code default" unless noted.
 
+`MAX_SESSION_TOKEN`
+
+Default: unset.
+
+Saved Max session token. When set, the CLI logs in with this token and skips SMS
+auth.
+
+`MAX_SOLVER_URL`
+
+Default: `http://127.0.0.1:3000`.
+
+Base URL of the `max_captcha_solver` solve API. The helper posts captcha
+challenges to `POST /solve` on this service when Max requires auth captcha.
+
+`MAX_CALLBACK_BIND`
+
+Default: `127.0.0.1:3002`.
+
+Local address used by the built-in callback receiver. The receiver serves
+`POST /captcha-callback` and forwards solver callbacks to the pending
+captcha challenge.
+
+`MAX_CALLBACK_URL_BASE`
+
+Default: unset, which becomes `http://<bound callback address>/captcha-callback`.
+
+Public base URL sent to `max_captcha_solver` as the callback target. Use this
+when the solver cannot reach the callback receiver through the bind address.
+The value may contain `{port}`, which is replaced with the actual callback
+server port.
+
+`RUST_LOG`
+
+Default in the CLI: `maxrs=info`.
+
+Tracing filter used by `tracing_subscriber`. Examples: `debug`,
+`maxrs=debug`, or `maxrs=info,hyper=warn`.
+
+## Captcha Solver
+
+`maxrs` can work without a solver if Max does not require captcha. If captcha is
+required, use
+[`blackyblack/max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver).
+Its solve API listens on `127.0.0.1:3000` by default and its operator UI listens
+on `0.0.0.0:3001` by default.
+
+For a local solver process running on the host, the defaults are enough:
+
+```env
+MAX_SOLVER_URL=
+MAX_CALLBACK_BIND=
+MAX_CALLBACK_URL_BASE=
 ```
-SESSION_INIT (6)
-  -> AUTH_CAPTCHA_REQUEST (224, phone) -> captcha link
-  → AUTH_REQUEST (17, phone)   → sms token
-  → AUTH (18, sms token, code) → session token
-  → LOGIN (19, session token)  → profile + chats
+
+For a containerized solver, publish the solver ports and make the callback URL
+point from the container back to the host:
+
+```env
+MAX_SOLVER_URL=http://127.0.0.1:3000
+MAX_CALLBACK_BIND=0.0.0.0:3002
+MAX_CALLBACK_URL_BASE=http://host.docker.internal:3002
 ```
 
-`AUTH_REQUEST` includes `captchaToken` in the current web flow. If
-`request_sms_code` returns `Error::CaptchaRequired`, a browser-capable caller
-must render the returned captcha link with the VK captcha widget and call
-`request_sms_code_with_captcha_token` with the resulting token. Alternatively,
-configure `CaptchaSolver` with a `max_captcha_solver` service URL and a public
-callback URL, then either forward callback `POST` bodies from your own web
-server to `CaptchaSolver::handle_callback_json` or run `HttpServer` with that
-solver attached to serve `POST /captcha-callback`. `request_sms_code_with_solver`
-posts the captcha URL to the solver and waits up to one hour total for the
-`/solve` response plus callback. Unfinished solver challenges are kept in memory
-and time out after one hour by default. The terminal demo cannot render that
-widget.
-
-Incoming messages arrive as server-initiated `NOTIF_MESSAGE` (128) frames and are
-forwarded to an async channel.
-
-See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full opcode/flow reference and
-the upstream sources it was derived from.
+On Linux, Docker may not define `host.docker.internal` automatically. Add a
+host-gateway mapping to the solver container or use an address that the
+container can route to on the host. The solve API should be reachable from
+`maxrs`, and the callback URL should be reachable from the solver container.
 
 ## Usage
 
 ```rust
-use maxrs::MaxClient;
+use maxrs::client::MaxClient;
 
 #[tokio::main]
-async fn main() -> maxrs::Result<()> {
+async fn main() -> maxrs::error::Result<()> {
     let (client, mut messages) = MaxClient::connect().await?;
 
-    // Receive incoming messages asynchronously.
     tokio::spawn(async move {
         while let Some(msg) = messages.recv().await {
             println!("[chat {}] {}: {}", msg.chat_id, msg.sender, msg.text);
         }
     });
 
-    // SMS login.
     let sms_token = client.request_sms_code("+79990000000").await?;
-    // ...read the code the user received...
     let session = client.verify_sms_code(&sms_token, "12345").await?;
     println!("session token: {}", session.token);
 
-    // Send things.
     client.send_typing(123456).await?;
     client.send_text(123456, "Hello from Rust!").await?;
     client.send_file(123456, "report.pdf", "Here is the report").await?;
@@ -98,27 +144,40 @@ async fn main() -> maxrs::Result<()> {
 }
 ```
 
-Later, skip SMS by reusing the token:
+To reuse a saved session token:
 
 ```rust
 let session = client.login_with_token(&saved_token).await?;
 ```
 
-## Running the demo
+To use the built-in captcha-aware SMS helper:
+
+```rust
+use maxrs::auth::AuthCaptchaConfig;
+use maxrs::client::MaxClient;
+
+# async fn run(client: MaxClient) -> maxrs::error::Result<()> {
+let config = AuthCaptchaConfig::from_env();
+let sms_token = client
+    .request_sms_code_with_auth_captcha("+79990000000", &config)
+    .await?;
+# Ok(())
+# }
+```
+
+## Protocol Notes
+
+See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
+
+## Example CLI
 
 ```bash
 cargo run --example cli
 ```
 
-It performs an interactive SMS login, prints incoming messages, and sends a
-message you type. It talks to the **real** Max servers, so you need a phone
-number that can receive the SMS code.
-
-## Disclaimer
-
-This project is unofficial and not affiliated with Max/VK. It relies on a
-reverse-engineered internal API that may change at any time. Use responsibly and
-at your own risk.
+The CLI connects, logs in with `MAX_SESSION_TOKEN` or interactive SMS auth, then
+listens for incoming messages until Ctrl-C. It does not print login payload
+details such as chats or contacts, and it does not send messages.
 
 ## License
 
