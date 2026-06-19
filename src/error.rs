@@ -23,6 +23,22 @@ pub enum Error {
     #[error("captcha required before requesting SMS code: {link}")]
     CaptchaRequired { link: String },
 
+    /// Captcha solving was requested, but no solver service URL is configured.
+    #[error("captcha solver is disabled")]
+    CaptchaSolverDisabled,
+
+    /// Captcha solver did not return before the challenge timeout.
+    #[error("timed out waiting for captcha challenge {challenge_id}")]
+    CaptchaTimeout { challenge_id: String },
+
+    /// Captcha solver reported failure or an invalid callback.
+    #[error("captcha solving failed: {0}")]
+    CaptchaFailed(String),
+
+    /// Callback was received for a challenge that is not pending in memory.
+    #[error("unknown captcha challenge: {challenge_id}")]
+    UnknownCaptchaChallenge { challenge_id: String },
+
     /// A response did not arrive within the configured timeout.
     #[error("timed out waiting for response to opcode {0}")]
     Timeout(u16),
