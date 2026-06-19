@@ -55,6 +55,7 @@ impl Default for CaptchaSolverConfig {
 
 /// Accepted solver request metadata.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptchaChallenge {
     pub challenge_id: String,
     pub status: String,
@@ -264,6 +265,23 @@ mod tests {
                 "challengeId": "id-1",
                 "captchaUrl": "https://id.vk.ru/not_robot_captcha",
             })
+        );
+    }
+
+    #[test]
+    fn captcha_challenge_deserializes_solver_payload() {
+        let challenge: CaptchaChallenge = serde_json::from_value(json!({
+            "challengeId": "id-1",
+            "status": "pending",
+            "operatorUrl": "https://solver.example/operator",
+        }))
+        .unwrap();
+
+        assert_eq!(challenge.challenge_id, "id-1");
+        assert_eq!(challenge.status, "pending");
+        assert_eq!(
+            challenge.operator_url.as_deref(),
+            Some("https://solver.example/operator")
         );
     }
 
