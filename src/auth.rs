@@ -1,7 +1,7 @@
 //! Authentication helpers shared by examples and applications.
 
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::captcha::http::{HttpServer, HttpServerConfig};
@@ -68,7 +68,10 @@ impl AuthCaptchaConfig {
                     DEFAULT_CAPTCHA_CALLBACK_PATH
                 )
             }
-            None => format!("http://{callback_addr}{DEFAULT_CAPTCHA_CALLBACK_PATH}"),
+            None => {
+                let callback_addr = normalize_callback_addr(callback_addr);
+                format!("http://{callback_addr}{DEFAULT_CAPTCHA_CALLBACK_PATH}")
+            }
         }
     }
 }
@@ -127,6 +130,16 @@ fn env_string(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {
+    let port = callback_addr.port();
+
+    match callback_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        _ => callback_addr,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +166,23 @@ mod tests {
         assert_eq!(
             config.callback_url(addr),
             "https://example.test:3002/max/captcha-callback"
+        );
+    }
+
+    #[test]
+    fn callback_url_normalizes_unspecified_bind_addresses() {
+        let config = AuthCaptchaConfig::default();
+
+        let ipv4_addr = "0.0.0.0:3002".parse().unwrap();
+        assert_eq!(
+            config.callback_url(ipv4_addr),
+            "http://127.0.0.1:3002/captcha-callback"
+        );
+
+        let ipv6_addr = "[::]:3002".parse().unwrap();
+        assert_eq!(
+            config.callback_url(ipv6_addr),
+            "http://[::1]:3002/captcha-callback"
         );
     }
 }
