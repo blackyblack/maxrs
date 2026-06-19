@@ -75,7 +75,10 @@ async fn handle_request(
     let response = match (request.method(), request.uri().path()) {
         (&Method::POST, DEFAULT_CAPTCHA_CALLBACK_PATH) => match captcha_solver {
             Some(captcha_solver) => match request.into_body().collect().await {
-                Ok(body) => match captcha_solver.handle_callback_json(&body.to_bytes()).await {
+                Ok(body) => match captcha_solver
+                    .handle_callback_json(body.to_bytes().as_ref())
+                    .await
+                {
                     Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
                     Err(err) => error_response(err),
                 },
@@ -88,15 +91,17 @@ async fn handle_request(
                 serde_json::json!({ "error": "captcha solver not configured" }),
             ),
         },
-        (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header("allow", "POST")
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(
-                serde_json::to_vec(&serde_json::json!({ "error": "method not allowed" }))
-                    .expect("valid JSON response"),
-            )))
-            .expect("valid HTTP response"),
+        (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => {
+            let mut response = json_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                serde_json::json!({ "error": "method not allowed" }),
+            );
+            response.headers_mut().insert(
+                hyper::header::ALLOW,
+                hyper::header::HeaderValue::from_static("POST"),
+            );
+            response
+        }
         _ => json_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({ "error": "not found" }),
@@ -210,7 +215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_solver_reports_json_error() {
+    async fn missing_solver_returns_json_error() {
         let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
             .await
             .unwrap();
