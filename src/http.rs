@@ -85,7 +85,7 @@ async fn handle_request(
             },
             None => json_response(
                 StatusCode::NOT_FOUND,
-                serde_json::json!({ "error": "not found" }),
+                serde_json::json!({ "error": "captcha solver not configured" }),
             ),
         },
         (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => Response::builder()
@@ -203,6 +203,36 @@ mod tests {
         assert_eq!(
             response.text().await.unwrap(),
             r#"{"error":"unknown captcha challenge: missing"}"#
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn missing_solver_reports_json_error() {
+        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/captcha-callback"))
+            .json(&json!({
+                "challengeId": "missing",
+                "status": "ok",
+                "token": "session",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(
+            response.text().await.unwrap(),
+            r#"{"error":"captcha solver not configured"}"#
         );
 
         server_task.abort();
