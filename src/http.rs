@@ -18,33 +18,18 @@ const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
     pub bind_addr: String,
-    pub max_body_size: usize,
-    pub captcha_callback_path: String,
 }
 
 impl HttpServerConfig {
     pub fn new(bind_addr: impl Into<String>) -> Self {
         Self {
             bind_addr: bind_addr.into(),
-            max_body_size: 1024 * 1024,
-            captcha_callback_path: DEFAULT_CAPTCHA_CALLBACK_PATH.into(),
         }
-    }
-
-    pub fn with_max_body_size(mut self, max_body_size: usize) -> Self {
-        self.max_body_size = max_body_size;
-        self
-    }
-
-    pub fn with_captcha_callback_path(mut self, captcha_callback_path: impl Into<String>) -> Self {
-        self.captcha_callback_path = captcha_callback_path.into();
-        self
     }
 }
 
 pub struct HttpServer {
     listener: TcpListener,
-    config: HttpServerConfig,
     captcha_solver: Option<Arc<CaptchaSolver>>,
 }
 
@@ -53,7 +38,6 @@ impl HttpServer {
         let listener = TcpListener::bind(&config.bind_addr).await?;
         Ok(Self {
             listener,
-            config,
             captcha_solver: None,
         })
     }
@@ -70,12 +54,10 @@ impl HttpServer {
     pub async fn serve(self) -> Result<()> {
         loop {
             let (stream, _) = self.listener.accept().await?;
-            let config = self.config.clone();
             let captcha_solver = self.captcha_solver.clone();
             tokio::spawn(async move {
-                let service = service_fn(move |request| {
-                    handle_request(request, config.clone(), captcha_solver.clone())
-                });
+                let service =
+                    service_fn(move |request| handle_request(request, captcha_solver.clone()));
                 if let Err(err) = http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await
@@ -86,41 +68,41 @@ impl HttpServer {
         }
     }
 }
-
 async fn handle_request(
     request: Request<Incoming>,
-    config: HttpServerConfig,
     captcha_solver: Option<Arc<CaptchaSolver>>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
-    let response = match (request.method(), request.uri().path(), captcha_solver) {
-        (&Method::POST, path, Some(captcha_solver)) if path == config.captcha_callback_path => {
-            match read_body(request.into_body(), config.max_body_size).await {
-                Ok(body) => match captcha_solver.handle_callback_json(&body).await {
-                    Ok(()) => response(StatusCode::NO_CONTENT, Vec::new()),
+    let response = match (request.method(), request.uri().path()) {
+        (&Method::POST, DEFAULT_CAPTCHA_CALLBACK_PATH) => match captcha_solver {
+            Some(captcha_solver) => match request.into_body().collect().await {
+                Ok(body) => match captcha_solver.handle_callback_json(&body.to_bytes()).await {
+                    Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
                     Err(err) => error_response(err),
                 },
-                Err(err) => error_response(err),
-            }
-        }
-        _ => response(StatusCode::NOT_FOUND, b"Not Found".to_vec()),
+                Err(err) => error_response(Error::UnexpectedResponse(format!(
+                    "failed reading HTTP request body: {err}"
+                ))),
+            },
+            None => json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({ "error": "not found" }),
+            ),
+        },
+        (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header("allow", "POST")
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "error": "method not allowed" }))
+                    .expect("valid JSON response"),
+            )))
+            .expect("valid HTTP response"),
+        _ => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "not found" }),
+        ),
     };
     Ok(response)
-}
-
-async fn read_body(mut body: Incoming, max_body_size: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|err| {
-            Error::UnexpectedResponse(format!("failed reading HTTP request body: {err}"))
-        })?;
-        if let Some(chunk) = frame.data_ref() {
-            if bytes.len() + chunk.len() > max_body_size {
-                return Err(Error::UnexpectedResponse("HTTP request too large".into()));
-            }
-            bytes.extend_from_slice(chunk);
-        }
-    }
-    Ok(bytes)
 }
 
 fn error_response(err: Error) -> Response<Full<Bytes>> {
@@ -128,21 +110,24 @@ fn error_response(err: Error) -> Response<Full<Bytes>> {
         Error::Json(_)
         | Error::UnexpectedResponse(_)
         | Error::UnknownCaptchaChallenge { .. }
-        | Error::CaptchaFailed(_) => {
-            response(StatusCode::BAD_REQUEST, err.to_string().into_bytes())
-        }
-        other => response(
+        | Error::CaptchaFailed(_) => json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": err.to_string() }),
+        ),
+        other => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            other.to_string().into_bytes(),
+            serde_json::json!({ "error": other.to_string() }),
         ),
     }
 }
 
-fn response(status: StatusCode, body: Vec<u8>) -> Response<Full<Bytes>> {
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&body).expect("valid JSON response"),
+        )))
         .expect("valid HTTP response")
 }
 
@@ -181,7 +166,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.text().await.unwrap(), r#"{"ok":true}"#);
         let callback = rx.await.unwrap();
         assert_eq!(callback.challenge_id, "challenge-1");
         assert_eq!(callback.token.as_deref(), Some("session"));
@@ -191,9 +178,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_limit_is_enforced() {
+    async fn errors_are_returned_as_json() {
         let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
-        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0").with_max_body_size(8))
+        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
             .await
             .unwrap()
             .with_captcha_solver(solver);
@@ -202,12 +189,21 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("http://{addr}/captcha-callback"))
-            .body("this body is too large")
+            .json(&json!({
+                "challengeId": "missing",
+                "status": "ok",
+                "token": "session",
+            }))
             .send()
             .await
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(
+            response.text().await.unwrap(),
+            r#"{"error":"unknown captcha challenge: missing"}"#
+        );
 
         server_task.abort();
         let _ = server_task.await;

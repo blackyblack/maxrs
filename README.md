@@ -55,10 +55,11 @@ must render the returned captcha link with the VK captcha widget and call
 configure `CaptchaSolver` with a `max_captcha_solver` service URL and a public
 callback URL, then either forward callback `POST` bodies from your own web
 server to `CaptchaSolver::handle_callback_json` or run `HttpServer` with that
-solver attached. `request_sms_code_with_solver` posts the captcha URL to the
-solver and waits up to one hour total for the `/solve` response plus callback.
-Unfinished solver challenges are kept in memory and time out after one hour by
-default. The terminal demo cannot render that widget.
+solver attached to serve `POST /captcha-callback`. `request_sms_code_with_solver`
+posts the captcha URL to the solver and waits up to one hour total for the
+`/solve` response plus callback. Unfinished solver challenges are kept in memory
+and time out after one hour by default. The terminal demo cannot render that
+widget.
 
 Incoming messages arrive as server-initiated `NOTIF_MESSAGE` (128) frames and are
 forwarded to an async channel.
