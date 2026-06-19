@@ -1,8 +1,9 @@
 use std::convert::Infallible;
+use std::error::Error as StdError;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -14,6 +15,7 @@ use crate::captcha::CaptchaSolver;
 use crate::error::{Error, Result};
 
 const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
+const DEFAULT_CALLBACK_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
@@ -30,6 +32,11 @@ impl HttpServerConfig {
 
 pub struct HttpServer {
     listener: TcpListener,
+    state: Arc<HttpState>,
+}
+
+#[derive(Clone)]
+struct HttpState {
     captcha_solver: Option<Arc<CaptchaSolver>>,
 }
 
@@ -38,12 +45,14 @@ impl HttpServer {
         let listener = TcpListener::bind(&config.bind_addr).await?;
         Ok(Self {
             listener,
-            captcha_solver: None,
+            state: Arc::new(HttpState {
+                captcha_solver: None,
+            }),
         })
     }
 
     pub fn with_captcha_solver(mut self, captcha_solver: Arc<CaptchaSolver>) -> Self {
-        self.captcha_solver = Some(captcha_solver);
+        Arc::make_mut(&mut self.state).captcha_solver = Some(captcha_solver);
         self
     }
 
@@ -54,10 +63,9 @@ impl HttpServer {
     pub async fn serve(self) -> Result<()> {
         loop {
             let (stream, _) = self.listener.accept().await?;
-            let captcha_solver = self.captcha_solver.clone();
+            let state = Arc::clone(&self.state);
             tokio::spawn(async move {
-                let service =
-                    service_fn(move |request| handle_request(request, captcha_solver.clone()));
+                let service = service_fn(move |request| route_request(request, Arc::clone(&state)));
                 if let Err(err) = http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await
@@ -68,46 +76,85 @@ impl HttpServer {
         }
     }
 }
-async fn handle_request(
+
+async fn route_request(
     request: Request<Incoming>,
-    captcha_solver: Option<Arc<CaptchaSolver>>,
+    state: Arc<HttpState>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
-        (&Method::POST, DEFAULT_CAPTCHA_CALLBACK_PATH) => match captcha_solver {
-            Some(captcha_solver) => match request.into_body().collect().await {
-                Ok(body) => match captcha_solver
-                    .handle_callback_json(body.to_bytes().as_ref())
-                    .await
-                {
-                    Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
-                    Err(err) => error_response(err),
-                },
-                Err(err) => error_response(Error::UnexpectedResponse(format!(
-                    "failed reading HTTP request body: {err}"
-                ))),
-            },
-            None => json_response(
-                StatusCode::NOT_FOUND,
-                serde_json::json!({ "error": "captcha solver not configured" }),
-            ),
-        },
-        (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => {
-            let mut response = json_response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                serde_json::json!({ "error": "method not allowed" }),
-            );
-            response.headers_mut().insert(
-                hyper::header::ALLOW,
-                hyper::header::HeaderValue::from_static("POST"),
-            );
-            response
+        (&Method::POST, DEFAULT_CAPTCHA_CALLBACK_PATH) => {
+            handle_captcha_callback(request, state).await
         }
+        (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => method_not_allowed("POST"),
         _ => json_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({ "error": "not found" }),
         ),
     };
     Ok(response)
+}
+
+async fn handle_captcha_callback(
+    request: Request<Incoming>,
+    state: Arc<HttpState>,
+) -> Response<Full<Bytes>> {
+    let Some(captcha_solver) = state.captcha_solver.as_ref() else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "captcha solver not configured" }),
+        );
+    };
+
+    let body = match read_limited_body(request.into_body()).await {
+        Ok(body) => body,
+        Err(BodyReadError::TooLarge) => {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({ "error": "request body too large" }),
+            );
+        }
+        Err(BodyReadError::Read(err)) => {
+            return error_response(Error::UnexpectedResponse(format!(
+                "failed reading HTTP request body: {err}"
+            )));
+        }
+    };
+
+    match captcha_solver.handle_callback_json(body.as_ref()).await {
+        Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
+        Err(err) => error_response(err),
+    }
+}
+
+async fn read_limited_body(body: Incoming) -> std::result::Result<Bytes, BodyReadError> {
+    match Limited::new(body, DEFAULT_CALLBACK_BODY_LIMIT_BYTES)
+        .collect()
+        .await
+    {
+        Ok(body) => Ok(body.to_bytes()),
+        Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => {
+            Err(BodyReadError::TooLarge)
+        }
+        Err(err) => Err(BodyReadError::Read(err)),
+    }
+}
+
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge,
+    Read(Box<dyn StdError + Send + Sync>),
+}
+
+fn method_not_allowed(allowed_methods: &'static str) -> Response<Full<Bytes>> {
+    let mut response = json_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        serde_json::json!({ "error": "method not allowed" }),
+    );
+    response.headers_mut().insert(
+        hyper::header::ALLOW,
+        hyper::header::HeaderValue::from_static(allowed_methods),
+    );
+    response
 }
 
 fn error_response(err: Error) -> Response<Full<Bytes>> {
@@ -238,6 +285,34 @@ mod tests {
         assert_eq!(
             response.text().await.unwrap(),
             r#"{"error":"captcha solver not configured"}"#
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn oversized_callback_body_is_rejected() {
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
+        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
+            .await
+            .unwrap()
+            .with_captcha_solver(solver);
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/captcha-callback"))
+            .body("x".repeat(DEFAULT_CALLBACK_BODY_LIMIT_BYTES + 1))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(
+            response.text().await.unwrap(),
+            r#"{"error":"request body too large"}"#
         );
 
         server_task.abort();

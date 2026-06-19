@@ -1,20 +1,5 @@
-//! `maxrs` — a small asynchronous Rust client for the **Max** (internal code
-//! name *OneMe*) messenger, talking to the web WebSocket API at
-//! `wss://ws-api.oneme.ru/websocket`.
-//!
-//! This is a proof-of-concept covering a focused slice of the protocol:
-//!
-//! * SMS-based authentication ([`MaxClient::request_sms_code`],
-//!   [`MaxClient::verify_sms_code`]) and token re-login
-//!   ([`MaxClient::login_with_token`]).
-//! * Sending text messages ([`MaxClient::send_text`]), files
-//!   ([`MaxClient::send_file`]) and typing notifications
-//!   ([`MaxClient::send_typing`]).
-//! * Asynchronously receiving incoming messages via the
-//!   [`mpsc::UnboundedReceiver`](tokio::sync::mpsc::UnboundedReceiver) returned
-//!   by [`MaxClient::connect`].
-//!
-//! The session token is held in memory only.
+//! `maxrs` — a small asynchronous Rust client for the **Max** messenger,
+//! talking to the web WebSocket API at `wss://ws-api.oneme.ru/websocket`.
 //!
 //! # Example
 //!

@@ -186,7 +186,7 @@ impl CaptchaSolver {
     }
 
     /// Removes expired unfinished challenges from memory.
-    pub async fn cleanup_expired(&self) {
+    async fn cleanup_expired(&self) {
         self.pending
             .lock()
             .await
