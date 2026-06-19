@@ -13,6 +13,14 @@
                 {
                     "name": "RUST_BACKTRACE",
                     "value": "1"
+                },
+                {
+                    "name": "MAX_CALLBACK_BIND",
+                    "value": "0.0.0.0:3002"
+                },
+                {
+                    "name": "MAX_CALLBACK_URL_BASE",
+                    "value": "http://host.docker.internal:3002"
                 }
             ],
             "console": "integratedTerminal"

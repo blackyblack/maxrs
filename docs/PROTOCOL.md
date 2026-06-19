@@ -110,17 +110,19 @@ token (no SMS).
 ```json
 {
   "chatId": 123456,
-  "message": { "text": "hello", "cid": 1700000000001, "elements": [], "attaches": [] },
+  "message": { "text": "hello", "cid": -1700000000001, "type": "USER",
+               "elements": [], "attaches": [] },
   "notify": true
 }
 ```
 
-`cid` is a client-generated, strictly increasing id used to de-duplicate.
+`cid` is a client-generated negative id used to de-duplicate without colliding
+with server-assigned positive message ids.
 
 ## Typing notification — MSG_TYPING (65)
 
 ```json
-{ "chatId": 123456, "type": "TYPING" }
+{ "chatId": 123456, "type": "TEXT" }
 ```
 
 ## Sending a file — FILE_UPLOAD (87)
@@ -153,7 +155,7 @@ token (no SMS).
    ```json
    {
      "chatId": 123456,
-     "message": { "text": "caption", "cid": 1700000000002, "elements": [],
+     "message": { "text": "caption", "cid": -1700000000002, "type": "USER", "elements": [],
                   "attaches": [ { "_type": "FILE", "fileId": 987654 } ] },
      "notify": true
    }

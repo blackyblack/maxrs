@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 const DEFAULT_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Configuration for the optional captcha solver integration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CaptchaSolverConfig {
     /// Base URL of the solver service, for example `https://solver.example`.
     /// When unset, starting solver-backed challenges is disabled.
@@ -33,15 +33,6 @@ impl CaptchaSolverConfig {
     /// explicitly optional in applications.
     pub fn disabled() -> Self {
         Self::default()
-    }
-}
-
-impl Default for CaptchaSolverConfig {
-    fn default() -> Self {
-        Self {
-            solver_url: None,
-            callback_url: None,
-        }
     }
 }
 

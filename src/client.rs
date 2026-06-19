@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use crate::captcha::CaptchaSolver;
+use crate::captcha::solver::CaptchaSolver;
 use crate::error::{Error, Result};
 use crate::models::{IncomingMessage, Session, UserAgent, BROWSER_USER_AGENT};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
@@ -46,11 +46,12 @@ impl Inner {
     }
 
     fn next_cid(&self) -> i64 {
-        let now = chrono_millis();
-        // Ensure strictly increasing, unique client ids.
+        let now = -chrono_millis();
+        // Client-generated message ids are negative to avoid colliding with
+        // server-assigned ids. Keep them unique even within the same millisecond.
         let mut prev = self.cid.load(Ordering::Relaxed);
         loop {
-            let next = now.max(prev + 1);
+            let next = now.min(prev - 1);
             match self
                 .cid
                 .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
@@ -147,7 +148,7 @@ impl MaxClient {
             pending: Mutex::new(HashMap::new()),
             file_waiters: Mutex::new(HashMap::new()),
             seq: AtomicU32::new(1),
-            cid: AtomicI64::new(chrono_millis()),
+            cid: AtomicI64::new(-chrono_millis()),
             session_initialized: AtomicBool::new(false),
             user_agent,
             http,
@@ -333,16 +334,7 @@ impl MaxClient {
 
     /// Sends a plain text message to `chat_id`.
     pub async fn send_text(&self, chat_id: i64, text: &str) -> Result<()> {
-        let payload = json!({
-            "chatId": chat_id,
-            "message": {
-                "text": text,
-                "cid": self.inner.next_cid(),
-                "elements": [],
-                "attaches": [],
-            },
-            "notify": true,
-        });
+        let payload = text_message_payload(chat_id, text, self.inner.next_cid());
         self.inner.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
     }
@@ -351,7 +343,7 @@ impl MaxClient {
     pub async fn send_typing(&self, chat_id: i64) -> Result<()> {
         let payload = json!({
             "chatId": chat_id,
-            "type": "TYPING",
+            "type": "TEXT",
         });
         self.inner.invoke(opcode::MSG_TYPING, payload).await?;
         Ok(())
@@ -426,6 +418,7 @@ impl MaxClient {
             "message": {
                 "text": caption,
                 "cid": self.inner.next_cid(),
+                "type": "USER",
                 "elements": [],
                 "attaches": [{ "_type": "FILE", "fileId": file_id }],
             },
@@ -443,6 +436,20 @@ impl MaxClient {
             .await?;
         Ok(())
     }
+}
+
+fn text_message_payload(chat_id: i64, text: &str, cid: i64) -> Value {
+    json!({
+        "chatId": chat_id,
+        "message": {
+            "text": text,
+            "cid": cid,
+            "type": "USER",
+            "elements": [],
+            "attaches": [],
+        },
+        "notify": true,
+    })
 }
 
 async fn read_loop(
@@ -573,5 +580,18 @@ mod tests {
         assert_eq!(error_message(&json!({ "error": "boom" })), "boom");
         assert_eq!(error_message(&json!({ "message": "m" })), "m");
         assert_eq!(error_message(&json!({})), "unknown error");
+    }
+
+    #[test]
+    fn text_message_payload_matches_web_schema() {
+        let payload = text_message_payload(295438091, "hello", -1_700_000_000_001);
+
+        assert_eq!(payload["chatId"], 295438091);
+        assert_eq!(payload["message"]["text"], "hello");
+        assert_eq!(payload["message"]["cid"], -1_700_000_000_001i64);
+        assert_eq!(payload["message"]["type"], "USER");
+        assert_eq!(payload["message"]["elements"], json!([]));
+        assert_eq!(payload["message"]["attaches"], json!([]));
+        assert_eq!(payload["notify"], true);
     }
 }

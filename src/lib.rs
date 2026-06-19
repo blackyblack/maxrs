@@ -4,9 +4,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use maxrs::MaxClient;
+//! use maxrs::client::MaxClient;
 //!
-//! # async fn run() -> maxrs::Result<()> {
+//! # async fn run() -> maxrs::error::Result<()> {
 //! let (client, mut messages) = MaxClient::connect().await?;
 //!
 //! // Listen for incoming messages in the background.
@@ -26,13 +26,9 @@
 //! # }
 //! ```
 
+pub mod auth;
 pub mod captcha;
-mod client;
-mod error;
+pub mod client;
+pub mod error;
 pub mod models;
 pub mod protocol;
-
-pub use captcha::{CaptchaCallback, CaptchaChallenge, CaptchaSolver, CaptchaSolverConfig};
-pub use client::MaxClient;
-pub use error::{Error, Result};
-pub use models::{IncomingMessage, Session, UserAgent};

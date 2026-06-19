@@ -1,10 +1,11 @@
 use thiserror::Error;
+use tokio_tungstenite::tungstenite;
 
 /// Errors returned by the Max client.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("websocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tungstenite::Error>),
 
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
@@ -57,3 +58,9 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<tungstenite::Error> for Error {
+    fn from(err: tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(err))
+    }
+}
