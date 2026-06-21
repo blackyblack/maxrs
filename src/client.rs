@@ -15,6 +15,9 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
+use crate::auth::{AuthCaptchaConfig, LoginConfig};
+use crate::captcha::http::{HttpServer, HttpServerConfig};
+use crate::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 use crate::error::{Error, Result};
 use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
@@ -178,9 +181,57 @@ impl MaxClient {
         });
     }
 
-    /// Sends the `SESSION_INIT` handshake. Called automatically by the auth
-    /// helpers, but exposed for completeness.
-    pub(crate) async fn session_init(&self) -> Result<()> {
+    /// Logs in using a saved session token when valid, otherwise starts the SMS auth flow.
+    pub async fn login(&self, config: LoginConfig) -> Result<Session> {
+        if let Some(token) = config.session_token.as_deref() {
+            match self.login_with_token(token).await {
+                Ok(session) => return Ok(session),
+                Err(err) => {
+                    tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
+                }
+            }
+        }
+
+        let phone = config
+            .phone
+            .as_deref()
+            .ok_or_else(|| Error::UnexpectedResponse("missing phone for SMS login".into()))?;
+        let sms_token = self
+            .request_sms_code_with_auth_captcha(phone, &config.captcha)
+            .await?;
+        let code = config.operator.request_sms_code(phone).await?;
+        self.verify_sms_code(&sms_token, code.trim()).await
+    }
+
+    async fn request_sms_code_with_auth_captcha(
+        &self,
+        phone: &str,
+        config: &AuthCaptchaConfig,
+    ) -> Result<String> {
+        match self.request_sms_code(phone).await {
+            Ok(token) => Ok(token),
+            Err(Error::CaptchaRequired { link }) => {
+                let solver_url = config
+                    .solver_url
+                    .as_ref()
+                    .ok_or(Error::CaptchaSolverDisabled)?;
+                let server = HttpServer::bind(HttpServerConfig::new(&config.callback_bind)).await?;
+                let callback_addr = server.local_addr()?;
+                let callback_url = config.callback_url(callback_addr);
+                let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
+                    solver_url.clone(),
+                    callback_url,
+                ))?);
+                tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
+                let captcha_token = solver.solve(&link).await?;
+                self.request_sms_code_with_captcha_token(phone, &captcha_token)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn session_init(&self) -> Result<()> {
         if self
             .inner
             .session_initialized
@@ -206,13 +257,7 @@ impl MaxClient {
     }
 
     /// Requests a captcha challenge URL for SMS authentication.
-    ///
-    /// Browser-based callers can show this link in a VK captcha widget and pass
-    /// the resulting token to [`MaxClient::request_sms_code_with_captcha_token`].
-    pub(crate) async fn request_auth_captcha_internal(
-        &self,
-        phone: &str,
-    ) -> Result<Option<String>> {
+    async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
         self.session_init().await?;
         let payload = json!({
             "source": "auth",
@@ -241,24 +286,16 @@ impl MaxClient {
     ///
     /// Returns a short-lived token that must be passed to
     /// [`MaxClient::verify_sms_code`] together with the received code.
-    pub(crate) async fn request_sms_code_internal(&self, phone: &str) -> Result<String> {
-        if let Some(link) = self.request_auth_captcha_internal(phone).await? {
+    async fn request_sms_code(&self, phone: &str) -> Result<String> {
+        if let Some(link) = self.request_auth_captcha(phone).await? {
             return Err(Error::CaptchaRequired { link });
         }
 
-        self.request_sms_code_with_captcha_token_internal(phone, "")
-            .await
+        self.request_sms_code_with_captcha_token(phone, "").await
     }
 
-    /// Step 1 of SMS auth using an optional external captcha solver.
-    ///
-    /// If Max returns a captcha URL, it is sent to `captcha_solver`; this method
-    /// then waits for the solver callback token and retries the SMS request with
-    /// that token. If no captcha is returned, it behaves like
-    /// [`MaxClient::request_sms_code`].
-    /// Step 1 of SMS auth with a captcha token obtained from
-    /// [`MaxClient::request_auth_captcha`].
-    pub(crate) async fn request_sms_code_with_captcha_token_internal(
+    /// Step 1 of SMS auth with a captcha token obtained from captcha solving.
+    async fn request_sms_code_with_captcha_token(
         &self,
         phone: &str,
         captcha_token: &str,
@@ -279,14 +316,8 @@ impl MaxClient {
 
     /// Step 2 of SMS auth: verifies the code and logs in.
     ///
-    /// On success the long-lived session token (kept in memory) is returned in
-    /// [`Session`]; store it to re-login later via
-    /// [`MaxClient::login_with_token`] without a new SMS.
-    pub(crate) async fn verify_sms_code_internal(
-        &self,
-        sms_token: &str,
-        code: &str,
-    ) -> Result<Session> {
+    /// On success the long-lived session token is returned in [`Session`].
+    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
         let payload = json!({
             "token": sms_token,
             "verifyCode": code,
@@ -298,10 +329,10 @@ impl MaxClient {
             .map(|s| s.to_string())
             .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))?;
 
-        self.login_with_token_internal(&token).await
+        self.login_with_token(&token).await
     }
 
-    pub(crate) async fn login_with_token_internal(&self, token: &str) -> Result<Session> {
+    async fn login_with_token(&self, token: &str) -> Result<Session> {
         self.session_init().await?;
         self.perform_login(token).await
     }
@@ -585,5 +616,30 @@ mod tests {
         assert_eq!(payload["message"]["elements"], json!([]));
         assert_eq!(payload["message"]["attaches"], json!([]));
         assert_eq!(payload["notify"], true);
+    }
+
+    #[test]
+    fn text_message_payload_serializes_typed_formatter_elements() {
+        let message = MaxMessage::with_elements(
+            "hello docs",
+            vec![
+                crate::models::MessageElement::strong(0, 5),
+                crate::models::MessageElement::link(6, 4, "https://example.test"),
+            ],
+        );
+        let payload = text_message_payload(295438091, &message, -1_700_000_000_002);
+
+        assert_eq!(
+            payload["message"]["elements"],
+            json!([
+                { "_type": "STRONG", "from": 0, "length": 5 },
+                {
+                    "_type": "LINK",
+                    "from": 6,
+                    "length": 4,
+                    "url": "https://example.test"
+                }
+            ])
+        );
     }
 }

@@ -2,17 +2,9 @@
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-use crate::captcha::http::{HttpServer, HttpServerConfig};
-use crate::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
-use crate::client::MaxClient;
 use crate::error::{Error, Result};
-use crate::models::Session;
 
 pub const ENV_SESSION_TOKEN: &str = "MAX_SESSION_TOKEN";
 pub const ENV_PHONE: &str = "MAX_PHONE";
@@ -77,8 +69,10 @@ impl OperatorChannel {
     pub(crate) async fn request_sms_code(&self, phone: &str) -> Result<String> {
         match self {
             OperatorChannel::None => Err(Error::NoOperatorChannel),
-            OperatorChannel::Cli => prompt(&format!("Enter the SMS code for {phone}: ")).await,
-            OperatorChannel::Telegram(config) => request_telegram_code(config, phone).await,
+            OperatorChannel::Cli => crate::operator_channels::cli::request_sms_code(phone).await,
+            OperatorChannel::Telegram(config) => {
+                crate::operator_channels::telegram::request_sms_code(config, phone).await
+            }
         }
     }
 }
@@ -150,118 +144,6 @@ impl AuthCaptchaConfig {
 impl Default for AuthCaptchaConfig {
     fn default() -> Self {
         Self::from_env()
-    }
-}
-
-impl MaxClient {
-    /// Logs in using a saved session token when valid, otherwise starts the SMS auth flow.
-    pub async fn login(&self, config: LoginConfig) -> Result<Session> {
-        if let Some(token) = config.session_token.as_deref() {
-            match self.login_with_token_internal(token).await {
-                Ok(session) => return Ok(session),
-                Err(err) => {
-                    tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
-                }
-            }
-        }
-
-        let phone = config
-            .phone
-            .as_deref()
-            .ok_or_else(|| Error::UnexpectedResponse("missing phone for SMS login".into()))?;
-        let sms_token = self
-            .request_sms_code_with_auth_captcha_internal(phone, &config.captcha)
-            .await?;
-        let code = config.operator.request_sms_code(phone).await?;
-        self.verify_sms_code_internal(&sms_token, code.trim()).await
-    }
-
-    pub(crate) async fn request_sms_code_with_auth_captcha_internal(
-        &self,
-        phone: &str,
-        config: &AuthCaptchaConfig,
-    ) -> Result<String> {
-        match self.request_sms_code_internal(phone).await {
-            Ok(token) => Ok(token),
-            Err(Error::CaptchaRequired { link }) => {
-                let solver_url = config
-                    .solver_url
-                    .as_ref()
-                    .ok_or(Error::CaptchaSolverDisabled)?;
-                let server = HttpServer::bind(HttpServerConfig::new(&config.callback_bind)).await?;
-                let callback_addr = server.local_addr()?;
-                let callback_url = config.callback_url(callback_addr);
-                let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
-                    solver_url.clone(),
-                    callback_url,
-                ))?);
-                tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
-                let captcha_token = solver.solve(&link).await?;
-                self.request_sms_code_with_captcha_token_internal(phone, &captcha_token)
-                    .await
-            }
-            Err(err) => Err(err),
-        }
-    }
-}
-
-async fn prompt(label: &str) -> Result<String> {
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(label.as_bytes()).await?;
-    stdout.flush().await?;
-    let mut line = String::new();
-    let mut reader = BufReader::new(tokio::io::stdin());
-    reader.read_line(&mut line).await?;
-    Ok(line)
-}
-
-async fn request_telegram_code(config: &TelegramOperatorConfig, phone: &str) -> Result<String> {
-    let http = reqwest::Client::new();
-    let base = format!("https://api.telegram.org/bot{}", config.bot_token);
-    let prompt = format!("Max login requested for {phone}. Reply to this chat with the SMS code.");
-    let send: Value = http
-        .post(format!("{base}/sendMessage"))
-        .json(&serde_json::json!({ "chat_id": config.chat_id, "text": prompt }))
-        .send()
-        .await?
-        .json()
-        .await?;
-    if !send["ok"].as_bool().unwrap_or(false) {
-        return Err(Error::Telegram(send.to_string()));
-    }
-
-    let deadline = tokio::time::Instant::now() + config.poll_timeout;
-    let mut offset = 0_i64;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(Error::Timeout(0));
-        }
-        let resp: Value = http
-            .get(format!("{base}/getUpdates"))
-            .query(&[("timeout", "20"), ("offset", &offset.to_string())])
-            .send()
-            .await?
-            .json()
-            .await?;
-        if !resp["ok"].as_bool().unwrap_or(false) {
-            return Err(Error::Telegram(resp.to_string()));
-        }
-        if let Some(updates) = resp["result"].as_array() {
-            for update in updates {
-                if let Some(id) = update["update_id"].as_i64() {
-                    offset = id + 1;
-                }
-                let message = &update["message"];
-                if message["chat"]["id"].as_i64() == Some(config.chat_id) {
-                    if let Some(text) = message["text"].as_str() {
-                        let code = text.trim();
-                        if !code.is_empty() {
-                            return Ok(code.to_string());
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 

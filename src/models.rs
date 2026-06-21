@@ -1,7 +1,6 @@
 //! Typed views over the JSON payloads this client cares about.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Client/device descriptor sent during `SESSION_INIT` and `LOGIN`.
 ///
@@ -77,9 +76,9 @@ pub struct Session {
 pub struct MaxMessage {
     /// Message text.
     pub text: String,
-    /// Raw formatter element objects accepted by Max.
+    /// Formatter elements applied to spans in `text`.
     #[serde(default)]
-    pub elements: Vec<Value>,
+    pub elements: Vec<MessageElement>,
 }
 
 impl MaxMessage {
@@ -90,10 +89,81 @@ impl MaxMessage {
         }
     }
 
-    pub fn with_elements(text: impl Into<String>, elements: Vec<Value>) -> Self {
+    pub fn with_elements(text: impl Into<String>, elements: Vec<MessageElement>) -> Self {
         Self {
             text: text.into(),
             elements,
         }
     }
+}
+
+/// Formatting elements supported by Max text messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageElement {
+    #[serde(rename = "_type")]
+    pub kind: MessageElementKind,
+    pub from: usize,
+    pub length: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl MessageElement {
+    pub fn strong(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Strong, from, length)
+    }
+    pub fn emphasized(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Emphasized, from, length)
+    }
+    pub fn underline(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Underline, from, length)
+    }
+    pub fn strikethrough(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Strikethrough, from, length)
+    }
+    pub fn monospaced(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Monospaced, from, length)
+    }
+    pub fn code(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Code, from, length)
+    }
+    pub fn heading(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Heading, from, length)
+    }
+    pub fn quote(from: usize, length: usize) -> Self {
+        Self::new(MessageElementKind::Quote, from, length)
+    }
+
+    pub fn link(from: usize, length: usize, url: impl Into<String>) -> Self {
+        Self {
+            kind: MessageElementKind::Link,
+            from,
+            length,
+            url: Some(url.into()),
+        }
+    }
+
+    pub fn new(kind: MessageElementKind, from: usize, length: usize) -> Self {
+        Self {
+            kind,
+            from,
+            length,
+            url: None,
+        }
+    }
+}
+
+/// Max-supported text formatter element kinds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MessageElementKind {
+    Strong,
+    Emphasized,
+    Underline,
+    Strikethrough,
+    Monospaced,
+    Code,
+    Link,
+    Heading,
+    Quote,
 }

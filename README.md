@@ -151,6 +151,10 @@ token is missing or rejected by Max, it requests a fresh SMS code for
 `MAX_OPERATOR_CHANNEL=telegram`, or `MAX_OPERATOR_CHANNEL=none`. Telegram mode
 uses `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`.
 
+`MaxMessage` supports typed formatter elements for bold, italic, underline,
+strikethrough, inline code, code blocks, links, headings, and quotes through
+`MessageElement`.
+
 ## Protocol Notes
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
