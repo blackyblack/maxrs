@@ -41,8 +41,8 @@ pub enum Error {
     NoOperatorChannel,
 
     /// Telegram was selected as operator channel but required env vars are missing or invalid.
-    #[error("telegram operator channel is requested but configuration is missing or invalid: {missing}; set MAX_TELEGRAM_BOT_TOKEN and MAX_TELEGRAM_CHAT_ID")]
-    TelegramConfigMissing { missing: String },
+    #[error("telegram operator channel is requested but configuration is missing or invalid: {0}")]
+    TelegramConfigMissing(String),
 
     /// Login needs the sign-in password but no password is configured.
     #[error("max login requires a password but MAX_PASSWORD is not configured")]
