@@ -161,8 +161,7 @@ container can route to on the host. The solve API should be reachable from
 ## Usage
 
 ```rust
-use maxrs::auth::LoginConfig;
-use maxrs::client::MaxClient;
+use maxrs::client::{LoginConfig, MaxClient};
 use maxrs::models::MaxMessage;
 
 #[tokio::main]

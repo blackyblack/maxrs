@@ -13,8 +13,7 @@
 //! - `MAX_OPERATOR_CHANNEL`: `cli`, `telegram`, or `none` for SMS code entry.
 //! - `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`: required for Telegram.
 
-use maxrs::auth::LoginConfig;
-use maxrs::client::MaxClient;
+use maxrs::client::{LoginConfig, MaxClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

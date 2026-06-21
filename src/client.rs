@@ -15,11 +15,17 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use crate::auth::{AuthCaptchaConfig, LoginConfig};
-use crate::captcha::http::{HttpServer, HttpServerConfig};
-use crate::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
+pub use crate::auth::{
+    session_token_from_env, AuthCaptchaConfig, LoginConfig, DEFAULT_CALLBACK_BIND,
+    DEFAULT_CAPTCHA_CALLBACK_PATH, DEFAULT_SOLVER_URL, ENV_CALLBACK_BIND, ENV_CALLBACK_URL_BASE,
+    ENV_PASSWORD, ENV_PHONE, ENV_SESSION_TOKEN, ENV_SOLVER_URL,
+};
 use crate::error::{Error, Result};
 use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};
+pub use crate::operator_channels::{
+    OperatorChannel, TelegramOperatorConfig, ENV_OPERATOR_CHANNEL, ENV_TELEGRAM_BOT_TOKEN,
+    ENV_TELEGRAM_CHAT_ID, ENV_TELEGRAM_POLL_TIMEOUT_SECS,
+};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
 
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
@@ -31,7 +37,7 @@ const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
 
-struct Inner {
+pub(crate) struct InnerClient {
     sink: Mutex<WsSink>,
     pending: Mutex<HashMap<u32, oneshot::Sender<Packet>>>,
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
@@ -42,7 +48,7 @@ struct Inner {
     http: reqwest::Client,
 }
 
-impl Inner {
+impl InnerClient {
     fn next_seq(&self) -> u32 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
@@ -71,7 +77,7 @@ impl Inner {
         Ok(())
     }
 
-    async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
+    pub(crate) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
         let seq = self.next_seq();
         let (tx, rx) = oneshot::channel();
         {
@@ -103,6 +109,28 @@ impl Inner {
             }
         }
     }
+
+    pub(crate) async fn session_init(&self) -> Result<()> {
+        if self
+            .session_initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let payload = json!({
+            "userAgent": self.user_agent,
+            "deviceId": uuid::Uuid::new_v4().to_string(),
+        });
+        match self.invoke(opcode::SESSION_INIT, payload).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.session_initialized.store(false, Ordering::Release);
+                Err(err)
+            }
+        }
+    }
 }
 
 /// An asynchronous client for the Max (OneMe) WebSocket API.
@@ -112,7 +140,7 @@ impl Inner {
 /// messages while sending from another.
 #[derive(Clone)]
 pub struct MaxClient {
-    inner: Arc<Inner>,
+    inner: Arc<InnerClient>,
 }
 
 impl MaxClient {
@@ -144,7 +172,7 @@ impl MaxClient {
             .user_agent(BROWSER_USER_AGENT)
             .build()?;
 
-        let inner = Arc::new(Inner {
+        let inner = Arc::new(InnerClient {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
             file_waiters: Mutex::new(HashMap::new()),
@@ -183,211 +211,7 @@ impl MaxClient {
 
     /// Logs in using a saved session token when valid, otherwise starts the SMS auth flow.
     pub async fn login(&self, config: LoginConfig) -> Result<Session> {
-        if let Some(token) = config.session_token.as_deref() {
-            match self.login_with_token(token).await {
-                Ok(session) => return Ok(session),
-                Err(err) if should_fallback_to_sms_login(&err) => {
-                    tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let phone = config
-            .phone
-            .as_deref()
-            .ok_or_else(|| Error::UnexpectedResponse("missing phone for SMS login".into()))?;
-        let sms_token = self
-            .request_sms_code_with_auth_captcha(phone, &config.captcha)
-            .await?;
-        let code = config.operator.request_sms_code(phone).await?;
-        self.verify_sms_code(&sms_token, code.trim(), config.password.as_deref())
-            .await
-    }
-
-    async fn request_sms_code_with_auth_captcha(
-        &self,
-        phone: &str,
-        config: &AuthCaptchaConfig,
-    ) -> Result<String> {
-        match self.request_sms_code(phone).await {
-            Ok(token) => Ok(token),
-            Err(Error::CaptchaRequired { link }) => {
-                let solver_url = config
-                    .solver_url
-                    .as_ref()
-                    .ok_or(Error::CaptchaSolverDisabled)?;
-                let server = HttpServer::bind(HttpServerConfig::new(&config.callback_bind)).await?;
-                let callback_addr = server.local_addr()?;
-                let callback_url = config.callback_url(callback_addr);
-                let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
-                    solver_url.clone(),
-                    callback_url,
-                ))?);
-                tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
-                let captcha_token = solver.solve(&link).await?;
-                self.request_sms_code_with_captcha_token(phone, &captcha_token)
-                    .await
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn session_init(&self) -> Result<()> {
-        if self
-            .inner
-            .session_initialized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        let payload = json!({
-            "userAgent": self.inner.user_agent,
-            "deviceId": uuid::Uuid::new_v4().to_string(),
-        });
-        match self.inner.invoke(opcode::SESSION_INIT, payload).await {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                self.inner
-                    .session_initialized
-                    .store(false, Ordering::Release);
-                Err(err)
-            }
-        }
-    }
-
-    /// Requests a captcha challenge URL for SMS authentication.
-    async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
-        self.session_init().await?;
-        let payload = json!({
-            "source": "auth",
-            "identifier": phone,
-        });
-        match self
-            .inner
-            .invoke(opcode::AUTH_CAPTCHA_REQUEST, payload)
-            .await
-        {
-            Ok(response) => Ok(response.payload["link"].as_str().map(str::to_string)),
-            Err(Error::Server { opcode, message })
-                if message == "captcha.create-session-failed" =>
-            {
-                tracing::debug!(
-                    opcode,
-                    "captcha session creation failed; continuing without token"
-                );
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Step 1 of SMS auth: requests that the server send an SMS code to `phone`.
-    ///
-    /// Returns a short-lived token that must be passed to
-    /// [`MaxClient::verify_sms_code`] together with the received code.
-    async fn request_sms_code(&self, phone: &str) -> Result<String> {
-        if let Some(link) = self.request_auth_captcha(phone).await? {
-            return Err(Error::CaptchaRequired { link });
-        }
-
-        self.request_sms_code_with_captcha_token(phone, "").await
-    }
-
-    /// Step 1 of SMS auth with a captcha token obtained from captcha solving.
-    async fn request_sms_code_with_captcha_token(
-        &self,
-        phone: &str,
-        captcha_token: &str,
-    ) -> Result<String> {
-        self.session_init().await?;
-        let payload = json!({
-            "phone": phone,
-            "type": "START_AUTH",
-            "language": "ru",
-            "captchaToken": captcha_token,
-        });
-        let response = self.inner.invoke(opcode::AUTH_REQUEST, payload).await?;
-        response.payload["token"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::UnexpectedResponse("missing auth token".into()))
-    }
-
-    /// Step 2 of SMS auth: verifies the code and logs in.
-    ///
-    /// On success the long-lived session token is returned in [`Session`].
-    async fn verify_sms_code(
-        &self,
-        sms_token: &str,
-        code: &str,
-        password: Option<&str>,
-    ) -> Result<Session> {
-        let payload = json!({
-            "token": sms_token,
-            "verifyCode": code,
-            "authTokenType": "CHECK_CODE",
-        });
-        let response = self.inner.invoke(opcode::AUTH, payload).await?;
-        if response.payload["passwordChallenge"].is_object() {
-            return self
-                .verify_password_challenge(&response.payload["passwordChallenge"], password)
-                .await;
-        }
-
-        self.login_with_auth_payload(&response.payload).await
-    }
-
-    async fn verify_password_challenge(
-        &self,
-        challenge: &Value,
-        password: Option<&str>,
-    ) -> Result<Session> {
-        let track_id = challenge["trackId"].as_str().ok_or_else(|| {
-            Error::UnexpectedResponse("missing password challenge trackId".into())
-        })?;
-        let password = password.ok_or(Error::PasswordRequired)?;
-        let response = self
-            .inner
-            .invoke(
-                opcode::AUTH_PASSWORD,
-                json!({
-                    "trackId": track_id,
-                    "password": password,
-                }),
-            )
-            .await?;
-
-        self.login_with_auth_payload(&response.payload).await
-    }
-
-    async fn login_with_auth_payload(&self, payload: &Value) -> Result<Session> {
-        let token = login_token_from_auth_payload(payload)?;
-        self.login_with_token(&token).await
-    }
-
-    async fn login_with_token(&self, token: &str) -> Result<Session> {
-        self.session_init().await?;
-        self.perform_login(token).await
-    }
-
-    async fn perform_login(&self, token: &str) -> Result<Session> {
-        let payload = json!({
-            "interactive": true,
-            "token": token,
-            "chatsSync": 0,
-            "contactsSync": 0,
-            "presenceSync": 0,
-            "draftsSync": 0,
-            "chatsCount": 40,
-        });
-        let response = self.inner.invoke(opcode::LOGIN, payload).await?;
-        Ok(Session {
-            token: token.to_string(),
-            login_payload: response.payload,
-        })
+        self.inner.login(config).await
     }
 
     /// Sends a text message to `chat_id`.
@@ -512,13 +336,9 @@ fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
     })
 }
 
-fn should_fallback_to_sms_login(err: &Error) -> bool {
-    matches!(err, Error::Server { opcode, .. } if *opcode == opcode::LOGIN)
-}
-
 async fn read_loop(
     mut read: SplitStream<WsStream>,
-    inner: Arc<Inner>,
+    inner: Arc<InnerClient>,
     msg_tx: mpsc::UnboundedSender<IncomingMessage>,
 ) {
     while let Some(frame) = read.next().await {
@@ -553,7 +373,7 @@ async fn read_loop(
 }
 
 async fn handle_server_request(
-    inner: &Arc<Inner>,
+    inner: &Arc<InnerClient>,
     msg_tx: &mpsc::UnboundedSender<IncomingMessage>,
     packet: Packet,
 ) {
@@ -600,13 +420,6 @@ fn error_message(payload: &Value) -> String {
         .or_else(|| payload["localizedMessage"].as_str())
         .unwrap_or("unknown error")
         .to_string()
-}
-
-fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
-    payload["tokenAttrs"]["LOGIN"]["token"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))
 }
 
 fn chrono_millis() -> i64 {
@@ -689,37 +502,6 @@ mod tests {
                     "url": "https://example.test"
                 }
             ])
-        );
-    }
-
-    #[test]
-    fn sms_login_fallback_only_handles_login_server_errors() {
-        assert!(should_fallback_to_sms_login(&Error::Server {
-            opcode: opcode::LOGIN,
-            message: "invalid session".into(),
-        }));
-        assert!(!should_fallback_to_sms_login(&Error::Server {
-            opcode: opcode::AUTH,
-            message: "invalid code".into(),
-        }));
-        assert!(!should_fallback_to_sms_login(&Error::Timeout(
-            opcode::LOGIN
-        )));
-    }
-
-    #[test]
-    fn extracts_login_token_from_auth_payload() {
-        let payload = json!({
-            "tokenAttrs": {
-                "LOGIN": {
-                    "token": "session-token"
-                }
-            }
-        });
-
-        assert_eq!(
-            login_token_from_auth_payload(&payload).unwrap(),
-            "session-token"
         );
     }
 }
