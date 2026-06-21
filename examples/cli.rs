@@ -16,7 +16,14 @@
 use maxrs::client::{LoginConfig, MaxClient};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
 
     tracing_subscriber::fmt()

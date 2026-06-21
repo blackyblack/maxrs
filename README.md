@@ -160,57 +160,19 @@ container can route to on the host. The solve API should be reachable from
 
 ## Usage
 
-```rust
-use maxrs::client::{LoginConfig, MaxClient};
-use maxrs::models::MaxMessage;
-
-#[tokio::main]
-async fn main() -> maxrs::error::Result<()> {
-    let login_config = LoginConfig::from_env()?;
-
-    let (client, mut messages) = MaxClient::connect().await?;
-
-    tokio::spawn(async move {
-        while let Some(msg) = messages.recv().await {
-            println!("[chat {}] {}: {}", msg.chat_id, msg.sender, msg.text);
-        }
-    });
-
-    let session = client.login(login_config).await?;
-    println!("session token: {}", session.token);
-
-    client.send_typing(123456).await?;
-    client.send_text(123456, MaxMessage::new("Hello from Rust!")).await?;
-    client.send_file(123456, "report.pdf", "Here is the report").await?;
-
-    Ok(())
-}
-```
-
-`MaxClient::login` first tries `MAX_SESSION_TOKEN` when configured. If that
-token is missing or rejected by Max, it requests a fresh SMS code for
-`MAX_PHONE`. If Max requires a sign-in password after the SMS code, it uses
-`MAX_PASSWORD`. Configure SMS code entry with `MAX_OPERATOR_CHANNEL=cli`,
-`MAX_OPERATOR_CHANNEL=telegram`, or `MAX_OPERATOR_CHANNEL=none`. Telegram mode
-uses `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`.
-
-`MaxMessage` supports typed formatter elements for bold, italic, underline,
-strikethrough, inline code, code blocks, links, headings, and quotes through
-`MessageElement`.
-
-## Protocol Notes
-
-See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
-
-## Example CLI
+Run the CLI example after configuring the needed environment variables:
 
 ```bash
 cargo run --example cli
 ```
 
-The CLI connects, logs in with `MAX_SESSION_TOKEN` or interactive auth, then
-listens for incoming messages until Ctrl-C. It does not print login payload
-details such as chats or contacts, and it does not send messages.
+The CLI logs in with `MAX_SESSION_TOKEN` when available. Otherwise it uses
+`MAX_PHONE`, requests an SMS code through the configured operator channel, and
+then listens for incoming messages until Ctrl-C.
+
+## Protocol Notes
+
+See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
 
 ## License
 
