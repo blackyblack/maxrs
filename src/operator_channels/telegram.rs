@@ -57,21 +57,21 @@ fn telegram_http_client() -> Result<reqwest::Client> {
         .retry(
             reqwest::retry::for_host(TELEGRAM_API_HOST)
                 .max_retries_per_request(2)
-                .classify_fn(|req_rep| {
-                    let should_retry = req_rep.method() == reqwest::Method::GET
-                        && req_rep.uri().path().ends_with("/getUpdates")
-                        && (req_rep.error().is_some()
+                .classify_fn(|request_result| {
+                    let should_retry = request_result.method() == reqwest::Method::GET
+                        && request_result.uri().path().ends_with("/getUpdates")
+                        && (request_result.error().is_some()
                             || matches!(
-                                req_rep.status(),
+                                request_result.status(),
                                 Some(status)
                                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS
                                         || status.is_server_error()
                             ));
 
                     if should_retry {
-                        req_rep.retryable()
+                        request_result.retryable()
                     } else {
-                        req_rep.success()
+                        request_result.success()
                     }
                 }),
         )

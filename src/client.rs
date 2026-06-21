@@ -497,13 +497,15 @@ impl MaxClient {
 }
 
 fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
+    let text = &message.text;
+    let elements = &message.elements;
     json!({
         "chatId": chat_id,
         "message": {
-            "text": &message.text,
-            "cid": &cid,
+            "text": text,
+            "cid": cid,
             "type": "USER",
-            "elements": &message.elements,
+            "elements": elements,
             "attaches": [],
         },
         "notify": true,
