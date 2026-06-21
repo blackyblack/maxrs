@@ -43,7 +43,7 @@ async fn request_text(config: &TelegramOperatorConfig, prompt: &str) -> Result<S
                     offset = id + 1;
                 }
                 if let Some(text) =
-                    operator_text_from_update(update, config.chat_id, config.bot_user_id, prompt)
+                    operator_text_from_update(update, config.chat_id, config.bot_user_id)
                 {
                     return Ok(text);
                 }
@@ -115,17 +115,12 @@ fn next_update_offset(resp: &Value) -> Result<i64> {
         .unwrap_or_default())
 }
 
-fn operator_text_from_update(
-    update: &Value,
-    chat_id: i64,
-    bot_user_id: i64,
-    prompt: &str,
-) -> Option<String> {
+fn operator_text_from_update(update: &Value, chat_id: i64, bot_user_id: i64) -> Option<String> {
     let message = &update["message"];
     if message["chat"]["id"].as_i64() != Some(chat_id) {
         return None;
     }
-    if is_own_message(message, bot_user_id, prompt) {
+    if is_own_message(message, bot_user_id) {
         return None;
     }
 
@@ -137,7 +132,7 @@ fn operator_text_from_update(
     }
 }
 
-fn is_own_message(message: &Value, bot_user_id: i64, _prompt: &str) -> bool {
+fn is_own_message(message: &Value, bot_user_id: i64) -> bool {
     message["from"]["id"].as_i64() == Some(bot_user_id)
 }
 
@@ -156,15 +151,7 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            operator_text_from_update(
-                &update,
-                42,
-                1001,
-                "Max login requested for +100. Reply to this chat with the SMS code.",
-            ),
-            None
-        );
+        assert_eq!(operator_text_from_update(&update, 42, 1001,), None);
     }
 
     #[test]
@@ -178,7 +165,7 @@ mod tests {
         });
 
         assert_eq!(
-            operator_text_from_update(&update, 42, 1001, "prompt"),
+            operator_text_from_update(&update, 42, 1001),
             Some("12345".to_string())
         );
     }
@@ -194,7 +181,7 @@ mod tests {
         });
 
         assert_eq!(
-            operator_text_from_update(&update, 42, 1001, "prompt"),
+            operator_text_from_update(&update, 42, 1001),
             Some("prompt".to_string())
         );
     }
