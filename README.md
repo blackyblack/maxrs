@@ -56,12 +56,53 @@ Default: unset.
 Saved Max session token. When set, the CLI logs in with this token and skips SMS
 auth.
 
+`MAX_PHONE`
+
+Default: unset.
+
+Phone number used for SMS auth when `MAX_SESSION_TOKEN` is unset or rejected.
+
+`MAX_PASSWORD`
+
+Default: unset.
+
+Sign-in password used only when Max requires a password challenge after the SMS
+code.
+
+`MAX_OPERATOR_CHANNEL`
+
+Default: `cli`.
+
+SMS code entry channel. Use `cli`, `telegram`, or `none`. If set to
+`telegram`, both `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID` must be
+configured.
+
+`MAX_TELEGRAM_BOT_TOKEN`
+
+Default: unset.
+
+Telegram bot token used when `MAX_OPERATOR_CHANNEL=telegram`.
+
+`MAX_TELEGRAM_CHAT_ID`
+
+Default: unset.
+
+Telegram chat id where SMS prompts are sent when `MAX_OPERATOR_CHANNEL=telegram`.
+
+`MAX_TELEGRAM_POLL_TIMEOUT_SECS`
+
+Default: `300`.
+
+Maximum time to wait for a Telegram SMS-code reply.
+
 `MAX_SOLVER_URL`
 
 Default: `http://127.0.0.1:3000`.
 
 Base URL of the `max_captcha_solver` solve API. The helper posts captcha
-challenges to `POST /solve` on this service when Max requires auth captcha.
+challenges to `POST /solve` on this service when Max requires auth captcha. If
+Max asks for captcha and this service is not running or not reachable, login
+fails with a captcha solver configuration error.
 
 `MAX_CALLBACK_BIND`
 
@@ -119,65 +160,19 @@ container can route to on the host. The solve API should be reachable from
 
 ## Usage
 
-```rust
-use maxrs::client::MaxClient;
-
-#[tokio::main]
-async fn main() -> maxrs::error::Result<()> {
-    let (client, mut messages) = MaxClient::connect().await?;
-
-    tokio::spawn(async move {
-        while let Some(msg) = messages.recv().await {
-            println!("[chat {}] {}: {}", msg.chat_id, msg.sender, msg.text);
-        }
-    });
-
-    let sms_token = client.request_sms_code("+79990000000").await?;
-    let session = client.verify_sms_code(&sms_token, "12345").await?;
-    println!("session token: {}", session.token);
-
-    client.send_typing(123456).await?;
-    client.send_text(123456, "Hello from Rust!").await?;
-    client.send_file(123456, "report.pdf", "Here is the report").await?;
-
-    Ok(())
-}
-```
-
-To reuse a saved session token:
-
-```rust
-let session = client.login_with_token(&saved_token).await?;
-```
-
-To use the built-in captcha-aware SMS helper:
-
-```rust
-use maxrs::auth::AuthCaptchaConfig;
-use maxrs::client::MaxClient;
-
-# async fn run(client: MaxClient) -> maxrs::error::Result<()> {
-let config = AuthCaptchaConfig::from_env();
-let sms_token = client
-    .request_sms_code_with_auth_captcha("+79990000000", &config)
-    .await?;
-# Ok(())
-# }
-```
-
-## Protocol Notes
-
-See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
-
-## Example CLI
+Run the CLI example after configuring the needed environment variables:
 
 ```bash
 cargo run --example cli
 ```
 
-The CLI connects, logs in with `MAX_SESSION_TOKEN` or interactive SMS auth, then
-listens for incoming messages until Ctrl-C. It does not print login payload
-details such as chats or contacts, and it does not send messages.
+The CLI logs in with `MAX_SESSION_TOKEN` when available. Otherwise it uses
+`MAX_PHONE`, requests an SMS code through the configured operator channel, and
+then listens for incoming messages until Ctrl-C.
+
+## Protocol Notes
+
+See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
 
 ## License
 

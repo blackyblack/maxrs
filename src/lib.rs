@@ -4,31 +4,29 @@
 //! # Example
 //!
 //! ```no_run
-//! use maxrs::client::MaxClient;
+//! use maxrs::client::{LoginConfig, MaxClient};
+//! use maxrs::models::MaxMessage;
 //!
 //! # async fn run() -> maxrs::error::Result<()> {
 //! let (client, mut messages) = MaxClient::connect().await?;
 //!
-//! // Listen for incoming messages in the background.
 //! tokio::spawn(async move {
 //!     while let Some(msg) = messages.recv().await {
 //!         println!("[{}] {}", msg.chat_id, msg.text);
 //!     }
 //! });
 //!
-//! let sms_token = client.request_sms_code("+79990000000").await?;
-//! // ... read the SMS code from the user ...
-//! let session = client.verify_sms_code(&sms_token, "12345").await?;
-//!
-//! client.send_text(123, "Hello from Rust!").await?;
+//! let session = client.login(LoginConfig::from_env()?).await?;
+//! client.send_text(123, MaxMessage::new("Hello from Rust!")).await?;
 //! # let _ = session;
 //! # Ok(())
 //! # }
 //! ```
 
-pub mod auth;
+mod auth;
 pub mod captcha;
 pub mod client;
 pub mod error;
 pub mod models;
+mod operator_channels;
 pub mod protocol;

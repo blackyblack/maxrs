@@ -15,9 +15,17 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use crate::captcha::solver::CaptchaSolver;
+pub use crate::auth::{
+    session_token_from_env, AuthCaptchaConfig, LoginConfig, DEFAULT_CALLBACK_BIND,
+    DEFAULT_CAPTCHA_CALLBACK_PATH, DEFAULT_SOLVER_URL, ENV_CALLBACK_BIND, ENV_CALLBACK_URL_BASE,
+    ENV_PASSWORD, ENV_PHONE, ENV_SESSION_TOKEN, ENV_SOLVER_URL,
+};
 use crate::error::{Error, Result};
-use crate::models::{IncomingMessage, Session, UserAgent, BROWSER_USER_AGENT};
+use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};
+pub use crate::operator_channels::{
+    OperatorChannel, TelegramOperatorConfig, ENV_OPERATOR_CHANNEL, ENV_TELEGRAM_BOT_TOKEN,
+    ENV_TELEGRAM_CHAT_ID, ENV_TELEGRAM_POLL_TIMEOUT_SECS,
+};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
 
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
@@ -29,7 +37,7 @@ const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
 
-struct Inner {
+pub(crate) struct InnerClient {
     sink: Mutex<WsSink>,
     pending: Mutex<HashMap<u32, oneshot::Sender<Packet>>>,
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
@@ -40,7 +48,7 @@ struct Inner {
     http: reqwest::Client,
 }
 
-impl Inner {
+impl InnerClient {
     fn next_seq(&self) -> u32 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
@@ -69,7 +77,7 @@ impl Inner {
         Ok(())
     }
 
-    async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
+    pub(crate) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
         let seq = self.next_seq();
         let (tx, rx) = oneshot::channel();
         {
@@ -101,6 +109,28 @@ impl Inner {
             }
         }
     }
+
+    pub(crate) async fn session_init(&self) -> Result<()> {
+        if self
+            .session_initialized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let payload = json!({
+            "userAgent": self.user_agent,
+            "deviceId": uuid::Uuid::new_v4().to_string(),
+        });
+        match self.invoke(opcode::SESSION_INIT, payload).await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.session_initialized.store(false, Ordering::Release);
+                Err(err)
+            }
+        }
+    }
 }
 
 /// An asynchronous client for the Max (OneMe) WebSocket API.
@@ -110,7 +140,7 @@ impl Inner {
 /// messages while sending from another.
 #[derive(Clone)]
 pub struct MaxClient {
-    inner: Arc<Inner>,
+    inner: Arc<InnerClient>,
 }
 
 impl MaxClient {
@@ -119,8 +149,7 @@ impl MaxClient {
     ///
     /// Returns the client together with a receiver of [`IncomingMessage`]s that
     /// the server pushes (`NOTIF_MESSAGE`). Authenticate next with
-    /// [`MaxClient::request_sms_code`] / [`MaxClient::verify_sms_code`] or
-    /// [`MaxClient::login_with_token`].
+    /// [`MaxClient::login`].
     pub async fn connect() -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
         Self::connect_with(UserAgent::default()).await
     }
@@ -143,7 +172,7 @@ impl MaxClient {
             .user_agent(BROWSER_USER_AGENT)
             .build()?;
 
-        let inner = Arc::new(Inner {
+        let inner = Arc::new(InnerClient {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
             file_waiters: Mutex::new(HashMap::new()),
@@ -180,161 +209,14 @@ impl MaxClient {
         });
     }
 
-    /// Sends the `SESSION_INIT` handshake. Called automatically by the auth
-    /// helpers, but exposed for completeness.
-    pub async fn session_init(&self) -> Result<()> {
-        if self
-            .inner
-            .session_initialized
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        let payload = json!({
-            "userAgent": self.inner.user_agent,
-            "deviceId": uuid::Uuid::new_v4().to_string(),
-        });
-        match self.inner.invoke(opcode::SESSION_INIT, payload).await {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                self.inner
-                    .session_initialized
-                    .store(false, Ordering::Release);
-                Err(err)
-            }
-        }
+    /// Logs in using a saved session token when valid, otherwise starts the SMS auth flow.
+    pub async fn login(&self, config: LoginConfig) -> Result<Session> {
+        self.inner.login(config).await
     }
 
-    /// Requests a captcha challenge URL for SMS authentication.
-    ///
-    /// Browser-based callers can show this link in a VK captcha widget and pass
-    /// the resulting token to [`MaxClient::request_sms_code_with_captcha_token`].
-    pub async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
-        self.session_init().await?;
-        let payload = json!({
-            "source": "auth",
-            "identifier": phone,
-        });
-        match self
-            .inner
-            .invoke(opcode::AUTH_CAPTCHA_REQUEST, payload)
-            .await
-        {
-            Ok(response) => Ok(response.payload["link"].as_str().map(str::to_string)),
-            Err(Error::Server { opcode, message })
-                if message == "captcha.create-session-failed" =>
-            {
-                tracing::debug!(
-                    opcode,
-                    "captcha session creation failed; continuing without token"
-                );
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Step 1 of SMS auth: requests that the server send an SMS code to `phone`.
-    ///
-    /// Returns a short-lived token that must be passed to
-    /// [`MaxClient::verify_sms_code`] together with the received code.
-    pub async fn request_sms_code(&self, phone: &str) -> Result<String> {
-        if let Some(link) = self.request_auth_captcha(phone).await? {
-            return Err(Error::CaptchaRequired { link });
-        }
-
-        self.request_sms_code_with_captcha_token(phone, "").await
-    }
-
-    /// Step 1 of SMS auth using an optional external captcha solver.
-    ///
-    /// If Max returns a captcha URL, it is sent to `captcha_solver`; this method
-    /// then waits for the solver callback token and retries the SMS request with
-    /// that token. If no captcha is returned, it behaves like
-    /// [`MaxClient::request_sms_code`].
-    pub async fn request_sms_code_with_solver(
-        &self,
-        phone: &str,
-        captcha_solver: &CaptchaSolver,
-    ) -> Result<String> {
-        let captcha_token = match self.request_auth_captcha(phone).await? {
-            Some(link) => captcha_solver.solve(&link).await?,
-            None => String::new(),
-        };
-
-        self.request_sms_code_with_captcha_token(phone, &captcha_token)
-            .await
-    }
-
-    /// Step 1 of SMS auth with a captcha token obtained from
-    /// [`MaxClient::request_auth_captcha`].
-    pub async fn request_sms_code_with_captcha_token(
-        &self,
-        phone: &str,
-        captcha_token: &str,
-    ) -> Result<String> {
-        self.session_init().await?;
-        let payload = json!({
-            "phone": phone,
-            "type": "START_AUTH",
-            "language": "ru",
-            "captchaToken": captcha_token,
-        });
-        let response = self.inner.invoke(opcode::AUTH_REQUEST, payload).await?;
-        response.payload["token"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::UnexpectedResponse("missing auth token".into()))
-    }
-
-    /// Step 2 of SMS auth: verifies the code and logs in.
-    ///
-    /// On success the long-lived session token (kept in memory) is returned in
-    /// [`Session`]; store it to re-login later via
-    /// [`MaxClient::login_with_token`] without a new SMS.
-    pub async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
-        let payload = json!({
-            "token": sms_token,
-            "verifyCode": code,
-            "authTokenType": "CHECK_CODE",
-        });
-        let response = self.inner.invoke(opcode::AUTH, payload).await?;
-        let token = response.payload["tokenAttrs"]["LOGIN"]["token"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))?;
-
-        self.login(&token).await
-    }
-
-    /// Logs in with a previously obtained session token.
-    pub async fn login_with_token(&self, token: &str) -> Result<Session> {
-        self.session_init().await?;
-        self.login(token).await
-    }
-
-    async fn login(&self, token: &str) -> Result<Session> {
-        let payload = json!({
-            "interactive": true,
-            "token": token,
-            "chatsSync": 0,
-            "contactsSync": 0,
-            "presenceSync": 0,
-            "draftsSync": 0,
-            "chatsCount": 40,
-        });
-        let response = self.inner.invoke(opcode::LOGIN, payload).await?;
-        Ok(Session {
-            token: token.to_string(),
-            login_payload: response.payload,
-        })
-    }
-
-    /// Sends a plain text message to `chat_id`.
-    pub async fn send_text(&self, chat_id: i64, text: &str) -> Result<()> {
-        let payload = text_message_payload(chat_id, text, self.inner.next_cid());
+    /// Sends a text message to `chat_id`.
+    pub async fn send_text(&self, chat_id: i64, message: MaxMessage) -> Result<()> {
+        let payload = text_message_payload(chat_id, &message, self.inner.next_cid());
         self.inner.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
     }
@@ -438,14 +320,16 @@ impl MaxClient {
     }
 }
 
-fn text_message_payload(chat_id: i64, text: &str, cid: i64) -> Value {
+fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
+    let text = &message.text;
+    let elements = &message.elements;
     json!({
         "chatId": chat_id,
         "message": {
             "text": text,
             "cid": cid,
             "type": "USER",
-            "elements": [],
+            "elements": elements,
             "attaches": [],
         },
         "notify": true,
@@ -454,7 +338,7 @@ fn text_message_payload(chat_id: i64, text: &str, cid: i64) -> Value {
 
 async fn read_loop(
     mut read: SplitStream<WsStream>,
-    inner: Arc<Inner>,
+    inner: Arc<InnerClient>,
     msg_tx: mpsc::UnboundedSender<IncomingMessage>,
 ) {
     while let Some(frame) = read.next().await {
@@ -489,7 +373,7 @@ async fn read_loop(
 }
 
 async fn handle_server_request(
-    inner: &Arc<Inner>,
+    inner: &Arc<InnerClient>,
     msg_tx: &mpsc::UnboundedSender<IncomingMessage>,
     packet: Packet,
 ) {
@@ -584,7 +468,8 @@ mod tests {
 
     #[test]
     fn text_message_payload_matches_web_schema() {
-        let payload = text_message_payload(295438091, "hello", -1_700_000_000_001);
+        let payload =
+            text_message_payload(295438091, &MaxMessage::new("hello"), -1_700_000_000_001);
 
         assert_eq!(payload["chatId"], 295438091);
         assert_eq!(payload["message"]["text"], "hello");
@@ -593,5 +478,30 @@ mod tests {
         assert_eq!(payload["message"]["elements"], json!([]));
         assert_eq!(payload["message"]["attaches"], json!([]));
         assert_eq!(payload["notify"], true);
+    }
+
+    #[test]
+    fn text_message_payload_serializes_typed_formatter_elements() {
+        let message = MaxMessage::with_elements(
+            "hello docs",
+            vec![
+                crate::models::MessageElement::strong(0, 5),
+                crate::models::MessageElement::link(6, 4, "https://example.test"),
+            ],
+        );
+        let payload = text_message_payload(295438091, &message, -1_700_000_000_002);
+
+        assert_eq!(
+            payload["message"]["elements"],
+            json!([
+                { "_type": "STRONG", "from": 0, "length": 5 },
+                {
+                    "_type": "LINK",
+                    "from": 6,
+                    "length": 4,
+                    "url": "https://example.test"
+                }
+            ])
+        );
     }
 }

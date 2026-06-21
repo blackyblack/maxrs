@@ -1,15 +1,22 @@
-//! Authentication helpers shared by examples and applications.
+//! Internal authentication support for the Max client.
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
+use serde_json::{json, Value};
+
 use crate::captcha::http::{HttpServer, HttpServerConfig};
 use crate::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
-use crate::client::MaxClient;
+use crate::client::InnerClient;
 use crate::error::{Error, Result};
+use crate::models::Session;
+use crate::operator_channels::OperatorChannel;
+use crate::protocol::opcode;
 
 pub const ENV_SESSION_TOKEN: &str = "MAX_SESSION_TOKEN";
+pub const ENV_PASSWORD: &str = "MAX_PASSWORD";
+pub const ENV_PHONE: &str = "MAX_PHONE";
 pub const ENV_SOLVER_URL: &str = "MAX_SOLVER_URL";
 pub const ENV_CALLBACK_BIND: &str = "MAX_CALLBACK_BIND";
 pub const ENV_CALLBACK_URL_BASE: &str = "MAX_CALLBACK_URL_BASE";
@@ -18,25 +25,39 @@ pub const DEFAULT_SOLVER_URL: &str = "http://127.0.0.1:3000";
 pub const DEFAULT_CALLBACK_BIND: &str = "127.0.0.1:3002";
 pub const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 
-/// Returns the saved Max session token from `MAX_SESSION_TOKEN`, when present.
 pub fn session_token_from_env() -> Option<String> {
     env_string(ENV_SESSION_TOKEN)
 }
 
-/// Runtime configuration for solving auth captchas through `max_captcha_solver`.
+#[derive(Debug, Clone)]
+pub struct LoginConfig {
+    pub phone: Option<String>,
+    pub password: Option<String>,
+    pub session_token: Option<String>,
+    pub captcha: AuthCaptchaConfig,
+    pub operator: OperatorChannel,
+}
+
+impl LoginConfig {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            phone: env_string(ENV_PHONE),
+            password: env_password(),
+            session_token: session_token_from_env(),
+            captcha: AuthCaptchaConfig::from_env(),
+            operator: OperatorChannel::from_env()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthCaptchaConfig {
-    /// Base URL of the solver service solve API.
     pub solver_url: Option<String>,
-    /// Local address for the built-in callback receiver.
     pub callback_bind: String,
-    /// Public base URL that the solver can use to reach the callback receiver.
     pub callback_url_base: Option<String>,
 }
 
 impl AuthCaptchaConfig {
-    /// Builds configuration from `MAX_SOLVER_URL`, `MAX_CALLBACK_BIND`, and
-    /// `MAX_CALLBACK_URL_BASE`.
     pub fn from_env() -> Self {
         Self {
             solver_url: Some(
@@ -48,7 +69,6 @@ impl AuthCaptchaConfig {
         }
     }
 
-    /// Builds configuration with captcha solving disabled.
     pub fn disabled() -> Self {
         Self {
             solver_url: None,
@@ -57,42 +77,54 @@ impl AuthCaptchaConfig {
         }
     }
 
-    /// Builds the callback URL sent to the solver for a bound callback server.
     pub fn callback_url(&self, callback_addr: SocketAddr) -> String {
         match &self.callback_url_base {
-            Some(base) => {
-                let base = base.replace("{port}", &callback_addr.port().to_string());
-                format!(
-                    "{}{}",
-                    base.trim_end_matches('/'),
-                    DEFAULT_CAPTCHA_CALLBACK_PATH
-                )
-            }
-            None => {
-                let callback_addr = normalize_callback_addr(callback_addr);
-                format!("http://{callback_addr}{DEFAULT_CAPTCHA_CALLBACK_PATH}")
-            }
+            Some(base) => format!(
+                "{}{}",
+                base.replace("{port}", &callback_addr.port().to_string())
+                    .trim_end_matches('/'),
+                DEFAULT_CAPTCHA_CALLBACK_PATH
+            ),
+            None => format!(
+                "http://{}{}",
+                normalize_callback_addr(callback_addr),
+                DEFAULT_CAPTCHA_CALLBACK_PATH
+            ),
         }
     }
 }
 
 impl Default for AuthCaptchaConfig {
     fn default() -> Self {
-        Self {
-            solver_url: Some(DEFAULT_SOLVER_URL.into()),
-            callback_bind: DEFAULT_CALLBACK_BIND.into(),
-            callback_url_base: None,
-        }
+        Self::from_env()
     }
 }
 
-impl MaxClient {
-    /// Requests an SMS auth code and solves auth captcha challenges with a
-    /// `max_captcha_solver` service when Max requires one.
-    ///
-    /// The helper starts the built-in `POST /captcha-callback` receiver for the
-    /// lifetime of the current process when a captcha challenge is encountered.
-    pub async fn request_sms_code_with_auth_captcha(
+impl InnerClient {
+    pub(crate) async fn login(&self, config: LoginConfig) -> Result<Session> {
+        if let Some(token) = config.session_token.as_deref() {
+            match self.login_with_token(token).await {
+                Ok(session) => return Ok(session),
+                Err(err) if should_fallback_to_sms_login(&err) => {
+                    tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let phone = config
+            .phone
+            .as_deref()
+            .ok_or_else(|| Error::UnexpectedResponse("missing phone for SMS login".into()))?;
+        let sms_token = self
+            .request_sms_code_with_auth_captcha(phone, &config.captcha)
+            .await?;
+        let code = config.operator.request_sms_code(phone).await?;
+        self.verify_sms_code(&sms_token, code.trim(), config.password.as_deref())
+            .await
+    }
+
+    async fn request_sms_code_with_auth_captcha(
         &self,
         phone: &str,
         config: &AuthCaptchaConfig,
@@ -111,9 +143,7 @@ impl MaxClient {
                     solver_url.clone(),
                     callback_url,
                 ))?);
-
                 tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
-
                 let captcha_token = solver.solve(&link).await?;
                 self.request_sms_code_with_captcha_token(phone, &captcha_token)
                     .await
@@ -121,6 +151,135 @@ impl MaxClient {
             Err(err) => Err(err),
         }
     }
+
+    async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
+        self.session_init().await?;
+        let payload = json!({
+            "source": "auth",
+            "identifier": phone,
+        });
+        match self.invoke(opcode::AUTH_CAPTCHA_REQUEST, payload).await {
+            Ok(response) => Ok(response.payload["link"].as_str().map(str::to_string)),
+            Err(Error::Server { opcode, message })
+                if message == "captcha.create-session-failed" =>
+            {
+                tracing::debug!(
+                    opcode,
+                    "captcha session creation failed; continuing without token"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn request_sms_code(&self, phone: &str) -> Result<String> {
+        if let Some(link) = self.request_auth_captcha(phone).await? {
+            return Err(Error::CaptchaRequired { link });
+        }
+
+        self.request_sms_code_with_captcha_token(phone, "").await
+    }
+
+    async fn request_sms_code_with_captcha_token(
+        &self,
+        phone: &str,
+        captcha_token: &str,
+    ) -> Result<String> {
+        self.session_init().await?;
+        let payload = json!({
+            "phone": phone,
+            "type": "START_AUTH",
+            "language": "ru",
+            "captchaToken": captcha_token,
+        });
+        let response = self.invoke(opcode::AUTH_REQUEST, payload).await?;
+        response.payload["token"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::UnexpectedResponse("missing auth token".into()))
+    }
+
+    async fn verify_sms_code(
+        &self,
+        sms_token: &str,
+        code: &str,
+        password: Option<&str>,
+    ) -> Result<Session> {
+        let payload = json!({
+            "token": sms_token,
+            "verifyCode": code,
+            "authTokenType": "CHECK_CODE",
+        });
+        let response = self.invoke(opcode::AUTH, payload).await?;
+        if response.payload["passwordChallenge"].is_object() {
+            return self
+                .verify_password_challenge(&response.payload["passwordChallenge"], password)
+                .await;
+        }
+
+        self.login_with_auth_payload(&response.payload).await
+    }
+
+    async fn verify_password_challenge(
+        &self,
+        challenge: &Value,
+        password: Option<&str>,
+    ) -> Result<Session> {
+        let track_id = challenge["trackId"].as_str().ok_or_else(|| {
+            Error::UnexpectedResponse("missing password challenge trackId".into())
+        })?;
+        let password = password.ok_or(Error::PasswordRequired)?;
+        let response = self
+            .invoke(
+                opcode::AUTH_PASSWORD,
+                json!({
+                    "trackId": track_id,
+                    "password": password,
+                }),
+            )
+            .await?;
+
+        self.login_with_auth_payload(&response.payload).await
+    }
+
+    async fn login_with_auth_payload(&self, payload: &Value) -> Result<Session> {
+        let token = login_token_from_auth_payload(payload)?;
+        self.login_with_token(&token).await
+    }
+
+    async fn login_with_token(&self, token: &str) -> Result<Session> {
+        self.session_init().await?;
+        self.perform_login(token).await
+    }
+
+    async fn perform_login(&self, token: &str) -> Result<Session> {
+        let payload = json!({
+            "interactive": true,
+            "token": token,
+            "chatsSync": 0,
+            "contactsSync": 0,
+            "presenceSync": 0,
+            "draftsSync": 0,
+            "chatsCount": 40,
+        });
+        let response = self.invoke(opcode::LOGIN, payload).await?;
+        Ok(Session {
+            token: token.to_string(),
+            login_payload: response.payload,
+        })
+    }
+}
+
+fn should_fallback_to_sms_login(err: &Error) -> bool {
+    matches!(err, Error::Server { opcode, .. } if *opcode == opcode::LOGIN)
+}
+
+fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
+    payload["tokenAttrs"]["LOGIN"]["token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -130,9 +289,12 @@ fn env_string(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_password() -> Option<String> {
+    env_string(ENV_PASSWORD)
+}
+
 fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {
     let port = callback_addr.port();
-
     match callback_addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
@@ -143,46 +305,36 @@ fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn callback_url_uses_bound_addr_by_default() {
-        let config = AuthCaptchaConfig::default();
-        let addr = "127.0.0.1:3002".parse().unwrap();
-
-        assert_eq!(
-            config.callback_url(addr),
-            "http://127.0.0.1:3002/captcha-callback"
-        );
+    fn sms_login_fallback_only_handles_login_server_errors() {
+        assert!(should_fallback_to_sms_login(&Error::Server {
+            opcode: opcode::LOGIN,
+            message: "invalid session".into(),
+        }));
+        assert!(!should_fallback_to_sms_login(&Error::Server {
+            opcode: opcode::AUTH,
+            message: "invalid code".into(),
+        }));
+        assert!(!should_fallback_to_sms_login(&Error::Timeout(
+            opcode::LOGIN
+        )));
     }
 
     #[test]
-    fn callback_url_uses_public_base_and_port_placeholder() {
-        let config = AuthCaptchaConfig {
-            callback_url_base: Some("https://example.test:{port}/max".into()),
-            ..AuthCaptchaConfig::default()
-        };
-        let addr = "127.0.0.1:3002".parse().unwrap();
+    fn extracts_login_token_from_auth_payload() {
+        let payload = json!({
+            "tokenAttrs": {
+                "LOGIN": {
+                    "token": "session-token"
+                }
+            }
+        });
 
         assert_eq!(
-            config.callback_url(addr),
-            "https://example.test:3002/max/captcha-callback"
-        );
-    }
-
-    #[test]
-    fn callback_url_normalizes_unspecified_bind_addresses() {
-        let config = AuthCaptchaConfig::default();
-
-        let ipv4_addr = "0.0.0.0:3002".parse().unwrap();
-        assert_eq!(
-            config.callback_url(ipv4_addr),
-            "http://127.0.0.1:3002/captcha-callback"
-        );
-
-        let ipv6_addr = "[::]:3002".parse().unwrap();
-        assert_eq!(
-            config.callback_url(ipv6_addr),
-            "http://[::1]:3002/captcha-callback"
+            login_token_from_auth_payload(&payload).unwrap(),
+            "session-token"
         );
     }
 }

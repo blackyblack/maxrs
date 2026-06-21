@@ -29,6 +29,7 @@ pub mod opcode {
     pub const SESSION_INIT: u16 = 6;
     pub const AUTH_REQUEST: u16 = 17;
     pub const AUTH: u16 = 18;
+    pub const AUTH_PASSWORD: u16 = 115;
     pub const LOGIN: u16 = 19;
     pub const AUTH_CAPTCHA_REQUEST: u16 = 224;
     pub const MSG_SEND: u16 = 64;
