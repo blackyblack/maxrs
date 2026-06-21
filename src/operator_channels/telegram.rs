@@ -62,10 +62,10 @@ fn telegram_http_client() -> Result<reqwest::Client> {
                 .max_retries_per_request(2)
                 .classify_fn(|request_result| {
                     let is_retryable_endpoint =
-                        matches!(request_result.method(), &reqwest::Method::GET)
-                            && request_result.uri().path().ends_with("/getUpdates")
-                            || matches!(request_result.method(), &reqwest::Method::POST)
-                                && request_result.uri().path().ends_with("/sendMessage");
+                        (matches!(request_result.method(), &reqwest::Method::GET)
+                            && request_result.uri().path().ends_with("/getUpdates"))
+                            || (matches!(request_result.method(), &reqwest::Method::POST)
+                                && request_result.uri().path().ends_with("/sendMessage"));
                     let should_retry = is_retryable_endpoint
                         && (request_result.error().is_some()
                             || matches!(
