@@ -186,9 +186,10 @@ impl MaxClient {
         if let Some(token) = config.session_token.as_deref() {
             match self.login_with_token(token).await {
                 Ok(session) => return Ok(session),
-                Err(err) => {
+                Err(err) if should_fallback_to_sms_login(&err) => {
                     tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
                 }
+                Err(err) => return Err(err),
             }
         }
 
@@ -499,14 +500,18 @@ fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
     json!({
         "chatId": chat_id,
         "message": {
-            "text": message.text,
+            "text": &message.text,
             "cid": cid,
             "type": "USER",
-            "elements": message.elements,
+            "elements": &message.elements,
             "attaches": [],
         },
         "notify": true,
     })
+}
+
+fn should_fallback_to_sms_login(err: &Error) -> bool {
+    matches!(err, Error::Server { opcode, .. } if *opcode == opcode::LOGIN)
 }
 
 async fn read_loop(
@@ -683,6 +688,21 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn sms_login_fallback_only_handles_login_server_errors() {
+        assert!(should_fallback_to_sms_login(&Error::Server {
+            opcode: opcode::LOGIN,
+            message: "invalid session".into(),
+        }));
+        assert!(!should_fallback_to_sms_login(&Error::Server {
+            opcode: opcode::AUTH,
+            message: "invalid code".into(),
+        }));
+        assert!(!should_fallback_to_sms_login(&Error::Timeout(
+            opcode::LOGIN
+        )));
     }
 
     #[test]

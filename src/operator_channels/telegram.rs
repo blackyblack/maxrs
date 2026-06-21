@@ -1,7 +1,9 @@
 use serde_json::Value;
 
-use crate::auth::TelegramOperatorConfig;
 use crate::error::{Error, Result};
+use crate::operator_channels::TelegramOperatorConfig;
+
+const TELEGRAM_API_HOST: &str = "api.telegram.org";
 
 pub async fn request_sms_code(config: &TelegramOperatorConfig, phone: &str) -> Result<String> {
     let prompt = format!("Max login requested for {phone}. Reply to this chat with the SMS code.");
@@ -9,7 +11,7 @@ pub async fn request_sms_code(config: &TelegramOperatorConfig, phone: &str) -> R
 }
 
 async fn request_text(config: &TelegramOperatorConfig, prompt: &str) -> Result<String> {
-    let http = reqwest::Client::new();
+    let http = telegram_http_client()?;
     let base = format!("https://api.telegram.org/bot{}", config.bot_token);
     let mut offset = next_update_offset(&fetch_updates(&http, &base, "0", None).await?)?;
 
@@ -23,14 +25,13 @@ async fn request_text(config: &TelegramOperatorConfig, prompt: &str) -> Result<S
     if !send["ok"].as_bool().unwrap_or(false) {
         return Err(Error::Telegram(send.to_string()));
     }
-    let bot_user_id = send["result"]["from"]["id"]
-        .as_i64()
-        .or_else(|| telegram_bot_id_from_token(&config.bot_token));
 
     let deadline = tokio::time::Instant::now() + config.poll_timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(Error::Timeout(0));
+            return Err(Error::Telegram(
+                "timed out waiting for an SMS code reply from the configured Telegram chat".into(),
+            ));
         }
         let resp = fetch_updates(&http, &base, "20", Some(offset)).await?;
         if !resp["ok"].as_bool().unwrap_or(false) {
@@ -42,13 +43,40 @@ async fn request_text(config: &TelegramOperatorConfig, prompt: &str) -> Result<S
                     offset = id + 1;
                 }
                 if let Some(text) =
-                    operator_text_from_update(update, config.chat_id, bot_user_id, prompt)
+                    operator_text_from_update(update, config.chat_id, config.bot_user_id, prompt)
                 {
                     return Ok(text);
                 }
             }
         }
     }
+}
+
+fn telegram_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .retry(
+            reqwest::retry::for_host(TELEGRAM_API_HOST)
+                .max_retries_per_request(2)
+                .classify_fn(|req_rep| {
+                    let should_retry = req_rep.method() == reqwest::Method::GET
+                        && req_rep.uri().path().ends_with("/getUpdates")
+                        && (req_rep.error().is_some()
+                            || matches!(
+                                req_rep.status(),
+                                Some(status)
+                                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                                        || status.is_server_error()
+                            ));
+
+                    if should_retry {
+                        req_rep.retryable()
+                    } else {
+                        req_rep.success()
+                    }
+                }),
+        )
+        .build()
+        .map_err(Into::into)
 }
 
 async fn fetch_updates(
@@ -90,7 +118,7 @@ fn next_update_offset(resp: &Value) -> Result<i64> {
 fn operator_text_from_update(
     update: &Value,
     chat_id: i64,
-    bot_user_id: Option<i64>,
+    bot_user_id: i64,
     prompt: &str,
 ) -> Option<String> {
     let message = &update["message"];
@@ -109,16 +137,8 @@ fn operator_text_from_update(
     }
 }
 
-fn is_own_message(message: &Value, bot_user_id: Option<i64>, prompt: &str) -> bool {
-    if bot_user_id.is_some() && message["from"]["id"].as_i64() == bot_user_id {
-        return true;
-    }
-
-    message["from"]["is_bot"].as_bool().unwrap_or(false) && message["text"].as_str() == Some(prompt)
-}
-
-fn telegram_bot_id_from_token(token: &str) -> Option<i64> {
-    token.split_once(':')?.0.parse().ok()
+fn is_own_message(message: &Value, bot_user_id: i64, _prompt: &str) -> bool {
+    message["from"]["id"].as_i64() == Some(bot_user_id)
 }
 
 #[cfg(test)]
@@ -140,7 +160,7 @@ mod tests {
             operator_text_from_update(
                 &update,
                 42,
-                Some(1001),
+                1001,
                 "Max login requested for +100. Reply to this chat with the SMS code.",
             ),
             None
@@ -158,28 +178,25 @@ mod tests {
         });
 
         assert_eq!(
-            operator_text_from_update(&update, 42, Some(1001), "prompt"),
+            operator_text_from_update(&update, 42, 1001, "prompt"),
             Some("12345".to_string())
         );
     }
 
     #[test]
-    fn ignores_prompt_echo_from_bot_when_id_is_unavailable() {
+    fn accepts_prompt_text_when_it_does_not_come_from_the_bot() {
         let update = json!({
             "message": {
                 "chat": { "id": 42 },
-                "from": { "is_bot": true },
+                "from": { "id": 2002, "is_bot": false },
                 "text": "prompt"
             }
         });
 
-        assert_eq!(operator_text_from_update(&update, 42, None, "prompt"), None);
-    }
-
-    #[test]
-    fn parses_telegram_bot_id_from_token_prefix() {
-        assert_eq!(telegram_bot_id_from_token("123456:secret"), Some(123456));
-        assert_eq!(telegram_bot_id_from_token("not-a-token"), None);
+        assert_eq!(
+            operator_text_from_update(&update, 42, 1001, "prompt"),
+            Some("prompt".to_string())
+        );
     }
 
     #[test]
