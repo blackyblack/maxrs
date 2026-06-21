@@ -2,7 +2,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::error::Result;
 
-pub(crate) async fn request_sms_code(phone: &str) -> Result<String> {
+pub async fn request_sms_code(phone: &str) -> Result<String> {
     let mut stdout = tokio::io::stdout();
     stdout
         .write_all(format!("Enter the SMS code for {phone}: ").as_bytes())

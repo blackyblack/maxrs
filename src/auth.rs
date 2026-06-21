@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 pub const ENV_SESSION_TOKEN: &str = "MAX_SESSION_TOKEN";
+pub const ENV_PASSWORD: &str = "MAX_PASSWORD";
 pub const ENV_PHONE: &str = "MAX_PHONE";
 pub const ENV_SOLVER_URL: &str = "MAX_SOLVER_URL";
 pub const ENV_CALLBACK_BIND: &str = "MAX_CALLBACK_BIND";
@@ -27,19 +28,21 @@ pub fn session_token_from_env() -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct LoginConfig {
     pub phone: Option<String>,
+    pub password: Option<String>,
     pub session_token: Option<String>,
     pub captcha: AuthCaptchaConfig,
     pub operator: OperatorChannel,
 }
 
 impl LoginConfig {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
             phone: env_string(ENV_PHONE),
+            password: env_password(),
             session_token: session_token_from_env(),
             captcha: AuthCaptchaConfig::from_env(),
-            operator: OperatorChannel::from_env(),
-        }
+            operator: OperatorChannel::from_env()?,
+        })
     }
 }
 
@@ -51,19 +54,16 @@ pub enum OperatorChannel {
 }
 
 impl OperatorChannel {
-    pub fn from_env() -> Self {
-        match env_string(ENV_OPERATOR_CHANNEL)
+    pub fn from_env() -> Result<Self> {
+        let channel = env_string(ENV_OPERATOR_CHANNEL)
             .unwrap_or_else(|| "cli".into())
-            .to_ascii_lowercase()
-            .as_str()
-        {
+            .to_ascii_lowercase();
+
+        Ok(match channel.as_str() {
             "none" | "off" | "disabled" => Self::None,
-            "telegram" | "tg" => match TelegramOperatorConfig::from_env() {
-                Some(config) => Self::Telegram(config),
-                None => Self::None,
-            },
+            "telegram" | "tg" => Self::Telegram(TelegramOperatorConfig::from_env()?),
             _ => Self::Cli,
-        }
+        })
     }
 
     pub(crate) async fn request_sms_code(&self, phone: &str) -> Result<String> {
@@ -85,10 +85,33 @@ pub struct TelegramOperatorConfig {
 }
 
 impl TelegramOperatorConfig {
-    pub fn from_env() -> Option<Self> {
-        Some(Self {
-            bot_token: env_string(ENV_TELEGRAM_BOT_TOKEN)?,
-            chat_id: env_string(ENV_TELEGRAM_CHAT_ID)?.parse().ok()?,
+    pub fn from_env() -> Result<Self> {
+        let bot_token = env_string(ENV_TELEGRAM_BOT_TOKEN);
+        let chat_id = env_string(ENV_TELEGRAM_CHAT_ID);
+        let mut missing = Vec::new();
+        if bot_token.is_none() {
+            missing.push(ENV_TELEGRAM_BOT_TOKEN);
+        }
+        if chat_id.is_none() {
+            missing.push(ENV_TELEGRAM_CHAT_ID);
+        }
+        if !missing.is_empty() {
+            return Err(Error::TelegramConfigMissing {
+                missing: missing.join(", "),
+            });
+        }
+
+        let chat_id =
+            chat_id
+                .expect("checked above")
+                .parse()
+                .map_err(|_| Error::TelegramConfigMissing {
+                    missing: format!("{ENV_TELEGRAM_CHAT_ID} must be an integer chat id"),
+                })?;
+
+        Ok(Self {
+            bot_token: bot_token.expect("checked above"),
+            chat_id,
             poll_timeout: env_string(ENV_TELEGRAM_POLL_TIMEOUT_SECS)
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_secs)
@@ -152,6 +175,10 @@ fn env_string(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn env_password() -> Option<String> {
+    env_string(ENV_PASSWORD)
 }
 
 fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {

@@ -119,7 +119,10 @@ impl CaptchaSolver {
 
         if let Err(err) = result {
             self.pending.lock().await.remove(&challenge_id);
-            return Err(err.into());
+            return Err(Error::CaptchaSolverUnavailable {
+                solver_url: solver_url.clone(),
+                source: err,
+            });
         }
 
         let remaining = DEFAULT_CHALLENGE_TIMEOUT.saturating_sub(challenge_started_at.elapsed());

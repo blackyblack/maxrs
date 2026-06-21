@@ -17,7 +17,7 @@
 //!     }
 //! });
 //!
-//! let session = client.login(LoginConfig::from_env()).await?;
+//! let session = client.login(LoginConfig::from_env()?).await?;
 //! client.send_text(123, MaxMessage::new("Hello from Rust!")).await?;
 //! # let _ = session;
 //! # Ok(())

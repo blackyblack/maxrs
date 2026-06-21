@@ -56,12 +56,53 @@ Default: unset.
 Saved Max session token. When set, the CLI logs in with this token and skips SMS
 auth.
 
+`MAX_PHONE`
+
+Default: unset.
+
+Phone number used for SMS auth when `MAX_SESSION_TOKEN` is unset or rejected.
+
+`MAX_PASSWORD`
+
+Default: unset.
+
+Sign-in password used only when Max requires a password challenge after the SMS
+code.
+
+`MAX_OPERATOR_CHANNEL`
+
+Default: `cli`.
+
+SMS code entry channel. Use `cli`, `telegram`, or `none`. If set to
+`telegram`, both `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID` must be
+configured.
+
+`MAX_TELEGRAM_BOT_TOKEN`
+
+Default: unset.
+
+Telegram bot token used when `MAX_OPERATOR_CHANNEL=telegram`.
+
+`MAX_TELEGRAM_CHAT_ID`
+
+Default: unset.
+
+Telegram chat id where SMS prompts are sent when `MAX_OPERATOR_CHANNEL=telegram`.
+
+`MAX_TELEGRAM_POLL_TIMEOUT_SECS`
+
+Default: `300`.
+
+Maximum time to wait for a Telegram SMS-code reply.
+
 `MAX_SOLVER_URL`
 
 Default: `http://127.0.0.1:3000`.
 
 Base URL of the `max_captcha_solver` solve API. The helper posts captcha
-challenges to `POST /solve` on this service when Max requires auth captcha.
+challenges to `POST /solve` on this service when Max requires auth captcha. If
+Max asks for captcha and this service is not running or not reachable, login
+fails with a captcha solver configuration error.
 
 `MAX_CALLBACK_BIND`
 
@@ -126,6 +167,8 @@ use maxrs::models::MaxMessage;
 
 #[tokio::main]
 async fn main() -> maxrs::error::Result<()> {
+    let login_config = LoginConfig::from_env()?;
+
     let (client, mut messages) = MaxClient::connect().await?;
 
     tokio::spawn(async move {
@@ -134,7 +177,7 @@ async fn main() -> maxrs::error::Result<()> {
         }
     });
 
-    let session = client.login(LoginConfig::from_env()).await?;
+    let session = client.login(login_config).await?;
     println!("session token: {}", session.token);
 
     client.send_typing(123456).await?;
@@ -147,7 +190,8 @@ async fn main() -> maxrs::error::Result<()> {
 
 `MaxClient::login` first tries `MAX_SESSION_TOKEN` when configured. If that
 token is missing or rejected by Max, it requests a fresh SMS code for
-`MAX_PHONE`. Configure SMS code entry with `MAX_OPERATOR_CHANNEL=cli`,
+`MAX_PHONE`. If Max requires a sign-in password after the SMS code, it uses
+`MAX_PASSWORD`. Configure SMS code entry with `MAX_OPERATOR_CHANNEL=cli`,
 `MAX_OPERATOR_CHANNEL=telegram`, or `MAX_OPERATOR_CHANNEL=none`. Telegram mode
 uses `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`.
 
@@ -165,7 +209,7 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
 cargo run --example cli
 ```
 
-The CLI connects, logs in with `MAX_SESSION_TOKEN` or interactive SMS auth, then
+The CLI connects, logs in with `MAX_SESSION_TOKEN` or interactive auth, then
 listens for incoming messages until Ctrl-C. It does not print login payload
 details such as chats or contacts, and it does not send messages.
 

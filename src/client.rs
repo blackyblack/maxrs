@@ -200,7 +200,8 @@ impl MaxClient {
             .request_sms_code_with_auth_captcha(phone, &config.captcha)
             .await?;
         let code = config.operator.request_sms_code(phone).await?;
-        self.verify_sms_code(&sms_token, code.trim()).await
+        self.verify_sms_code(&sms_token, code.trim(), config.password.as_deref())
+            .await
     }
 
     async fn request_sms_code_with_auth_captcha(
@@ -317,18 +318,52 @@ impl MaxClient {
     /// Step 2 of SMS auth: verifies the code and logs in.
     ///
     /// On success the long-lived session token is returned in [`Session`].
-    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
+    async fn verify_sms_code(
+        &self,
+        sms_token: &str,
+        code: &str,
+        password: Option<&str>,
+    ) -> Result<Session> {
         let payload = json!({
             "token": sms_token,
             "verifyCode": code,
             "authTokenType": "CHECK_CODE",
         });
         let response = self.inner.invoke(opcode::AUTH, payload).await?;
-        let token = response.payload["tokenAttrs"]["LOGIN"]["token"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))?;
+        if response.payload["passwordChallenge"].is_object() {
+            return self
+                .verify_password_challenge(&response.payload["passwordChallenge"], password)
+                .await;
+        }
 
+        self.login_with_auth_payload(&response.payload).await
+    }
+
+    async fn verify_password_challenge(
+        &self,
+        challenge: &Value,
+        password: Option<&str>,
+    ) -> Result<Session> {
+        let track_id = challenge["trackId"].as_str().ok_or_else(|| {
+            Error::UnexpectedResponse("missing password challenge trackId".into())
+        })?;
+        let password = password.ok_or(Error::PasswordRequired)?;
+        let response = self
+            .inner
+            .invoke(
+                opcode::AUTH_PASSWORD,
+                json!({
+                    "trackId": track_id,
+                    "password": password,
+                }),
+            )
+            .await?;
+
+        self.login_with_auth_payload(&response.payload).await
+    }
+
+    async fn login_with_auth_payload(&self, payload: &Value) -> Result<Session> {
+        let token = login_token_from_auth_payload(payload)?;
         self.login_with_token(&token).await
     }
 
@@ -560,6 +595,13 @@ fn error_message(payload: &Value) -> String {
         .to_string()
 }
 
+fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
+    payload["tokenAttrs"]["LOGIN"]["token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))
+}
+
 fn chrono_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -640,6 +682,22 @@ mod tests {
                     "url": "https://example.test"
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn extracts_login_token_from_auth_payload() {
+        let payload = json!({
+            "tokenAttrs": {
+                "LOGIN": {
+                    "token": "session-token"
+                }
+            }
+        });
+
+        assert_eq!(
+            login_token_from_auth_payload(&payload).unwrap(),
+            "session-token"
         );
     }
 }

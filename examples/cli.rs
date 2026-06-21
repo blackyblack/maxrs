@@ -9,6 +9,7 @@
 //! Configuration:
 //! - `MAX_SESSION_TOKEN`: optional saved session token.
 //! - `MAX_PHONE`: phone number used when the saved token is missing or expired.
+//! - `MAX_PASSWORD`: optional sign-in password used when Max requires it after SMS.
 //! - `MAX_OPERATOR_CHANNEL`: `cli`, `telegram`, or `none` for SMS code entry.
 //! - `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`: required for Telegram.
 
@@ -26,6 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    let login_config = LoginConfig::from_env()?;
+
     let (client, mut messages) = MaxClient::connect().await?;
     println!("Connected to Max.");
 
@@ -40,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let session = client.login(LoginConfig::from_env()).await?;
+    let session = client.login(login_config).await?;
     println!("Logged in. Session token (keep it safe): {}", session.token);
     println!("Listening for incoming messages (Ctrl-C to quit)...");
 
