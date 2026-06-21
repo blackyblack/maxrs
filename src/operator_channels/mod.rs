@@ -50,35 +50,24 @@ pub struct TelegramOperatorConfig {
 
 impl TelegramOperatorConfig {
     pub fn from_env() -> Result<Self> {
-        let bot_token = env_string(ENV_TELEGRAM_BOT_TOKEN);
-        let chat_id = env_string(ENV_TELEGRAM_CHAT_ID);
-        let mut missing = Vec::new();
-        if bot_token.is_none() {
-            missing.push(ENV_TELEGRAM_BOT_TOKEN);
-        }
-        if chat_id.is_none() {
-            missing.push(ENV_TELEGRAM_CHAT_ID);
-        }
-        if !missing.is_empty() {
-            return Err(Error::TelegramConfigMissing {
-                missing: missing.join(", "),
-            });
-        }
-
-        let bot_token = bot_token.expect("checked above");
+        let bot_token =
+            env_string(ENV_TELEGRAM_BOT_TOKEN).ok_or_else(|| Error::TelegramConfigMissing {
+                missing: ENV_TELEGRAM_BOT_TOKEN.into(),
+            })?;
         let bot_user_id =
             telegram_bot_id_from_token(&bot_token).ok_or_else(|| Error::TelegramConfigMissing {
                 missing: format!(
                     "{ENV_TELEGRAM_BOT_TOKEN} must start with the numeric Telegram bot id prefix"
                 ),
             })?;
-        let chat_id =
-            chat_id
-                .expect("checked above")
-                .parse()
-                .map_err(|_| Error::TelegramConfigMissing {
-                    missing: format!("{ENV_TELEGRAM_CHAT_ID} must be an integer chat id"),
-                })?;
+        let chat_id = env_string(ENV_TELEGRAM_CHAT_ID)
+            .ok_or_else(|| Error::TelegramConfigMissing {
+                missing: ENV_TELEGRAM_CHAT_ID.into(),
+            })?
+            .parse()
+            .map_err(|_| Error::TelegramConfigMissing {
+                missing: format!("{ENV_TELEGRAM_CHAT_ID} must be an integer chat id"),
+            })?;
 
         Ok(Self {
             bot_token,

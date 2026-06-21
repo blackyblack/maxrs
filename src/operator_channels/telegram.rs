@@ -6,18 +6,21 @@ use crate::operator_channels::TelegramOperatorConfig;
 const TELEGRAM_API_HOST: &str = "api.telegram.org";
 
 pub async fn request_sms_code(config: &TelegramOperatorConfig, phone: &str) -> Result<String> {
-    let prompt = format!("Max login requested for {phone}. Reply to this chat with the SMS code.");
-    request_text(config, &prompt).await
+    request_text(
+        config,
+        format!("Max login requested for {phone}. Reply to this chat with the SMS code."),
+    )
+    .await
 }
 
-async fn request_text(config: &TelegramOperatorConfig, prompt: &str) -> Result<String> {
+async fn request_text(config: &TelegramOperatorConfig, text: String) -> Result<String> {
     let http = telegram_http_client()?;
-    let base = format!("https://api.telegram.org/bot{}", config.bot_token);
+    let base = format!("https://{TELEGRAM_API_HOST}/bot{}", config.bot_token);
     let mut offset = next_update_offset(&fetch_updates(&http, &base, "0", None).await?)?;
 
     let send: Value = http
         .post(format!("{base}/sendMessage"))
-        .json(&serde_json::json!({ "chat_id": config.chat_id, "text": prompt }))
+        .json(&serde_json::json!({ "chat_id": config.chat_id, "text": text }))
         .send()
         .await?
         .json()
@@ -58,8 +61,12 @@ fn telegram_http_client() -> Result<reqwest::Client> {
             reqwest::retry::for_host(TELEGRAM_API_HOST)
                 .max_retries_per_request(2)
                 .classify_fn(|request_result| {
-                    let should_retry = request_result.method() == reqwest::Method::GET
-                        && request_result.uri().path().ends_with("/getUpdates")
+                    let is_retryable_endpoint =
+                        matches!(request_result.method(), &reqwest::Method::GET)
+                            && request_result.uri().path().ends_with("/getUpdates")
+                            || matches!(request_result.method(), &reqwest::Method::POST)
+                                && request_result.uri().path().ends_with("/sendMessage");
+                    let should_retry = is_retryable_endpoint
                         && (request_result.error().is_some()
                             || matches!(
                                 request_result.status(),
