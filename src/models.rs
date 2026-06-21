@@ -1,6 +1,7 @@
 //! Typed views over the JSON payloads this client cares about.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Client/device descriptor sent during `SESSION_INIT` and `LOGIN`.
 ///
@@ -69,4 +70,30 @@ pub struct Session {
     pub token: String,
     /// Raw `LOGIN` response payload.
     pub login_payload: serde_json::Value,
+}
+
+/// Outgoing text message with optional Max formatter elements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaxMessage {
+    /// Message text.
+    pub text: String,
+    /// Raw formatter element objects accepted by Max.
+    #[serde(default)]
+    pub elements: Vec<Value>,
+}
+
+impl MaxMessage {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            elements: Vec::new(),
+        }
+    }
+
+    pub fn with_elements(text: impl Into<String>, elements: Vec<Value>) -> Self {
+        Self {
+            text: text.into(),
+            elements,
+        }
+    }
 }

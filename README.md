@@ -120,7 +120,9 @@ container can route to on the host. The solve API should be reachable from
 ## Usage
 
 ```rust
+use maxrs::auth::LoginConfig;
 use maxrs::client::MaxClient;
+use maxrs::models::MaxMessage;
 
 #[tokio::main]
 async fn main() -> maxrs::error::Result<()> {
@@ -132,38 +134,22 @@ async fn main() -> maxrs::error::Result<()> {
         }
     });
 
-    let sms_token = client.request_sms_code("+79990000000").await?;
-    let session = client.verify_sms_code(&sms_token, "12345").await?;
+    let session = client.login(LoginConfig::from_env()).await?;
     println!("session token: {}", session.token);
 
     client.send_typing(123456).await?;
-    client.send_text(123456, "Hello from Rust!").await?;
+    client.send_text(123456, MaxMessage::new("Hello from Rust!")).await?;
     client.send_file(123456, "report.pdf", "Here is the report").await?;
 
     Ok(())
 }
 ```
 
-To reuse a saved session token:
-
-```rust
-let session = client.login_with_token(&saved_token).await?;
-```
-
-To use the built-in captcha-aware SMS helper:
-
-```rust
-use maxrs::auth::AuthCaptchaConfig;
-use maxrs::client::MaxClient;
-
-# async fn run(client: MaxClient) -> maxrs::error::Result<()> {
-let config = AuthCaptchaConfig::from_env();
-let sms_token = client
-    .request_sms_code_with_auth_captcha("+79990000000", &config)
-    .await?;
-# Ok(())
-# }
-```
+`MaxClient::login` first tries `MAX_SESSION_TOKEN` when configured. If that
+token is missing or rejected by Max, it requests a fresh SMS code for
+`MAX_PHONE`. Configure SMS code entry with `MAX_OPERATOR_CHANNEL=cli`,
+`MAX_OPERATOR_CHANNEL=telegram`, or `MAX_OPERATOR_CHANNEL=none`. Telegram mode
+uses `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`.
 
 ## Protocol Notes
 

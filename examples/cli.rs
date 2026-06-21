@@ -6,16 +6,13 @@
 //! cargo run --example cli
 //! ```
 //!
-//! The demo reuses `MAX_SESSION_TOKEN` when it is present. Otherwise it
-//! performs SMS login and can solve auth captcha challenges through
-//! `max_captcha_solver`.
-//!
-//! NOTE: this talks to the real Max servers, so SMS login needs a valid phone
-//! number that can receive the SMS code.
+//! Configuration:
+//! - `MAX_SESSION_TOKEN`: optional saved session token.
+//! - `MAX_PHONE`: phone number used when the saved token is missing or expired.
+//! - `MAX_OPERATOR_CHANNEL`: `cli`, `telegram`, or `none` for SMS code entry.
+//! - `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`: required for Telegram.
 
-use std::io::Write;
-
-use maxrs::auth::{session_token_from_env, AuthCaptchaConfig};
+use maxrs::auth::LoginConfig;
 use maxrs::client::MaxClient;
 
 #[tokio::main]
@@ -40,49 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 msg.text.trim()
             };
             println!("\n<< {text}");
-            print!("> ");
-            let _ = std::io::stdout().flush();
         }
     });
 
-    let _session = match session_token_from_env() {
-        Some(token) => {
-            let session = client.login_with_token(&token).await?;
-            println!("Logged in with MAX_SESSION_TOKEN.");
-            session
-        }
-        None => {
-            let phone = prompt("Phone number (e.g. +79990000000): ").await?;
-            let captcha_config = AuthCaptchaConfig::from_env();
-            let sms_token = client
-                .request_sms_code_with_auth_captcha(phone.trim(), &captcha_config)
-                .await?;
-            println!("SMS code requested.");
-
-            let code = prompt("Enter the SMS code: ").await?;
-            let session = client.verify_sms_code(&sms_token, code.trim()).await?;
-            println!("Logged in. Session token (keep it safe): {}", session.token);
-            session
-        }
-    };
-
+    let session = client.login(LoginConfig::from_env()).await?;
+    println!("Logged in. Session token (keep it safe): {}", session.token);
     println!("Listening for incoming messages (Ctrl-C to quit)...");
-    print!("> ");
-    std::io::stdout().flush()?;
 
     tokio::signal::ctrl_c().await?;
     Ok(())
-}
-
-async fn prompt(label: &str) -> std::io::Result<String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(label.as_bytes()).await?;
-    stdout.flush().await?;
-
-    let mut line = String::new();
-    let mut reader = BufReader::new(tokio::io::stdin());
-    reader.read_line(&mut line).await?;
-    Ok(line)
 }

@@ -15,9 +15,8 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-use crate::captcha::solver::CaptchaSolver;
 use crate::error::{Error, Result};
-use crate::models::{IncomingMessage, Session, UserAgent, BROWSER_USER_AGENT};
+use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
 
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
@@ -119,8 +118,7 @@ impl MaxClient {
     ///
     /// Returns the client together with a receiver of [`IncomingMessage`]s that
     /// the server pushes (`NOTIF_MESSAGE`). Authenticate next with
-    /// [`MaxClient::request_sms_code`] / [`MaxClient::verify_sms_code`] or
-    /// [`MaxClient::login_with_token`].
+    /// [`MaxClient::login`].
     pub async fn connect() -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
         Self::connect_with(UserAgent::default()).await
     }
@@ -182,7 +180,7 @@ impl MaxClient {
 
     /// Sends the `SESSION_INIT` handshake. Called automatically by the auth
     /// helpers, but exposed for completeness.
-    pub async fn session_init(&self) -> Result<()> {
+    pub(crate) async fn session_init(&self) -> Result<()> {
         if self
             .inner
             .session_initialized
@@ -211,7 +209,10 @@ impl MaxClient {
     ///
     /// Browser-based callers can show this link in a VK captcha widget and pass
     /// the resulting token to [`MaxClient::request_sms_code_with_captcha_token`].
-    pub async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
+    pub(crate) async fn request_auth_captcha_internal(
+        &self,
+        phone: &str,
+    ) -> Result<Option<String>> {
         self.session_init().await?;
         let payload = json!({
             "source": "auth",
@@ -240,12 +241,13 @@ impl MaxClient {
     ///
     /// Returns a short-lived token that must be passed to
     /// [`MaxClient::verify_sms_code`] together with the received code.
-    pub async fn request_sms_code(&self, phone: &str) -> Result<String> {
-        if let Some(link) = self.request_auth_captcha(phone).await? {
+    pub(crate) async fn request_sms_code_internal(&self, phone: &str) -> Result<String> {
+        if let Some(link) = self.request_auth_captcha_internal(phone).await? {
             return Err(Error::CaptchaRequired { link });
         }
 
-        self.request_sms_code_with_captcha_token(phone, "").await
+        self.request_sms_code_with_captcha_token_internal(phone, "")
+            .await
     }
 
     /// Step 1 of SMS auth using an optional external captcha solver.
@@ -254,23 +256,9 @@ impl MaxClient {
     /// then waits for the solver callback token and retries the SMS request with
     /// that token. If no captcha is returned, it behaves like
     /// [`MaxClient::request_sms_code`].
-    pub async fn request_sms_code_with_solver(
-        &self,
-        phone: &str,
-        captcha_solver: &CaptchaSolver,
-    ) -> Result<String> {
-        let captcha_token = match self.request_auth_captcha(phone).await? {
-            Some(link) => captcha_solver.solve(&link).await?,
-            None => String::new(),
-        };
-
-        self.request_sms_code_with_captcha_token(phone, &captcha_token)
-            .await
-    }
-
     /// Step 1 of SMS auth with a captcha token obtained from
     /// [`MaxClient::request_auth_captcha`].
-    pub async fn request_sms_code_with_captcha_token(
+    pub(crate) async fn request_sms_code_with_captcha_token_internal(
         &self,
         phone: &str,
         captcha_token: &str,
@@ -294,7 +282,11 @@ impl MaxClient {
     /// On success the long-lived session token (kept in memory) is returned in
     /// [`Session`]; store it to re-login later via
     /// [`MaxClient::login_with_token`] without a new SMS.
-    pub async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
+    pub(crate) async fn verify_sms_code_internal(
+        &self,
+        sms_token: &str,
+        code: &str,
+    ) -> Result<Session> {
         let payload = json!({
             "token": sms_token,
             "verifyCode": code,
@@ -306,16 +298,15 @@ impl MaxClient {
             .map(|s| s.to_string())
             .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))?;
 
-        self.login(&token).await
+        self.login_with_token_internal(&token).await
     }
 
-    /// Logs in with a previously obtained session token.
-    pub async fn login_with_token(&self, token: &str) -> Result<Session> {
+    pub(crate) async fn login_with_token_internal(&self, token: &str) -> Result<Session> {
         self.session_init().await?;
-        self.login(token).await
+        self.perform_login(token).await
     }
 
-    async fn login(&self, token: &str) -> Result<Session> {
+    async fn perform_login(&self, token: &str) -> Result<Session> {
         let payload = json!({
             "interactive": true,
             "token": token,
@@ -332,9 +323,9 @@ impl MaxClient {
         })
     }
 
-    /// Sends a plain text message to `chat_id`.
-    pub async fn send_text(&self, chat_id: i64, text: &str) -> Result<()> {
-        let payload = text_message_payload(chat_id, text, self.inner.next_cid());
+    /// Sends a text message to `chat_id`.
+    pub async fn send_text(&self, chat_id: i64, message: MaxMessage) -> Result<()> {
+        let payload = text_message_payload(chat_id, &message, self.inner.next_cid());
         self.inner.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
     }
@@ -438,14 +429,14 @@ impl MaxClient {
     }
 }
 
-fn text_message_payload(chat_id: i64, text: &str, cid: i64) -> Value {
+fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
     json!({
         "chatId": chat_id,
         "message": {
-            "text": text,
+            "text": message.text,
             "cid": cid,
             "type": "USER",
-            "elements": [],
+            "elements": message.elements,
             "attaches": [],
         },
         "notify": true,
@@ -584,7 +575,8 @@ mod tests {
 
     #[test]
     fn text_message_payload_matches_web_schema() {
-        let payload = text_message_payload(295438091, "hello", -1_700_000_000_001);
+        let payload =
+            text_message_payload(295438091, &MaxMessage::new("hello"), -1_700_000_000_001);
 
         assert_eq!(payload["chatId"], 295438091);
         assert_eq!(payload["message"]["text"], "hello");

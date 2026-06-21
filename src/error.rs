@@ -28,6 +28,10 @@ pub enum Error {
     #[error("captcha solver is disabled")]
     CaptchaSolverDisabled,
 
+    /// Login needs an SMS code but no operator channel is configured.
+    #[error("no operator channel is configured for SMS code entry")]
+    NoOperatorChannel,
+
     /// Captcha solver did not return before the challenge timeout.
     #[error("timed out waiting for captcha challenge {challenge_id}")]
     CaptchaTimeout { challenge_id: String },
@@ -55,6 +59,10 @@ pub enum Error {
     /// The client is used before a successful login.
     #[error("not authenticated")]
     NotAuthenticated,
+
+    /// Telegram Bot API returned an error response.
+    #[error("telegram operator channel failed: {0}")]
+    Telegram(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
