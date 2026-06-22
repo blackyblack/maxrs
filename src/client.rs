@@ -32,6 +32,7 @@ const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
 const ORIGIN: &str = "https://web.max.ru";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const UNKNOWN_USER_ID: i64 = i64::MIN;
 const SECURITY_SERVICE_USER_ID: i64 = 543_835;
@@ -43,10 +44,14 @@ pub(crate) struct InnerClient {
     sink: Mutex<WsSink>,
     pending: Mutex<HashMap<u32, oneshot::Sender<Packet>>>,
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
+    login_config: Mutex<Option<LoginConfig>>,
+    msg_tx: mpsc::UnboundedSender<IncomingMessage>,
+    reconnect_tx: mpsc::UnboundedSender<()>,
     seq: AtomicU32,
     cid: AtomicI64,
     own_user_id: AtomicI64,
     session_initialized: AtomicBool,
+    reconnecting: AtomicBool,
     user_agent: UserAgent,
     http: reqwest::Client,
 }
@@ -89,6 +94,16 @@ impl InnerClient {
         let mut sink = self.sink.lock().await;
         sink.send(Message::text(text)).await?;
         Ok(())
+    }
+
+    fn notify_disconnect(&self) {
+        if self
+            .reconnecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.reconnect_tx.send(());
+        }
     }
 
     pub(crate) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
@@ -172,38 +187,34 @@ impl MaxClient {
     pub async fn connect_with(
         user_agent: UserAgent,
     ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
-        let mut request = WS_URL.into_client_request()?;
-        {
-            let headers = request.headers_mut();
-            headers.insert("Origin", HeaderValue::from_static(ORIGIN));
-            headers.insert("User-Agent", HeaderValue::from_static(BROWSER_USER_AGENT));
-        }
-
-        let (stream, _response) = connect_async(request).await?;
-        let (sink, read) = stream.split();
-
+        let (sink, read) = open_connection().await?;
         let http = reqwest::Client::builder()
             .user_agent(BROWSER_USER_AGENT)
             .build()?;
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
 
         let inner = Arc::new(InnerClient {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
             file_waiters: Mutex::new(HashMap::new()),
+            login_config: Mutex::new(None),
+            msg_tx,
+            reconnect_tx,
             seq: AtomicU32::new(1),
             cid: AtomicI64::new(-chrono_millis()),
             own_user_id: AtomicI64::new(UNKNOWN_USER_ID),
             session_initialized: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
             user_agent,
             http,
         });
 
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(read_loop(read, Arc::clone(&inner), msg_tx));
+        tokio::spawn(read_loop(read, Arc::clone(&inner)));
 
         let client = MaxClient { inner };
         client.spawn_keepalive();
+        client.spawn_reconnect_loop(reconnect_rx);
 
         Ok((client, msg_rx))
     }
@@ -218,15 +229,26 @@ impl MaxClient {
                     .await
                     .is_err()
                 {
-                    break;
+                    inner.notify_disconnect();
                 }
+            }
+        });
+    }
+
+    fn spawn_reconnect_loop(&self, mut reconnect_rx: mpsc::UnboundedReceiver<()>) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            while reconnect_rx.recv().await.is_some() {
+                reconnect_inner(Arc::clone(&inner)).await;
             }
         });
     }
 
     /// Logs in using a saved session token when valid, otherwise starts the SMS auth flow.
     pub async fn login(&self, config: LoginConfig) -> Result<Session> {
-        self.inner.login(config).await
+        let session = self.inner.login(config.clone()).await?;
+        *self.inner.login_config.lock().await = Some(config);
+        Ok(session)
     }
 
     /// Sends a text message to `chat_id`.
@@ -335,6 +357,67 @@ impl MaxClient {
     }
 }
 
+async fn open_connection() -> Result<(WsSink, SplitStream<WsStream>)> {
+    let mut request = WS_URL.into_client_request()?;
+    {
+        let headers = request.headers_mut();
+        headers.insert("Origin", HeaderValue::from_static(ORIGIN));
+        headers.insert("User-Agent", HeaderValue::from_static(BROWSER_USER_AGENT));
+    }
+
+    let (stream, _response) = connect_async(request).await?;
+    Ok(stream.split())
+}
+
+async fn reconnect_inner(inner: Arc<InnerClient>) {
+    let mut config = match inner.login_config.lock().await.clone() {
+        Some(config) => config,
+        None => {
+            inner.reconnecting.store(false, Ordering::Release);
+            return;
+        }
+    };
+
+    loop {
+        tracing::warn!(
+            delay_secs = RECONNECT_DELAY.as_secs(),
+            "Max connection was lost; reconnecting through the main login flow"
+        );
+        tokio::time::sleep(RECONNECT_DELAY).await;
+
+        config.session_token = session_token_from_file();
+
+        match open_connection().await {
+            Ok((sink, read)) => {
+                {
+                    let mut current_sink = inner.sink.lock().await;
+                    *current_sink = sink;
+                }
+                inner.session_initialized.store(false, Ordering::Release);
+                inner.own_user_id.store(UNKNOWN_USER_ID, Ordering::Release);
+                tokio::spawn(read_loop(read, Arc::clone(&inner)));
+
+                match inner.login(config.clone()).await {
+                    Ok(session) => {
+                        config.session_token = Some(session.token);
+                        *inner.login_config.lock().await = Some(config);
+                        inner.reconnecting.store(false, Ordering::Release);
+                        tracing::info!("Max reconnection completed");
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "Max login after reconnect failed; retrying");
+                        inner.notify_disconnect();
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "Max WebSocket reconnect failed; retrying");
+            }
+        }
+    }
+}
+
 fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
     let text = &message.text;
     let elements = &message.elements;
@@ -351,11 +434,7 @@ fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
     })
 }
 
-async fn read_loop(
-    mut read: SplitStream<WsStream>,
-    inner: Arc<InnerClient>,
-    msg_tx: mpsc::UnboundedSender<IncomingMessage>,
-) {
+async fn read_loop(mut read: SplitStream<WsStream>, inner: Arc<InnerClient>) {
     while let Some(frame) = read.next().await {
         let text = match frame {
             Ok(Message::Text(text)) => text.to_string(),
@@ -376,7 +455,7 @@ async fn read_loop(
         };
 
         if packet.is_request() {
-            handle_server_request(&inner, &msg_tx, packet).await;
+            handle_server_request(&inner, &inner.msg_tx, packet).await;
         } else if let Some(tx) = inner.pending.lock().await.remove(&packet.seq) {
             let _ = tx.send(packet);
         }
@@ -385,6 +464,8 @@ async fn read_loop(
     // Connection ended: drop all pending senders so callers get ConnectionClosed.
     inner.pending.lock().await.clear();
     inner.file_waiters.lock().await.clear();
+    inner.session_initialized.store(false, Ordering::Release);
+    inner.notify_disconnect();
 }
 
 async fn handle_server_request(

@@ -32,16 +32,12 @@ pub fn session_token_path() -> PathBuf {
 
 pub fn session_token_from_file() -> Option<String> {
     read_session_token_file(&session_token_path())
-        .ok()
-        .flatten()
 }
 
-fn read_session_token_file(path: &Path) -> std::io::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(token) => Ok(non_empty_trimmed(token)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
-    }
+fn read_session_token_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(non_empty_trimmed)
 }
 
 fn non_empty_trimmed(value: String) -> Option<String> {
@@ -354,6 +350,11 @@ mod tests {
             Some("token-value".into())
         );
         assert_eq!(non_empty_trimmed("  \n".into()), None);
+    }
+
+    #[test]
+    fn session_token_file_errors_are_treated_as_missing_tokens() {
+        assert_eq!(read_session_token_file(Path::new(".")), None);
     }
 
     #[test]

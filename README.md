@@ -14,7 +14,7 @@ without notice.
 
 ## Features
 
-- WebSocket connection and protocol request/response correlation
+- WebSocket connection, protocol request/response correlation, and automatic reconnects after login
 - SMS authentication and re-login with a saved session token file
 - Auth captcha preflight and optional `max_captcha_solver` integration
 - Incoming message channel for server-pushed `NOTIF_MESSAGE` frames
@@ -174,9 +174,10 @@ cargo run --example cli
 The CLI logs in with `.max_session_token` when available. Otherwise it uses
 `MAX_PHONE`, requests an SMS code through the configured operator channel, saves
 the refreshed session token back to `.max_session_token`, and then listens for
-incoming messages until Ctrl-C. If the WebSocket connection is lost, the CLI
-reconnects and runs the same main login flow again so expired tokens fall back to
-captcha/SMS/password auth automatically.
+incoming messages until Ctrl-C. After a successful `MaxClient::login`, the
+library keeps the message receiver open across WebSocket reconnects and reruns
+the same main login flow so expired tokens fall back to captcha/SMS/password auth
+automatically.
 
 ## Protocol Notes
 
