@@ -16,9 +16,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 pub use crate::auth::{
-    session_token_from_env, AuthCaptchaConfig, LoginConfig, DEFAULT_CALLBACK_BIND,
-    DEFAULT_CAPTCHA_CALLBACK_PATH, DEFAULT_SOLVER_URL, ENV_CALLBACK_BIND, ENV_CALLBACK_URL_BASE,
-    ENV_PASSWORD, ENV_PHONE, ENV_SESSION_TOKEN, ENV_SOLVER_URL,
+    session_token_from_file, session_token_path, AuthCaptchaConfig, LoginConfig,
+    DEFAULT_CALLBACK_BIND, DEFAULT_CAPTCHA_CALLBACK_PATH, DEFAULT_SOLVER_URL, ENV_CALLBACK_BIND,
+    ENV_CALLBACK_URL_BASE, ENV_PASSWORD, ENV_PHONE, ENV_SOLVER_URL, SESSION_TOKEN_FILE,
 };
 use crate::error::{Error, Result};
 use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};

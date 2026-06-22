@@ -2,6 +2,7 @@
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -14,7 +15,7 @@ use crate::models::Session;
 use crate::operator_channels::OperatorChannel;
 use crate::protocol::opcode;
 
-pub const ENV_SESSION_TOKEN: &str = "MAX_SESSION_TOKEN";
+pub const SESSION_TOKEN_FILE: &str = ".max_session_token";
 pub const ENV_PASSWORD: &str = "MAX_PASSWORD";
 pub const ENV_PHONE: &str = "MAX_PHONE";
 pub const ENV_SOLVER_URL: &str = "MAX_SOLVER_URL";
@@ -25,8 +26,31 @@ pub const DEFAULT_SOLVER_URL: &str = "http://127.0.0.1:3000";
 pub const DEFAULT_CALLBACK_BIND: &str = "127.0.0.1:3002";
 pub const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 
-pub fn session_token_from_env() -> Option<String> {
-    env_string(ENV_SESSION_TOKEN)
+pub fn session_token_path() -> PathBuf {
+    PathBuf::from(SESSION_TOKEN_FILE)
+}
+
+pub fn session_token_from_file() -> Option<String> {
+    read_session_token_file(&session_token_path())
+        .ok()
+        .flatten()
+}
+
+fn read_session_token_file(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(token) => Ok(non_empty_trimmed(token)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+async fn store_session_token_file(token: &str) -> std::io::Result<()> {
+    tokio::fs::write(session_token_path(), format!("{}\n", token.trim())).await
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +67,7 @@ impl LoginConfig {
         Ok(Self {
             phone: env_string(ENV_PHONE),
             password: env_password(),
-            session_token: session_token_from_env(),
+            session_token: session_token_from_file(),
             captcha: AuthCaptchaConfig::from_env(),
             operator: OperatorChannel::from_env()?,
         })
@@ -245,7 +269,11 @@ impl InnerClient {
 
     async fn login_with_auth_payload(&self, payload: &Value) -> Result<Session> {
         let token = login_token_from_auth_payload(payload)?;
-        self.login_with_token(&token).await
+        let session = self.login_with_token(&token).await?;
+        if let Err(err) = store_session_token_file(&session.token).await {
+            tracing::warn!(%err, path = %session_token_path().display(), "failed to store Max session token; continuing with in-memory session");
+        }
+        Ok(session)
     }
 
     async fn login_with_token(&self, token: &str) -> Result<Session> {
@@ -318,6 +346,15 @@ fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trims_session_token_file_contents() {
+        assert_eq!(
+            non_empty_trimmed("  token-value\n".into()),
+            Some("token-value".into())
+        );
+        assert_eq!(non_empty_trimmed("  \n".into()), None);
+    }
 
     #[test]
     fn sms_login_fallback_only_handles_login_server_errors() {

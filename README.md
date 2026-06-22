@@ -15,13 +15,15 @@ without notice.
 ## Features
 
 - WebSocket connection and protocol request/response correlation
-- SMS authentication and re-login with a saved session token
+- SMS authentication and re-login with a saved session token file
 - Auth captcha preflight and optional `max_captcha_solver` integration
 - Incoming message channel for server-pushed `NOTIF_MESSAGE` frames
 - Text messages, file messages, typing notifications, and keepalive pings
 
-The session token is kept in memory by the library. Store it yourself if your
-application needs to log in again without requesting another SMS code.
+The library reads a saved session token from `.max_session_token` in the current
+working directory and refreshes that file after successful SMS/password login.
+If the file cannot be written, the active session keeps running and a warning is
+written to the log.
 
 ## Prerequisites
 
@@ -49,12 +51,15 @@ The example CLI loads `.env` from the current directory before reading the
 process environment. Copy `.env.template` to `.env` and fill only the values you
 need. Empty values in `.env.template` mean "use the code default" unless noted.
 
-`MAX_SESSION_TOKEN`
+Session token file: `.max_session_token`
 
-Default: unset.
+Default: absent.
 
-Saved Max session token. When set, the CLI logs in with this token and skips SMS
-auth.
+Saved Max session token used to skip SMS auth when valid. Create this file with a
+single token line for easier local debugging, or let `maxrs` create/update it
+after a successful SMS/password login. The file is ignored by git. If the token
+is invalid or expired, login falls back to the normal auth flow, including
+captcha, SMS code entry, and password challenge when Max requires them.
 
 `MAX_PHONE`
 
@@ -166,9 +171,12 @@ Run the CLI example after configuring the needed environment variables:
 cargo run --example cli
 ```
 
-The CLI logs in with `MAX_SESSION_TOKEN` when available. Otherwise it uses
-`MAX_PHONE`, requests an SMS code through the configured operator channel, and
-then listens for incoming messages until Ctrl-C.
+The CLI logs in with `.max_session_token` when available. Otherwise it uses
+`MAX_PHONE`, requests an SMS code through the configured operator channel, saves
+the refreshed session token back to `.max_session_token`, and then listens for
+incoming messages until Ctrl-C. If the WebSocket connection is lost, the CLI
+reconnects and runs the same main login flow again so expired tokens fall back to
+captcha/SMS/password auth automatically.
 
 ## Protocol Notes
 
