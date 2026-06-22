@@ -33,7 +33,7 @@ const ORIGIN: &str = "https://web.max.ru";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const UNKNOWN_USER_ID: i64 = i64::MIN;
+const UNKNOWN_USER_ID: i64 = i64::MIN;
 const SECURITY_SERVICE_USER_ID: i64 = 543_835;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
