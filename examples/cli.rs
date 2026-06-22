@@ -11,9 +11,11 @@
 //! - `MAX_PHONE`: phone number used when the saved token is missing or expired.
 //! - `MAX_PASSWORD`: optional sign-in password used when Max requires it after SMS.
 //! - `MAX_OPERATOR_CHANNEL`: `cli`, `telegram`, or `none` for SMS code entry.
+//!   Defaults to `none`; set `cli` for terminal prompts.
 //! - `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`: required for Telegram.
 
-use maxrs::client::{LoginConfig, MaxClient, SESSION_TOKEN_FILE};
+use maxrs::auth::{LoginConfig, SESSION_TOKEN_FILE};
+use maxrs::client::MaxClient;
 
 #[tokio::main]
 async fn main() {

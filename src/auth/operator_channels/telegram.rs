@@ -1,7 +1,8 @@
 use serde_json::Value;
 
 use crate::error::{Error, Result};
-use crate::operator_channels::TelegramOperatorConfig;
+
+use super::TelegramOperatorConfig;
 
 const TELEGRAM_API_HOST: &str = "api.telegram.org";
 
@@ -13,7 +14,7 @@ pub async fn request_sms_code(config: &TelegramOperatorConfig, phone: &str) -> R
 async fn request_text(config: &TelegramOperatorConfig, text: &str) -> Result<String> {
     let http = telegram_http_client()?;
     let base = format!("https://{TELEGRAM_API_HOST}/bot{}", config.bot_token);
-    let mut offset = next_update_offset(&fetch_updates(&http, &base, "0", None).await?)?;
+    let mut offset = next_update_offset(&fetch_updates(&http, &base, 0, None).await?)?;
 
     let send: Value = http
         .post(format!("{base}/sendMessage"))
@@ -33,20 +34,23 @@ async fn request_text(config: &TelegramOperatorConfig, text: &str) -> Result<Str
                 "timed out waiting for an SMS code reply from the configured Telegram chat".into(),
             ));
         }
-        let resp = fetch_updates(&http, &base, "20", Some(offset)).await?;
+        let resp = fetch_updates(&http, &base, 20, Some(offset)).await?;
         if !resp["ok"].as_bool().unwrap_or(false) {
             return Err(Error::Telegram(resp.to_string()));
         }
-        if let Some(updates) = resp["result"].as_array() {
-            for update in updates {
-                if let Some(id) = update["update_id"].as_i64() {
-                    offset = id + 1;
-                }
-                if let Some(text) =
-                    operator_text_from_update(update, config.chat_id, config.bot_user_id)
-                {
-                    return Ok(text);
-                }
+        let updates = if let Some(updates) = resp["result"].as_array() {
+            updates
+        } else {
+            continue;
+        };
+        for update in updates {
+            if let Some(id) = update["update_id"].as_i64() {
+                offset = id + 1;
+            }
+            if let Some(text) =
+                operator_text_from_update(update, config.chat_id, config.bot_user_id)
+            {
+                return Ok(text);
             }
         }
     }
@@ -85,20 +89,17 @@ fn telegram_http_client() -> Result<reqwest::Client> {
 async fn fetch_updates(
     http: &reqwest::Client,
     base: &str,
-    timeout: &str,
+    timeout: u64,
     offset: Option<i64>,
 ) -> Result<Value> {
     let mut request = http
         .get(format!("{base}/getUpdates"))
         .query(&[("timeout", timeout)]);
-    let offset_value;
     if let Some(offset) = offset {
-        offset_value = offset.to_string();
-        request = request.query(&[("offset", offset_value.as_str())]);
+        request = request.query(&[("offset", offset)]);
     }
 
-    let resp = request.send().await?.json().await?;
-    Ok(resp)
+    request.send().await?.json().await.map_err(|e| e.into())
 }
 
 fn next_update_offset(resp: &Value) -> Result<i64> {

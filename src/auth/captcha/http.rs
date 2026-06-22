@@ -11,8 +11,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use crate::captcha::solver::CaptchaSolver;
 use crate::error::{Error, Result};
+
+use super::solver::CaptchaSolver;
 
 const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 const DEFAULT_CALLBACK_BODY_LIMIT_BYTES: usize = 16 * 1024;
@@ -190,7 +191,7 @@ mod tests {
     use std::time::Instant;
     use tokio::sync::oneshot;
 
-    use crate::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
+    use crate::auth::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 
     #[tokio::test]
     async fn optional_server_forwards_captcha_callbacks() {

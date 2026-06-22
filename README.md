@@ -76,11 +76,11 @@ code.
 
 `MAX_OPERATOR_CHANNEL`
 
-Default: `cli`.
+Default: `none`.
 
-SMS code entry channel. Use `cli`, `telegram`, or `none`. If set to
-`telegram`, both `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID` must be
-configured.
+SMS code entry channel. Use `cli`, `telegram`, or `none`. Set this to `cli`
+for interactive local SMS entry. If set to `telegram`, both
+`MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID` must be configured.
 
 `MAX_TELEGRAM_BOT_TOKEN`
 
@@ -172,9 +172,10 @@ cargo run --example cli
 ```
 
 The CLI logs in with `.max_session_token` when available. Otherwise it uses
-`MAX_PHONE`, requests an SMS code through the configured operator channel, saves
-the refreshed session token back to `.max_session_token`, and then listens for
-incoming messages until Ctrl-C. After a successful `MaxClient::login`, the
+`MAX_PHONE`, requests an SMS code through the configured operator channel
+(`MAX_OPERATOR_CHANNEL=cli` for terminal entry), saves the refreshed session
+token back to `.max_session_token`, and then listens for incoming messages until
+Ctrl-C. After a successful `MaxClient::login`, the
 library keeps the message receiver open across WebSocket reconnects and reruns
 the same main login flow so expired tokens fall back to captcha/SMS/password auth
 automatically.

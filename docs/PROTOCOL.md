@@ -156,12 +156,12 @@ with server-assigned positive message ids.
    {
      "chatId": 123456,
      "message": { "text": "caption", "cid": -1700000000002, "type": "USER", "elements": [],
-                  "attaches": [ { "_type": "FILE", "fileId": 987654 } ] },
+                  "attaches": [ { "type": "FILE", "fileId": 987654 } ] },
      "notify": true
    }
    ```
 
-Photos use PHOTO_UPLOAD (80) with `{"_type":"PHOTO","photoToken":...}` instead;
+Photos use PHOTO_UPLOAD (80) with `{"type":"PHOTO","photoToken":...}` instead;
 only generic files are implemented here.
 
 ## Receiving messages — NOTIF_MESSAGE (128)

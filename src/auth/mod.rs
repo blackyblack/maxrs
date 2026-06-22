@@ -1,19 +1,23 @@
-//! Internal authentication support for the Max client.
+//! Authentication support for the Max client.
+
+pub mod captcha;
+pub mod operator_channels;
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::captcha::http::{HttpServer, HttpServerConfig};
-use crate::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 use crate::client::InnerClient;
 use crate::error::{Error, Result};
 use crate::models::Session;
-use crate::operator_channels::OperatorChannel;
 use crate::protocol::opcode;
+
+use self::captcha::http::{HttpServer, HttpServerConfig};
+use self::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
+use self::operator_channels::OperatorChannel;
 
 pub const SESSION_TOKEN_FILE: &str = ".max_session_token";
 pub const ENV_PASSWORD: &str = "MAX_PASSWORD";
@@ -26,16 +30,12 @@ pub const DEFAULT_SOLVER_URL: &str = "http://127.0.0.1:3000";
 pub const DEFAULT_CALLBACK_BIND: &str = "127.0.0.1:3002";
 pub const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 
-pub fn session_token_path() -> PathBuf {
+fn session_token_path() -> PathBuf {
     PathBuf::from(SESSION_TOKEN_FILE)
 }
 
 pub fn session_token_from_file() -> Option<String> {
-    read_session_token_file(&session_token_path())
-}
-
-fn read_session_token_file(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
+    std::fs::read_to_string(&session_token_path())
         .ok()
         .and_then(non_empty_trimmed)
 }
@@ -350,11 +350,6 @@ mod tests {
             Some("token-value".into())
         );
         assert_eq!(non_empty_trimmed("  \n".into()), None);
-    }
-
-    #[test]
-    fn session_token_file_errors_are_treated_as_missing_tokens() {
-        assert_eq!(read_session_token_file(Path::new(".")), None);
     }
 
     #[test]

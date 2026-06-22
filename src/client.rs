@@ -15,17 +15,9 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-pub use crate::auth::{
-    session_token_from_file, session_token_path, AuthCaptchaConfig, LoginConfig,
-    DEFAULT_CALLBACK_BIND, DEFAULT_CAPTCHA_CALLBACK_PATH, DEFAULT_SOLVER_URL, ENV_CALLBACK_BIND,
-    ENV_CALLBACK_URL_BASE, ENV_PASSWORD, ENV_PHONE, ENV_SOLVER_URL, SESSION_TOKEN_FILE,
-};
+use crate::auth::{session_token_from_file, LoginConfig};
 use crate::error::{Error, Result};
 use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};
-pub use crate::operator_channels::{
-    OperatorChannel, TelegramOperatorConfig, ENV_OPERATOR_CHANNEL, ENV_TELEGRAM_BOT_TOKEN,
-    ENV_TELEGRAM_CHAT_ID, ENV_TELEGRAM_POLL_TIMEOUT_SECS,
-};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
 
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
@@ -339,7 +331,7 @@ impl MaxClient {
                 "cid": self.inner.next_cid(),
                 "type": "USER",
                 "elements": [],
-                "attaches": [{ "_type": "FILE", "fileId": file_id }],
+                "attaches": [{ "type": "FILE", "fileId": file_id }],
             },
             "notify": true,
         });
@@ -632,9 +624,9 @@ mod tests {
         assert_eq!(
             payload["message"]["elements"],
             json!([
-                { "_type": "STRONG", "from": 0, "length": 5 },
+                { "type": "STRONG", "from": 0, "length": 5 },
                 {
-                    "_type": "LINK",
+                    "type": "LINK",
                     "from": 6,
                     "length": 4,
                     "url": "https://example.test"

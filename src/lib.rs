@@ -4,7 +4,8 @@
 //! # Example
 //!
 //! ```no_run
-//! use maxrs::client::{LoginConfig, MaxClient};
+//! use maxrs::auth::LoginConfig;
+//! use maxrs::client::MaxClient;
 //! use maxrs::models::MaxMessage;
 //!
 //! # async fn run() -> maxrs::error::Result<()> {
@@ -23,10 +24,8 @@
 //! # }
 //! ```
 
-mod auth;
-pub mod captcha;
+pub mod auth;
 pub mod client;
 pub mod error;
 pub mod models;
-mod operator_channels;
 pub mod protocol;
