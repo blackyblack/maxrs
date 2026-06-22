@@ -33,6 +33,8 @@ const ORIGIN: &str = "https://web.max.ru";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const UNKNOWN_USER_ID: i64 = i64::MIN;
+const SECURITY_SERVICE_USER_ID: i64 = 543_835;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
@@ -43,6 +45,7 @@ pub(crate) struct InnerClient {
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
     seq: AtomicU32,
     cid: AtomicI64,
+    own_user_id: AtomicI64,
     session_initialized: AtomicBool,
     user_agent: UserAgent,
     http: reqwest::Client,
@@ -67,6 +70,17 @@ impl InnerClient {
                 Ok(_) => return next,
                 Err(actual) => prev = actual,
             }
+        }
+    }
+
+    pub(crate) fn set_own_user_id(&self, user_id: i64) {
+        self.own_user_id.store(user_id, Ordering::Release);
+    }
+
+    fn own_user_id(&self) -> Option<i64> {
+        match self.own_user_id.load(Ordering::Acquire) {
+            UNKNOWN_USER_ID => None,
+            user_id => Some(user_id),
         }
     }
 
@@ -178,6 +192,7 @@ impl MaxClient {
             file_waiters: Mutex::new(HashMap::new()),
             seq: AtomicU32::new(1),
             cid: AtomicI64::new(-chrono_millis()),
+            own_user_id: AtomicI64::new(UNKNOWN_USER_ID),
             session_initialized: AtomicBool::new(false),
             user_agent,
             http,
@@ -387,7 +402,9 @@ async fn handle_server_request(
                     json!({ "chatId": message.chat_id, "messageId": message.message_id }),
                 );
                 let _ = inner.send_packet(&ack).await;
-                let _ = msg_tx.send(message);
+                if !is_filtered_incoming_message(&message, inner.own_user_id()) {
+                    let _ = msg_tx.send(message);
+                }
             }
         }
         opcode::NOTIF_ATTACH => {
@@ -411,6 +428,18 @@ fn parse_incoming(payload: &Value) -> Option<IncomingMessage> {
         text: message["text"].as_str().unwrap_or_default().to_string(),
         time: message["time"].as_i64().unwrap_or_default(),
     })
+}
+
+fn is_filtered_incoming_message(message: &IncomingMessage, own_user_id: Option<i64>) -> bool {
+    is_own_message(message, own_user_id) || is_security_service_message(message)
+}
+
+fn is_own_message(message: &IncomingMessage, own_user_id: Option<i64>) -> bool {
+    own_user_id == Some(message.sender)
+}
+
+fn is_security_service_message(message: &IncomingMessage) -> bool {
+    message.sender == SECURITY_SERVICE_USER_ID
 }
 
 fn error_message(payload: &Value) -> String {
@@ -457,6 +486,34 @@ mod tests {
     #[test]
     fn missing_chat_id_is_not_a_message() {
         assert!(parse_incoming(&json!({ "message": { "text": "x" } })).is_none());
+    }
+
+    #[test]
+    fn identifies_own_incoming_message() {
+        let msg = IncomingMessage {
+            chat_id: 1,
+            message_id: 2,
+            sender: 777,
+            text: "echo".into(),
+            time: 3,
+        };
+
+        assert!(is_own_message(&msg, Some(777)));
+        assert!(!is_own_message(&msg, Some(778)));
+        assert!(!is_own_message(&msg, None));
+    }
+
+    #[test]
+    fn filters_security_service_message() {
+        let msg = IncomingMessage {
+            chat_id: 300_880_330,
+            message_id: 0,
+            sender: SECURITY_SERVICE_USER_ID,
+            text: "New MAX login".into(),
+            time: 0,
+        };
+
+        assert!(is_filtered_incoming_message(&msg, None));
     }
 
     #[test]

@@ -264,6 +264,9 @@ impl InnerClient {
             "chatsCount": 40,
         });
         let response = self.invoke(opcode::LOGIN, payload).await?;
+        if let Some(user_id) = own_user_id_from_login_payload(&response.payload) {
+            self.set_own_user_id(user_id);
+        }
         Ok(Session {
             token: token.to_string(),
             login_payload: response.payload,
@@ -280,6 +283,15 @@ fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
         .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))
+}
+
+fn own_user_id_from_login_payload(payload: &Value) -> Option<i64> {
+    let profile = &payload["profile"];
+    profile["id"]
+        .as_i64()
+        .or_else(|| profile["userId"].as_i64())
+        .or_else(|| profile["uid"].as_i64())
+        .or_else(|| payload["userId"].as_i64())
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -335,6 +347,30 @@ mod tests {
         assert_eq!(
             login_token_from_auth_payload(&payload).unwrap(),
             "session-token"
+        );
+    }
+
+    #[test]
+    fn extracts_own_user_id_from_login_profile() {
+        assert_eq!(
+            own_user_id_from_login_payload(&json!({ "profile": { "id": 777 } })),
+            Some(777)
+        );
+        assert_eq!(
+            own_user_id_from_login_payload(&json!({ "profile": { "userId": 778 } })),
+            Some(778)
+        );
+        assert_eq!(
+            own_user_id_from_login_payload(&json!({ "profile": { "uid": 779 } })),
+            Some(779)
+        );
+        assert_eq!(
+            own_user_id_from_login_payload(&json!({ "profile": {}, "userId": 780 })),
+            Some(780)
+        );
+        assert_eq!(
+            own_user_id_from_login_payload(&json!({ "profile": {} })),
+            None
         );
     }
 }
