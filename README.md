@@ -1,43 +1,28 @@
 # maxrs
 
-`maxrs` is an unofficial asynchronous Rust client for the Max messenger web
-WebSocket API at `wss://ws-api.oneme.ru/websocket`.
+`maxrs` is an unofficial asynchronous Rust client for the Max messenger.
 
-The crate is a proof of concept for the parts of the reverse-engineered web
-protocol that are useful for a minimal custom client: SMS authentication,
-session-token login, incoming message notifications, typing notifications, text
-messages, file upload, and optional captcha solving for the current web auth
-flow.
+It supports SMS/session-token login, incoming messages, typing notifications,
+text messages, file upload, explicit reconnects, and optional captcha solving.
 
 This project is not affiliated with Max or VK. The internal API can change
 without notice.
 
 ## Features
 
-- WebSocket connection and protocol request/response correlation
-- SMS authentication and re-login with a saved session token
-- Auth captcha preflight and optional `max_captcha_solver` integration
-- Incoming message channel for server-pushed `NOTIF_MESSAGE` frames
+- WebSocket login and explicit reconnects through `MaxClient::connect`
+- SMS authentication and saved session-token login
+- Captcha-free SMS auth by default, with optional `max_captcha_solver` fallback
+- Incoming message channel
 - Text messages, file messages, typing notifications, and keepalive pings
-
-The session token is kept in memory by the library. Store it yourself if your
-application needs to log in again without requesting another SMS code.
 
 ## Prerequisites
 
-Install a current stable Rust toolchain from <https://rustup.rs/>.
-
-SMS login talks to the real Max service, so you need a phone number that can
-receive the verification SMS.
-
-Captcha solving is optional, but Max may require it before sending an SMS. For
-the ready-to-use helper, run
-[`blackyblack/max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver)
-and configure the env variables below.
+- Current stable Rust toolchain: <https://rustup.rs/>
+- Phone number that can receive a Max verification SMS
+- Optional captcha solver: [`blackyblack/max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver)
 
 ## Installation
-
-Clone this repository and run the included example:
 
 ```bash
 cargo run --example cli
@@ -45,98 +30,32 @@ cargo run --example cli
 
 ## Configuration
 
-The example CLI loads `.env` from the current directory before reading the
-process environment. Copy `.env.template` to `.env` and fill only the values you
-need. Empty values in `.env.template` mean "use the code default" unless noted.
+The example CLI loads `.env` before reading the process environment. Copy
+`.env.template` to `.env` and fill only the values you need.
 
-`MAX_SESSION_TOKEN`
-
-Default: unset.
-
-Saved Max session token. When set, the CLI logs in with this token and skips SMS
-auth.
-
-`MAX_PHONE`
-
-Default: unset.
-
-Phone number used for SMS auth when `MAX_SESSION_TOKEN` is unset or rejected.
-
-`MAX_PASSWORD`
-
-Default: unset.
-
-Sign-in password used only when Max requires a password challenge after the SMS
-code.
-
-`MAX_OPERATOR_CHANNEL`
-
-Default: `cli`.
-
-SMS code entry channel. Use `cli`, `telegram`, or `none`. If set to
-`telegram`, both `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID` must be
-configured.
-
-`MAX_TELEGRAM_BOT_TOKEN`
-
-Default: unset.
-
-Telegram bot token used when `MAX_OPERATOR_CHANNEL=telegram`.
-
-`MAX_TELEGRAM_CHAT_ID`
-
-Default: unset.
-
-Telegram chat id where SMS prompts are sent when `MAX_OPERATOR_CHANNEL=telegram`.
-
-`MAX_TELEGRAM_POLL_TIMEOUT_SECS`
-
-Default: `300`.
-
-Maximum time to wait for a Telegram SMS-code reply.
-
-`MAX_SOLVER_URL`
-
-Default: `http://127.0.0.1:3000`.
-
-Base URL of the `max_captcha_solver` solve API. The helper posts captcha
-challenges to `POST /solve` on this service when Max requires auth captcha. If
-Max asks for captcha and this service is not running or not reachable, login
-fails with a captcha solver configuration error.
-
-`MAX_CALLBACK_BIND`
-
-Default: `127.0.0.1:3002`.
-
-Local address used by the built-in callback receiver. The receiver serves
-`POST /captcha-callback` and forwards solver callbacks to the pending
-captcha challenge.
-
-`MAX_CALLBACK_URL_BASE`
-
-Default: unset, which becomes `http://<bound callback address>/captcha-callback`.
-
-Public base URL sent to `max_captcha_solver` as the callback target. Use this
-when the solver cannot reach the callback receiver through the bind address.
-The value may contain `{port}`, which is replaced with the actual callback
-server port.
-
-`RUST_LOG`
-
-Default in the CLI: `maxrs=info`.
-
-Tracing filter used by `tracing_subscriber`. Examples: `debug`,
-`maxrs=debug`, or `maxrs=info,hyper=warn`.
+- `.max_session_token`: optional saved token file. One token line; refreshed
+  after SMS/password login.
+- `MAX_PHONE`: required when no valid saved token exists.
+- `MAX_PASSWORD`: used only if Max asks for a password challenge after SMS.
+- `MAX_OPERATOR_CHANNEL`: `none` by default. Use `cli` for local SMS entry or
+  `telegram` for Telegram prompts.
+- `MAX_TELEGRAM_BOT_TOKEN`, `MAX_TELEGRAM_CHAT_ID`: required with
+  `MAX_OPERATOR_CHANNEL=telegram`.
+- `MAX_TELEGRAM_POLL_TIMEOUT_SECS`: Telegram SMS reply timeout. Default: `300`.
+- `MAX_SOLVER_URL`: captcha solver API URL. Default: `http://127.0.0.1:3000`.
+  Empty disables the solver. Only used if Max rejects the captcha-free SMS
+  request and requires a captcha retry.
+- `MAX_CALLBACK_BIND`: captcha callback bind address. Default: `127.0.0.1:3002`.
+- `MAX_CALLBACK_URL_BASE`: public callback base for the solver. May contain
+  `{port}`.
+- `RUST_LOG`: tracing filter. CLI default: `maxrs=info`.
 
 ## Captcha Solver
 
-`maxrs` can work without a solver if Max does not require captcha. If captcha is
-required, use
-[`blackyblack/max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver).
-Its solve API listens on `127.0.0.1:3000` by default and its operator UI listens
-on `0.0.0.0:3001` by default.
-
-For a local solver process running on the host, the defaults are enough:
+SMS auth is attempted without captcha first.
+Max may still require captcha for some accounts or requests; in that case `maxrs`
+falls back to the optional solver. For a local solver running on the host, the
+defaults are enough:
 
 ```env
 MAX_SOLVER_URL=
@@ -144,8 +63,8 @@ MAX_CALLBACK_BIND=
 MAX_CALLBACK_URL_BASE=
 ```
 
-For a containerized solver, publish the solver ports and make the callback URL
-point from the container back to the host:
+For a containerized solver, publish the solver ports and point callbacks back to
+the host:
 
 ```env
 MAX_SOLVER_URL=http://127.0.0.1:3000
@@ -153,10 +72,9 @@ MAX_CALLBACK_BIND=0.0.0.0:3002
 MAX_CALLBACK_URL_BASE=http://host.docker.internal:3002
 ```
 
-On Linux, Docker may not define `host.docker.internal` automatically. Add a
-host-gateway mapping to the solver container or use an address that the
-container can route to on the host. The solve API should be reachable from
-`maxrs`, and the callback URL should be reachable from the solver container.
+On Linux, Docker may need a `host-gateway` mapping for `host.docker.internal`.
+The solve API must be reachable from `maxrs`; the callback URL must be reachable
+from the solver.
 
 ## Usage
 
@@ -166,9 +84,7 @@ Run the CLI example after configuring the needed environment variables:
 cargo run --example cli
 ```
 
-The CLI logs in with `MAX_SESSION_TOKEN` when available. Otherwise it uses
-`MAX_PHONE`, requests an SMS code through the configured operator channel, and
-then listens for incoming messages until Ctrl-C.
+The CLI logs in to Max and listens for incoming messages until Ctrl-C.
 
 ## Protocol Notes
 

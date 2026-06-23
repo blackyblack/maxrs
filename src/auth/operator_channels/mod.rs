@@ -1,7 +1,9 @@
-use std::env;
 use std::time::Duration;
 
-use crate::error::{Error, Result};
+use crate::{
+    auth::env_string,
+    error::{Error, Result},
+};
 
 pub(crate) mod cli;
 pub(crate) mod telegram;
@@ -20,14 +22,16 @@ pub enum OperatorChannel {
 
 impl OperatorChannel {
     pub fn from_env() -> Result<Self> {
-        let channel = env_string(ENV_OPERATOR_CHANNEL)
-            .unwrap_or_else(|| "cli".into())
-            .to_ascii_lowercase();
+        Self::from_name(env_string(ENV_OPERATOR_CHANNEL).as_deref())
+    }
+
+    fn from_name(channel: Option<&str>) -> Result<Self> {
+        let channel = channel.unwrap_or("none").to_ascii_lowercase();
 
         Ok(match channel.as_str() {
-            "none" | "off" | "disabled" => Self::None,
+            "cli" => Self::Cli,
             "telegram" | "tg" => Self::Telegram(TelegramOperatorConfig::from_env()?),
-            _ => Self::Cli,
+            _ => Self::None,
         })
     }
 
@@ -57,7 +61,7 @@ impl TelegramOperatorConfig {
                 "{ENV_TELEGRAM_BOT_TOKEN} must start with the numeric Telegram bot id prefix"
             ))
         })?;
-        let chat_id = env_string(ENV_TELEGRAM_CHAT_ID)
+        let chat_id: i64 = env_string(ENV_TELEGRAM_CHAT_ID)
             .ok_or_else(|| Error::TelegramConfigMissing(format!("set {ENV_TELEGRAM_CHAT_ID}")))?
             .parse()
             .map_err(|_| {
@@ -78,24 +82,25 @@ impl TelegramOperatorConfig {
     }
 }
 
-fn env_string(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn telegram_bot_id_from_token(token: &str) -> Option<i64> {
     token.split_once(':')?.0.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::telegram_bot_id_from_token;
+    use super::{telegram_bot_id_from_token, OperatorChannel};
 
     #[test]
     fn parses_telegram_bot_id_from_token_prefix() {
         assert_eq!(telegram_bot_id_from_token("123456:secret"), Some(123456));
         assert_eq!(telegram_bot_id_from_token("not-a-token"), None);
+    }
+
+    #[test]
+    fn defaults_to_no_operator_channel() {
+        assert!(matches!(
+            OperatorChannel::from_name(None).unwrap(),
+            OperatorChannel::None
+        ));
     }
 }

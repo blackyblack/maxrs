@@ -1,2 +1,4 @@
 /target
 .env
+
+.max_session_token

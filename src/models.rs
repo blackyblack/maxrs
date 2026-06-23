@@ -100,7 +100,7 @@ impl MaxMessage {
 /// Formatting elements supported by Max text messages.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageElement {
-    #[serde(rename = "_type")]
+    #[serde(rename = "type")]
     pub kind: MessageElementKind,
     pub from: usize,
     pub length: usize,

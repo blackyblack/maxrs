@@ -7,6 +7,9 @@ pub enum Error {
     #[error("websocket error: {0}")]
     WebSocket(#[source] Box<tungstenite::Error>),
 
+    #[error("invalid HTTP header value: {0}")]
+    InvalidHeaderValue(#[from] tungstenite::http::header::InvalidHeaderValue),
+
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -19,10 +22,6 @@ pub enum Error {
     /// The server replied with an error frame (`cmd == 3`).
     #[error("server error (opcode {opcode}): {message}")]
     Server { opcode: u16, message: String },
-
-    /// SMS authentication requires completing a captcha challenge in a browser.
-    #[error("captcha required before requesting SMS code: {link}")]
-    CaptchaRequired { link: String },
 
     /// Captcha solving was requested, but no solver service URL is configured.
     #[error("captcha solver is not configured; set MAX_SOLVER_URL to a running max_captcha_solver service or disable captcha solving explicitly")]
@@ -71,10 +70,6 @@ pub enum Error {
     /// A response payload was missing an expected field.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
-
-    /// The client is used before a successful login.
-    #[error("not authenticated")]
-    NotAuthenticated,
 
     /// Telegram Bot API returned an error response.
     #[error("telegram operator channel failed: {0}")]

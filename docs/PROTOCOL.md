@@ -53,15 +53,15 @@ the server does not drop the connection.
    { "userAgent": { "deviceType": "WEB", "...": "..." }, "deviceId": "<uuid>" }
    ```
 
-   Current web auth then performs **AUTH_CAPTCHA_REQUEST (224)** before
+   Some web auth attempts perform **AUTH_CAPTCHA_REQUEST (224)** before
    requesting the SMS code:
 
    ```json
    { "source": "auth", "identifier": "+79990000000" }
    ```
 
-   Response payload may contain `link`. The official web client renders that
-   link in a VK captcha widget and passes the resulting `captchaToken` to
+   Response payload may contain `link`. The official web client can render that
+   link in a VK captcha widget and pass the resulting `captchaToken` to
    AUTH_REQUEST.
 
 2. **AUTH_REQUEST (17)** — asks the server to send an SMS code.
@@ -71,11 +71,13 @@ the server does not drop the connection.
      "phone": "+79990000000",
      "type": "START_AUTH",
      "language": "ru",
-     "captchaToken": "<captcha token or empty string>"
+     "captchaToken": "<captcha token, only when captcha was required>"
    }
    ```
 
    Response payload contains a short-lived `token` (the "SMS token").
+   `maxrs` sends request without `captchaToken` first and retries with captcha only if AUTH_REQUEST is
+   rejected.
 
 3. **AUTH (18)** — verifies the code.
 
@@ -156,12 +158,12 @@ with server-assigned positive message ids.
    {
      "chatId": 123456,
      "message": { "text": "caption", "cid": -1700000000002, "type": "USER", "elements": [],
-                  "attaches": [ { "_type": "FILE", "fileId": 987654 } ] },
+                  "attaches": [ { "type": "FILE", "fileId": 987654 } ] },
      "notify": true
    }
    ```
 
-Photos use PHOTO_UPLOAD (80) with `{"_type":"PHOTO","photoToken":...}` instead;
+Photos use PHOTO_UPLOAD (80) with `{"type":"PHOTO","photoToken":...}` instead;
 only generic files are implemented here.
 
 ## Receiving messages — NOTIF_MESSAGE (128)
