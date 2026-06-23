@@ -35,7 +35,7 @@ fn session_token_path() -> PathBuf {
 }
 
 pub fn session_token_from_file() -> Option<String> {
-    std::fs::read_to_string(&session_token_path())
+    std::fs::read_to_string(session_token_path())
         .ok()
         .and_then(non_empty_trimmed)
 }
@@ -136,76 +136,14 @@ impl InnerClient {
             .phone
             .as_deref()
             .ok_or_else(|| Error::UnexpectedResponse("missing phone for SMS login".into()))?;
-        let sms_token = self
-            .request_sms_code_with_auth_captcha(phone, &config.captcha)
-            .await?;
+        let sms_token = self.request_sms_code(phone, &config.captcha).await?;
         let code = config.operator.request_sms_code(phone).await?;
         self.verify_sms_code(&sms_token, code.trim(), config.password.as_deref())
             .await
     }
 
-    async fn request_sms_code_with_auth_captcha(
-        &self,
-        phone: &str,
-        config: &AuthCaptchaConfig,
-    ) -> Result<String> {
-        match self.request_sms_code(phone).await {
-            Ok(token) => Ok(token),
-            Err(Error::CaptchaRequired { link }) => {
-                let solver_url = config
-                    .solver_url
-                    .as_ref()
-                    .ok_or(Error::CaptchaSolverDisabled)?;
-                let server = HttpServer::bind(HttpServerConfig::new(&config.callback_bind)).await?;
-                let callback_addr = server.local_addr()?;
-                let callback_url = config.callback_url(callback_addr);
-                let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
-                    solver_url.clone(),
-                    callback_url,
-                ))?);
-                tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
-                let captcha_token = solver.solve(&link).await?;
-                self.request_sms_code_with_captcha_token(phone, &captcha_token)
-                    .await
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn request_auth_captcha(&self, phone: &str) -> Result<Option<String>> {
-        self.session_init().await?;
-        let payload = json!({
-            "source": "auth",
-            "identifier": phone,
-        });
-        match self.invoke(opcode::AUTH_CAPTCHA_REQUEST, payload).await {
-            Ok(response) => Ok(response.payload["link"].as_str().map(str::to_string)),
-            Err(Error::Server { opcode, message })
-                if message == "captcha.create-session-failed" =>
-            {
-                tracing::debug!(
-                    opcode,
-                    "captcha session creation failed; continuing without token"
-                );
-                Ok(None)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    async fn request_sms_code(&self, phone: &str) -> Result<String> {
-        if let Some(link) = self.request_auth_captcha(phone).await? {
-            return Err(Error::CaptchaRequired { link });
-        }
-
-        self.request_sms_code_with_captcha_token(phone, "").await
-    }
-
-    async fn request_sms_code_with_captcha_token(
-        &self,
-        phone: &str,
-        captcha_token: &str,
-    ) -> Result<String> {
+    async fn request_sms_code(&self, phone: &str, config: &AuthCaptchaConfig) -> Result<String> {
+        let captcha_token = self.solve_auth_captcha(phone, config).await?;
         self.session_init().await?;
         let payload = json!({
             "phone": phone,
@@ -218,6 +156,40 @@ impl InnerClient {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| Error::UnexpectedResponse("missing auth token".into()))
+    }
+
+    async fn solve_auth_captcha(&self, phone: &str, config: &AuthCaptchaConfig) -> Result<String> {
+        let captcha_link = self.request_auth_captcha(phone).await?;
+        if captcha_link.is_empty() {
+            return Err(Error::UnexpectedResponse("missing captcha link".into()));
+        }
+
+        let solver_url = config
+            .solver_url
+            .as_ref()
+            .ok_or(Error::CaptchaSolverDisabled)?;
+        let server = HttpServer::bind(HttpServerConfig::new(&config.callback_bind)).await?;
+        let callback_addr = server.local_addr()?;
+        let callback_url = config.callback_url(callback_addr);
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
+            solver_url.clone(),
+            callback_url,
+        ))?);
+        tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
+        solver.solve(&captcha_link).await
+    }
+
+    async fn request_auth_captcha(&self, phone: &str) -> Result<String> {
+        self.session_init().await?;
+        let payload = json!({
+            "source": "auth",
+            "identifier": phone,
+        });
+        let response = self.invoke(opcode::AUTH_CAPTCHA_REQUEST, payload).await?;
+        Ok(response.payload["link"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
     }
 
     async fn verify_sms_code(
@@ -233,6 +205,7 @@ impl InnerClient {
         });
         let response = self.invoke(opcode::AUTH, payload).await?;
         if response.payload["passwordChallenge"].is_object() {
+            let password = password.ok_or(Error::PasswordRequired)?;
             return self
                 .verify_password_challenge(&response.payload["passwordChallenge"], password)
                 .await;
@@ -244,12 +217,11 @@ impl InnerClient {
     async fn verify_password_challenge(
         &self,
         challenge: &Value,
-        password: Option<&str>,
+        password: &str,
     ) -> Result<Session> {
         let track_id = challenge["trackId"].as_str().ok_or_else(|| {
             Error::UnexpectedResponse("missing password challenge trackId".into())
         })?;
-        let password = password.ok_or(Error::PasswordRequired)?;
         let response = self
             .invoke(
                 opcode::AUTH_PASSWORD,

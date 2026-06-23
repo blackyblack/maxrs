@@ -1,7 +1,9 @@
-use std::env;
 use std::time::Duration;
 
-use crate::error::{Error, Result};
+use crate::{
+    auth::env_string,
+    error::{Error, Result},
+};
 
 pub(crate) mod cli;
 pub(crate) mod telegram;
@@ -78,13 +80,6 @@ impl TelegramOperatorConfig {
                 .unwrap_or_else(|| Duration::from_secs(300)),
         })
     }
-}
-
-fn env_string(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn telegram_bot_id_from_token(token: &str) -> Option<i64> {

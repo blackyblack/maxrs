@@ -1,5 +1,6 @@
 //! The asynchronous Max client.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -278,6 +279,39 @@ impl MaxClient {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".to_string());
 
+        self.send_uploaded_file(chat_id, file_name, bytes, caption)
+            .await
+    }
+
+    /// Uploads a file from an in-memory byte buffer and sends it to `chat_id`.
+    ///
+    /// This follows the same Max upload flow as [`MaxClient::send_file`], but
+    /// uses the supplied bytes instead of reading from the filesystem. The
+    /// `file_name` is sent in the HTTP `Content-Disposition` header.
+    pub async fn send_file_bytes<'a>(
+        &self,
+        chat_id: i64,
+        file_name: impl Into<String>,
+        bytes: impl Into<Cow<'a, [u8]>>,
+        caption: &str,
+    ) -> Result<()> {
+        self.send_uploaded_file(
+            chat_id,
+            file_name.into(),
+            bytes.into().into_owned(),
+            caption,
+        )
+        .await
+    }
+
+    async fn send_uploaded_file(
+        &self,
+        chat_id: i64,
+        file_name: String,
+        bytes: Vec<u8>,
+        caption: &str,
+    ) -> Result<()> {
+        let file_name = normalized_file_name(file_name);
         let response = self
             .inner
             .invoke(opcode::FILE_UPLOAD, json!({ "count": 1 }))
@@ -324,17 +358,7 @@ impl MaxClient {
         let _ = tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx).await;
         self.inner.file_waiters.lock().await.remove(&file_id);
 
-        let payload = json!({
-            "chatId": chat_id,
-            "message": {
-                "text": caption,
-                "cid": self.inner.next_cid(),
-                "type": "USER",
-                "elements": [],
-                "attaches": [{ "type": "FILE", "fileId": file_id }],
-            },
-            "notify": true,
-        });
+        let payload = file_message_payload(chat_id, caption, file_id, self.inner.next_cid());
         self.inner.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
     }
@@ -424,6 +448,28 @@ fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
         },
         "notify": true,
     })
+}
+
+fn file_message_payload(chat_id: i64, caption: &str, file_id: i64, cid: i64) -> Value {
+    json!({
+        "chatId": chat_id,
+        "message": {
+            "text": caption,
+            "cid": cid,
+            "type": "USER",
+            "elements": [],
+            "attaches": [{ "type": "FILE", "fileId": file_id }],
+        },
+        "notify": true,
+    })
+}
+
+fn normalized_file_name(file_name: String) -> String {
+    if file_name.is_empty() {
+        "file".to_string()
+    } else {
+        file_name
+    }
 }
 
 async fn read_loop(mut read: SplitStream<WsStream>, inner: Arc<InnerClient>) {
@@ -633,5 +679,27 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn file_message_payload_matches_web_schema() {
+        let payload = file_message_payload(295438091, "caption", 987654, -1_700_000_000_003);
+
+        assert_eq!(payload["chatId"], 295438091);
+        assert_eq!(payload["message"]["text"], "caption");
+        assert_eq!(payload["message"]["cid"], -1_700_000_000_003i64);
+        assert_eq!(payload["message"]["type"], "USER");
+        assert_eq!(payload["message"]["elements"], json!([]));
+        assert_eq!(
+            payload["message"]["attaches"],
+            json!([{ "type": "FILE", "fileId": 987654 }])
+        );
+        assert_eq!(payload["notify"], true);
+    }
+
+    #[test]
+    fn empty_buffer_file_name_falls_back_to_file() {
+        assert_eq!(normalized_file_name(String::new()), "file");
+        assert_eq!(normalized_file_name("report.txt".to_string()), "report.txt");
     }
 }

@@ -20,10 +20,6 @@ pub enum Error {
     #[error("server error (opcode {opcode}): {message}")]
     Server { opcode: u16, message: String },
 
-    /// SMS authentication requires completing a captcha challenge in a browser.
-    #[error("captcha required before requesting SMS code: {link}")]
-    CaptchaRequired { link: String },
-
     /// Captcha solving was requested, but no solver service URL is configured.
     #[error("captcha solver is not configured; set MAX_SOLVER_URL to a running max_captcha_solver service or disable captcha solving explicitly")]
     CaptchaSolverDisabled,
