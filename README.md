@@ -12,7 +12,7 @@ without notice.
 
 - WebSocket login and automatic reconnects
 - SMS authentication and saved session-token login
-- Auth captcha preflight and optional `max_captcha_solver` integration
+- Captcha-free SMS auth by default, with optional `max_captcha_solver` fallback
 - Incoming message channel
 - Text messages, file messages, typing notifications, and keepalive pings
 
@@ -43,7 +43,8 @@ The example CLI loads `.env` before reading the process environment. Copy
   `MAX_OPERATOR_CHANNEL=telegram`.
 - `MAX_TELEGRAM_POLL_TIMEOUT_SECS`: Telegram SMS reply timeout. Default: `300`.
 - `MAX_SOLVER_URL`: captcha solver API URL. Default: `http://127.0.0.1:3000`.
-  Empty disables the solver.
+  Empty disables the solver. Only used if Max rejects the captcha-free SMS
+  request and requires a captcha retry.
 - `MAX_CALLBACK_BIND`: captcha callback bind address. Default: `127.0.0.1:3002`.
 - `MAX_CALLBACK_URL_BASE`: public callback base for the solver. May contain
   `{port}`.
@@ -51,8 +52,10 @@ The example CLI loads `.env` before reading the process environment. Copy
 
 ## Captcha Solver
 
-Max may require captcha before SMS auth. For a local solver running on the host,
-the defaults are enough:
+SMS auth is attempted without captcha first, matching PyMax's current flow. Max
+may still require captcha for some accounts or requests; in that case `maxrs`
+falls back to the optional solver. For a local solver running on the host, the
+defaults are enough:
 
 ```env
 MAX_SOLVER_URL=
@@ -82,7 +85,8 @@ cargo run --example cli
 ```
 
 The CLI logs in to Max and listens for incoming messages until Ctrl-C.
-Reconnects reuse the stored login flow, so expired saved tokens can fall back to captcha/SMS/password auth.
+Reconnects reuse the stored login flow, so expired saved tokens can fall back to
+SMS/password auth and captcha only if Max rejects the initial SMS request.
 
 ## Protocol Notes
 

@@ -143,14 +143,24 @@ impl InnerClient {
     }
 
     async fn request_sms_code(&self, phone: &str, config: &AuthCaptchaConfig) -> Result<String> {
+        let retry_err = match self.request_sms_code_with_captcha_token(phone, None).await {
+            Ok(token) => return Ok(token),
+            Err(err) if should_retry_sms_with_captcha(&err) => err,
+            Err(err) => return Err(err),
+        };
+        tracing::info!(%retry_err, "Max rejected SMS auth request; retrying with captcha");
         let captcha_token = self.solve_auth_captcha(phone, config).await?;
+        self.request_sms_code_with_captcha_token(phone, Some(&captcha_token))
+            .await
+    }
+
+    async fn request_sms_code_with_captcha_token(
+        &self,
+        phone: &str,
+        captcha_token: Option<&str>,
+    ) -> Result<String> {
         self.session_init().await?;
-        let payload = json!({
-            "phone": phone,
-            "type": "START_AUTH",
-            "language": "ru",
-            "captchaToken": captcha_token,
-        });
+        let payload = sms_auth_request_payload(phone, captcha_token);
         let response = self.invoke(opcode::AUTH_REQUEST, payload).await?;
         response.payload["token"]
             .as_str()
@@ -159,7 +169,15 @@ impl InnerClient {
     }
 
     async fn solve_auth_captcha(&self, phone: &str, config: &AuthCaptchaConfig) -> Result<String> {
-        let captcha_link = self.request_auth_captcha(phone).await?;
+        self.session_init().await?;
+
+        // request captcha link from the server, which will be solved by the captcha solver
+        let payload = json!({
+            "source": "auth",
+            "identifier": phone,
+        });
+        let response = self.invoke(opcode::AUTH_CAPTCHA_REQUEST, payload).await?;
+        let captcha_link = response.payload["link"].as_str().unwrap_or_default();
         if captcha_link.is_empty() {
             return Err(Error::UnexpectedResponse("missing captcha link".into()));
         }
@@ -176,20 +194,7 @@ impl InnerClient {
             callback_url,
         ))?);
         tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
-        solver.solve(&captcha_link).await
-    }
-
-    async fn request_auth_captcha(&self, phone: &str) -> Result<String> {
-        self.session_init().await?;
-        let payload = json!({
-            "source": "auth",
-            "identifier": phone,
-        });
-        let response = self.invoke(opcode::AUTH_CAPTCHA_REQUEST, payload).await?;
-        Ok(response.payload["link"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        solver.solve(captcha_link).await
     }
 
     async fn verify_sms_code(
@@ -274,6 +279,22 @@ fn should_fallback_to_sms_login(err: &Error) -> bool {
     matches!(err, Error::Server { opcode, .. } if *opcode == opcode::LOGIN)
 }
 
+fn should_retry_sms_with_captcha(err: &Error) -> bool {
+    matches!(err, Error::Server { opcode, .. } if *opcode == opcode::AUTH_REQUEST)
+}
+
+fn sms_auth_request_payload(phone: &str, captcha_token: Option<&str>) -> Value {
+    let mut payload = json!({
+        "phone": phone,
+        "type": "START_AUTH",
+        "language": "ru",
+    });
+    if let Some(captcha_token) = captcha_token {
+        payload["captchaToken"] = Value::String(captcha_token.to_string());
+    }
+    payload
+}
+
 fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
     payload["tokenAttrs"]["LOGIN"]["token"]
         .as_str()
@@ -337,6 +358,49 @@ mod tests {
         assert!(!should_fallback_to_sms_login(&Error::Timeout(
             opcode::LOGIN
         )));
+    }
+
+    #[test]
+    fn captcha_retry_only_handles_sms_auth_request_server_errors() {
+        assert!(should_retry_sms_with_captcha(&Error::Server {
+            opcode: opcode::AUTH_REQUEST,
+            message: "captcha required".into(),
+        }));
+        assert!(!should_retry_sms_with_captcha(&Error::Server {
+            opcode: opcode::AUTH,
+            message: "invalid code".into(),
+        }));
+        assert!(!should_retry_sms_with_captcha(&Error::Timeout(
+            opcode::AUTH_REQUEST
+        )));
+    }
+
+    #[test]
+    fn sms_auth_request_payload_omits_captcha_by_default() {
+        let payload = sms_auth_request_payload("+79990000000", None);
+
+        assert_eq!(
+            payload,
+            json!({
+                "phone": "+79990000000",
+                "type": "START_AUTH",
+                "language": "ru",
+            })
+        );
+        assert!(payload.get("captchaToken").is_none());
+    }
+
+    #[test]
+    fn sms_auth_request_payload_includes_captcha_on_retry() {
+        assert_eq!(
+            sms_auth_request_payload("+79990000000", Some("captcha-token")),
+            json!({
+                "phone": "+79990000000",
+                "type": "START_AUTH",
+                "language": "ru",
+                "captchaToken": "captcha-token",
+            })
+        );
     }
 
     #[test]
