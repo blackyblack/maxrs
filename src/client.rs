@@ -18,7 +18,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::auth::{session_token_from_file, LoginConfig};
 use crate::error::{Error, Result};
-use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent, BROWSER_USER_AGENT};
+use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent};
 use crate::protocol::{opcode, Packet, CMD_ERROR};
 
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
@@ -37,7 +37,7 @@ pub(crate) struct InnerClient {
     sink: Mutex<WsSink>,
     pending: Mutex<HashMap<u32, oneshot::Sender<Packet>>>,
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
-    login_config: Mutex<Option<LoginConfig>>,
+    login_config: Mutex<LoginConfig>,
     msg_tx: mpsc::UnboundedSender<IncomingMessage>,
     reconnect_tx: mpsc::UnboundedSender<()>,
     seq: AtomicU32,
@@ -166,23 +166,26 @@ pub struct MaxClient {
 }
 
 impl MaxClient {
-    /// Opens a WebSocket connection and starts the background read and
-    /// keepalive tasks.
+    /// Opens a WebSocket connection, logs in, and starts the background read,
+    /// keepalive, and reconnect tasks.
     ///
-    /// Returns the client together with a receiver of [`IncomingMessage`]s that
-    /// the server pushes (`NOTIF_MESSAGE`). Authenticate next with
-    /// [`MaxClient::login`].
-    pub async fn connect() -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
-        Self::connect_with(UserAgent::default()).await
+    /// Returns the client, a receiver of [`IncomingMessage`]s that the server
+    /// pushes (`NOTIF_MESSAGE`), and the authenticated [`Session`].
+    pub async fn connect(
+        config: LoginConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>, Session)> {
+        Self::connect_with_user_agent(config, UserAgent::default()).await
     }
 
     /// Like [`MaxClient::connect`] but with a custom [`UserAgent`].
-    pub async fn connect_with(
+    pub async fn connect_with_user_agent(
+        config: LoginConfig,
         user_agent: UserAgent,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
-        let (sink, read) = open_connection().await?;
+    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>, Session)> {
+        let header_user_agent = user_agent.header_user_agent.clone();
+        let (sink, read) = open_connection(&header_user_agent).await?;
         let http = reqwest::Client::builder()
-            .user_agent(BROWSER_USER_AGENT)
+            .user_agent(header_user_agent)
             .build()?;
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
@@ -191,7 +194,7 @@ impl MaxClient {
             sink: Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
             file_waiters: Mutex::new(HashMap::new()),
-            login_config: Mutex::new(None),
+            login_config: Mutex::new(config.clone()),
             msg_tx,
             reconnect_tx,
             seq: AtomicU32::new(1),
@@ -203,13 +206,24 @@ impl MaxClient {
             http,
         });
 
-        tokio::spawn(read_loop(read, Arc::clone(&inner)));
+        let read_task = tokio::spawn(read_loop(read, Arc::clone(&inner)));
 
         let client = MaxClient { inner };
+        let session = match client.inner.login(config.clone()).await {
+            Ok(session) => session,
+            Err(err) => {
+                read_task.abort();
+                return Err(err);
+            }
+        };
+        let mut reconnect_config = config;
+        reconnect_config.session_token = Some(session.token.clone());
+        *client.inner.login_config.lock().await = reconnect_config;
+
         client.spawn_keepalive();
         client.spawn_reconnect_loop(reconnect_rx);
 
-        Ok((client, msg_rx))
+        Ok((client, msg_rx, session))
     }
 
     fn spawn_keepalive(&self) {
@@ -235,13 +249,6 @@ impl MaxClient {
                 reconnect_inner(Arc::clone(&inner)).await;
             }
         });
-    }
-
-    /// Logs in using a saved session token when valid, otherwise starts the SMS auth flow.
-    pub async fn login(&self, config: LoginConfig) -> Result<Session> {
-        let session = self.inner.login(config.clone()).await?;
-        *self.inner.login_config.lock().await = Some(config);
-        Ok(session)
     }
 
     /// Sends a text message to `chat_id`.
@@ -373,12 +380,12 @@ impl MaxClient {
     }
 }
 
-async fn open_connection() -> Result<(WsSink, SplitStream<WsStream>)> {
+async fn open_connection(header_user_agent: &str) -> Result<(WsSink, SplitStream<WsStream>)> {
     let mut request = WS_URL.into_client_request()?;
     {
         let headers = request.headers_mut();
         headers.insert("Origin", HeaderValue::from_static(ORIGIN));
-        headers.insert("User-Agent", HeaderValue::from_static(BROWSER_USER_AGENT));
+        headers.insert("User-Agent", HeaderValue::from_str(header_user_agent)?);
     }
 
     let (stream, _response) = connect_async(request).await?;
@@ -386,13 +393,7 @@ async fn open_connection() -> Result<(WsSink, SplitStream<WsStream>)> {
 }
 
 async fn reconnect_inner(inner: Arc<InnerClient>) {
-    let mut config = match inner.login_config.lock().await.clone() {
-        Some(config) => config,
-        None => {
-            inner.reconnecting.store(false, Ordering::Release);
-            return;
-        }
-    };
+    let mut config = inner.login_config.lock().await.clone();
 
     loop {
         tracing::warn!(
@@ -403,7 +404,8 @@ async fn reconnect_inner(inner: Arc<InnerClient>) {
 
         config.session_token = session_token_from_file();
 
-        match open_connection().await {
+        let header_user_agent = inner.user_agent.header_user_agent.clone();
+        match open_connection(&header_user_agent).await {
             Ok((sink, read)) => {
                 {
                     let mut current_sink = inner.sink.lock().await;
@@ -416,7 +418,7 @@ async fn reconnect_inner(inner: Arc<InnerClient>) {
                 match inner.login(config.clone()).await {
                     Ok(session) => {
                         config.session_token = Some(session.token);
-                        *inner.login_config.lock().await = Some(config);
+                        *inner.login_config.lock().await = config;
                         inner.reconnecting.store(false, Ordering::Release);
                         tracing::info!("Max reconnection completed");
                         break;

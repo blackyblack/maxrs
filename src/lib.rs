@@ -9,7 +9,7 @@
 //! use maxrs::models::MaxMessage;
 //!
 //! # async fn run() -> maxrs::error::Result<()> {
-//! let (client, mut messages) = MaxClient::connect().await?;
+//! let (client, mut messages, session) = MaxClient::connect(LoginConfig::from_env()?).await?;
 //!
 //! tokio::spawn(async move {
 //!     while let Some(msg) = messages.recv().await {
@@ -17,7 +17,6 @@
 //!     }
 //! });
 //!
-//! let session = client.login(LoginConfig::from_env()?).await?;
 //! client.send_text(123, MaxMessage::new("Hello from Rust!")).await?;
 //! # let _ = session;
 //! # Ok(())
