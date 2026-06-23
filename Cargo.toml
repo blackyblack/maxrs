@@ -28,7 +28,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[example]]
 name = "cli"
 path = "examples/cli.rs"
-
-[profile.dev]
-debug = "full"
-opt-level = 0

@@ -76,8 +76,7 @@ the server does not drop the connection.
    ```
 
    Response payload contains a short-lived `token` (the "SMS token").
-   PyMax's current SMS flow sends the same request without `captchaToken`;
-   `maxrs` does the same first and retries with captcha only if AUTH_REQUEST is
+   `maxrs` sends request without `captchaToken` first and retries with captcha only if AUTH_REQUEST is
    rejected.
 
 3. **AUTH (18)** — verifies the code.

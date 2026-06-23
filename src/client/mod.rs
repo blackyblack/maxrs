@@ -204,7 +204,7 @@ impl MaxClient {
     /// Sends a text message to `chat_id`.
     pub async fn send_text(&self, chat_id: i64, message: MaxMessage) -> Result<()> {
         let payload = text_message_payload(chat_id, &message, self.inner.next_cid().await);
-        self.invoke_or_disconnect(opcode::MSG_SEND, payload).await?;
+        self.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
     }
 
@@ -214,8 +214,7 @@ impl MaxClient {
             "chatId": chat_id,
             "type": "TEXT",
         });
-        self.invoke_or_disconnect(opcode::MSG_TYPING, payload)
-            .await?;
+        self.invoke(opcode::MSG_TYPING, payload).await?;
         Ok(())
     }
 
@@ -271,7 +270,7 @@ impl MaxClient {
     ) -> Result<()> {
         let file_name = normalized_file_name(file_name);
         let response = self
-            .invoke_or_disconnect(opcode::FILE_UPLOAD, json!({ "count": 1 }))
+            .invoke(opcode::FILE_UPLOAD, json!({ "count": 1 }))
             .await?;
         let info = response.payload["info"]
             .get(0)
@@ -316,19 +315,19 @@ impl MaxClient {
         self.inner.file_waiters.lock().await.remove(&file_id);
 
         let payload = file_message_payload(chat_id, caption, file_id, self.inner.next_cid().await);
-        self.invoke_or_disconnect(opcode::MSG_SEND, payload).await?;
+        self.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
     }
 
     /// Sends a single keepalive ping. Mostly useful for tests; the background
     /// task pings automatically.
     pub async fn ping(&self) -> Result<()> {
-        self.invoke_or_disconnect(opcode::PING, json!({ "interactive": false }))
+        self.invoke(opcode::PING, json!({ "interactive": false }))
             .await?;
         Ok(())
     }
 
-    async fn invoke_or_disconnect(&self, opcode: u16, payload: Value) -> Result<Packet> {
+    async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
         match self.inner.invoke(opcode, payload).await {
             Ok(response) => Ok(response),
             Err(err) => {

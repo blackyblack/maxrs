@@ -52,8 +52,8 @@ The example CLI loads `.env` before reading the process environment. Copy
 
 ## Captcha Solver
 
-SMS auth is attempted without captcha first, matching PyMax's current flow. Max
-may still require captcha for some accounts or requests; in that case `maxrs`
+SMS auth is attempted without captcha first.
+Max may still require captcha for some accounts or requests; in that case `maxrs`
 falls back to the optional solver. For a local solver running on the host, the
 defaults are enough:
 
@@ -84,12 +84,7 @@ Run the CLI example after configuring the needed environment variables:
 cargo run --example cli
 ```
 
-The CLI logs in to Max and listens for incoming messages until Ctrl-C. The
-client does not retry failed requests automatically. A failed message send or
-keepalive closes the current WebSocket and leaves the client disconnected; call
-`client.connect().await` to open a new connection and run the stored login flow
-again. Expired saved tokens can still fall back to SMS/password auth and captcha
-only when Max rejects the initial login request.
+The CLI logs in to Max and listens for incoming messages until Ctrl-C.
 
 ## Protocol Notes
 
