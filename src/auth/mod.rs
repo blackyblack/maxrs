@@ -121,9 +121,24 @@ impl Default for AuthCaptchaConfig {
 }
 
 impl InnerClient {
-    pub(crate) async fn login(&self, config: LoginConfig) -> Result<Session> {
-        if let Some(token) = config.session_token.as_deref() {
-            match self.login_with_token(token).await {
+    pub(crate) async fn login(inner: Arc<Self>, config: LoginConfig) -> Result<Session> {
+        AuthFlow::new(inner, config).login().await
+    }
+}
+
+struct AuthFlow {
+    inner: Arc<InnerClient>,
+    config: LoginConfig,
+}
+
+impl AuthFlow {
+    fn new(inner: Arc<InnerClient>, config: LoginConfig) -> Self {
+        Self { inner, config }
+    }
+
+    async fn login(&self) -> Result<Session> {
+        if let Some(token) = self.config.session_token.as_deref() {
+            match self.perform_login(token).await {
                 Ok(session) => return Ok(session),
                 Err(err) if should_fallback_to_sms_login(&err) => {
                     tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
@@ -132,24 +147,24 @@ impl InnerClient {
             }
         }
 
-        let phone = config
+        let phone = self
+            .config
             .phone
             .as_deref()
             .ok_or_else(|| Error::UnexpectedResponse("missing phone for SMS login".into()))?;
-        let sms_token = self.request_sms_code(phone, &config.captcha).await?;
-        let code = config.operator.request_sms_code(phone).await?;
-        self.verify_sms_code(&sms_token, code.trim(), config.password.as_deref())
-            .await
+        let sms_token = self.request_sms_code(phone).await?;
+        let code = self.config.operator.request_sms_code(phone).await?;
+        self.verify_sms_code(&sms_token, code.trim()).await
     }
 
-    async fn request_sms_code(&self, phone: &str, config: &AuthCaptchaConfig) -> Result<String> {
+    async fn request_sms_code(&self, phone: &str) -> Result<String> {
         let retry_err = match self.request_sms_code_with_captcha_token(phone, None).await {
             Ok(token) => return Ok(token),
             Err(err) if should_retry_sms_with_captcha(&err) => err,
             Err(err) => return Err(err),
         };
         tracing::info!(%retry_err, "Max rejected SMS auth request; retrying with captcha");
-        let captcha_token = self.solve_auth_captcha(phone, config).await?;
+        let captcha_token = self.solve_auth_captcha(phone).await?;
         self.request_sms_code_with_captcha_token(phone, Some(&captcha_token))
             .await
     }
@@ -159,36 +174,39 @@ impl InnerClient {
         phone: &str,
         captcha_token: Option<&str>,
     ) -> Result<String> {
-        self.session_init().await?;
         let payload = sms_auth_request_payload(phone, captcha_token);
-        let response = self.invoke(opcode::AUTH_REQUEST, payload).await?;
+        let response = self.inner.invoke(opcode::AUTH_REQUEST, payload).await?;
         response.payload["token"]
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| Error::UnexpectedResponse("missing auth token".into()))
     }
 
-    async fn solve_auth_captcha(&self, phone: &str, config: &AuthCaptchaConfig) -> Result<String> {
-        self.session_init().await?;
-
+    async fn solve_auth_captcha(&self, phone: &str) -> Result<String> {
         // request captcha link from the server, which will be solved by the captcha solver
         let payload = json!({
             "source": "auth",
             "identifier": phone,
         });
-        let response = self.invoke(opcode::AUTH_CAPTCHA_REQUEST, payload).await?;
+        let response = self
+            .inner
+            .invoke(opcode::AUTH_CAPTCHA_REQUEST, payload)
+            .await?;
         let captcha_link = response.payload["link"].as_str().unwrap_or_default();
         if captcha_link.is_empty() {
             return Err(Error::UnexpectedResponse("missing captcha link".into()));
         }
 
-        let solver_url = config
+        let solver_url = self
+            .config
+            .captcha
             .solver_url
             .as_ref()
             .ok_or(Error::CaptchaSolverDisabled)?;
-        let server = HttpServer::bind(HttpServerConfig::new(&config.callback_bind)).await?;
+        let server =
+            HttpServer::bind(HttpServerConfig::new(&self.config.captcha.callback_bind)).await?;
         let callback_addr = server.local_addr()?;
-        let callback_url = config.callback_url(callback_addr);
+        let callback_url = self.config.captcha.callback_url(callback_addr);
         let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
             solver_url.clone(),
             callback_url,
@@ -197,20 +215,19 @@ impl InnerClient {
         solver.solve(captcha_link).await
     }
 
-    async fn verify_sms_code(
-        &self,
-        sms_token: &str,
-        code: &str,
-        password: Option<&str>,
-    ) -> Result<Session> {
+    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
         let payload = json!({
             "token": sms_token,
             "verifyCode": code,
             "authTokenType": "CHECK_CODE",
         });
-        let response = self.invoke(opcode::AUTH, payload).await?;
+        let response = self.inner.invoke(opcode::AUTH, payload).await?;
         if response.payload["passwordChallenge"].is_object() {
-            let password = password.ok_or(Error::PasswordRequired)?;
+            let password = self
+                .config
+                .password
+                .as_deref()
+                .ok_or(Error::PasswordRequired)?;
             return self
                 .verify_password_challenge(&response.payload["passwordChallenge"], password)
                 .await;
@@ -228,6 +245,7 @@ impl InnerClient {
             Error::UnexpectedResponse("missing password challenge trackId".into())
         })?;
         let response = self
+            .inner
             .invoke(
                 opcode::AUTH_PASSWORD,
                 json!({
@@ -242,16 +260,11 @@ impl InnerClient {
 
     async fn login_with_auth_payload(&self, payload: &Value) -> Result<Session> {
         let token = login_token_from_auth_payload(payload)?;
-        let session = self.login_with_token(&token).await?;
+        let session = self.perform_login(&token).await?;
         if let Err(err) = store_session_token_file(&session.token).await {
             tracing::warn!(%err, path = %session_token_path().display(), "failed to store Max session token; continuing with in-memory session");
         }
         Ok(session)
-    }
-
-    async fn login_with_token(&self, token: &str) -> Result<Session> {
-        self.session_init().await?;
-        self.perform_login(token).await
     }
 
     async fn perform_login(&self, token: &str) -> Result<Session> {
@@ -264,9 +277,9 @@ impl InnerClient {
             "draftsSync": 0,
             "chatsCount": 40,
         });
-        let response = self.invoke(opcode::LOGIN, payload).await?;
+        let response = self.inner.invoke(opcode::LOGIN, payload).await?;
         if let Some(user_id) = own_user_id_from_login_payload(&response.payload) {
-            self.set_own_user_id(user_id);
+            self.inner.set_own_user_id(user_id).await;
         }
         Ok(Session {
             token: token.to_string(),

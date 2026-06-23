@@ -2,27 +2,27 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "cppvsdbg",
+            "type": "lldb",
             "request": "launch",
             "name": "Debug maxrs CLI",
-            "program": "${workspaceFolder}/target/debug/examples/cli.exe",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--example",
+                    "cli"
+                ],
+                "filter": {
+                    "name": "cli",
+                    "kind": "example"
+                }
+            },
             "args": [],
             "cwd": "${workspaceFolder}",
-            "preLaunchTask": "cargo build --example cli",
-            "environment": [
-                {
-                    "name": "RUST_BACKTRACE",
-                    "value": "1"
-                },
-                {
-                    "name": "MAX_CALLBACK_BIND",
-                    "value": "0.0.0.0:3002"
-                },
-                {
-                    "name": "MAX_CALLBACK_URL_BASE",
-                    "value": "http://host.docker.internal:3002"
-                }
-            ],
+            "env": {
+                "RUST_BACKTRACE": "1",
+                "MAX_CALLBACK_BIND": "0.0.0.0:3002",
+                "MAX_CALLBACK_URL_BASE": "http://host.docker.internal:3002"
+            },
             "console": "integratedTerminal"
         }
     ]

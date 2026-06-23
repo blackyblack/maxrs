@@ -9,7 +9,8 @@
 //! use maxrs::models::MaxMessage;
 //!
 //! # async fn run() -> maxrs::error::Result<()> {
-//! let (client, mut messages, session) = MaxClient::connect(LoginConfig::from_env()?).await?;
+//! let (client, mut messages) = MaxClient::new(LoginConfig::from_env()?)?;
+//! let session = client.connect().await?;
 //!
 //! tokio::spawn(async move {
 //!     while let Some(msg) = messages.recv().await {

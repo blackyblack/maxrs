@@ -1,3 +1,7 @@
 {
-    "rust-analyzer.debug.engine": "ms-vscode.cpptools"
+    "rust-analyzer.debug.engine": "vadimcn.vscode-lldb",
+    "lldb.evaluateForHovers": false,
+    "lldb.commandCompletions": false,
+    "lldb.dereferencePointers": false,
+    "lldb.launch.expressions": "native"
 }

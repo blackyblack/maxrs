@@ -3,14 +3,14 @@
 `maxrs` is an unofficial asynchronous Rust client for the Max messenger.
 
 It supports SMS/session-token login, incoming messages, typing notifications,
-text messages, file upload, automatic reconnects, and optional captcha solving.
+text messages, file upload, explicit reconnects, and optional captcha solving.
 
 This project is not affiliated with Max or VK. The internal API can change
 without notice.
 
 ## Features
 
-- WebSocket login and automatic reconnects
+- WebSocket login and explicit reconnects through `MaxClient::connect`
 - SMS authentication and saved session-token login
 - Captcha-free SMS auth by default, with optional `max_captcha_solver` fallback
 - Incoming message channel
@@ -84,9 +84,12 @@ Run the CLI example after configuring the needed environment variables:
 cargo run --example cli
 ```
 
-The CLI logs in to Max and listens for incoming messages until Ctrl-C.
-Reconnects reuse the stored login flow, so expired saved tokens can fall back to
-SMS/password auth and captcha only if Max rejects the initial SMS request.
+The CLI logs in to Max and listens for incoming messages until Ctrl-C. The
+client does not retry failed requests automatically. A failed message send or
+keepalive closes the current WebSocket and leaves the client disconnected; call
+`client.connect().await` to open a new connection and run the stored login flow
+again. Expired saved tokens can still fall back to SMS/password auth and captcha
+only when Max rejects the initial login request.
 
 ## Protocol Notes
 
