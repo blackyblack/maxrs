@@ -97,15 +97,33 @@ impl MaxMessage {
     }
 }
 
-/// Formatting elements supported by Max text messages.
+/// A formatter annotation over a `[from, from + length)` span of `text`.
+///
+/// `LINK` carries its target as `attributes.url`; other kinds have no
+/// attributes. `from`/`length` units (Unicode scalars vs UTF-16 code units) are
+/// caller-defined and unverified against the server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageElement {
     #[serde(rename = "type")]
     pub kind: MessageElementKind,
+    #[serde(default)]
     pub from: usize,
     pub length: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "ElementAttributes::is_empty")]
+    pub attributes: ElementAttributes,
+}
+
+/// Type-specific attributes of a [`MessageElement`]; skipped when empty.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElementAttributes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+impl ElementAttributes {
+    fn is_empty(&self) -> bool {
+        self.url.is_none()
+    }
 }
 
 impl MessageElement {
@@ -139,7 +157,9 @@ impl MessageElement {
             kind: MessageElementKind::Link,
             from,
             length,
-            url: Some(url.into()),
+            attributes: ElementAttributes {
+                url: Some(url.into()),
+            },
         }
     }
 
@@ -148,8 +168,12 @@ impl MessageElement {
             kind,
             from,
             length,
-            url: None,
+            attributes: ElementAttributes::default(),
         }
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.attributes.url.as_deref()
     }
 }
 

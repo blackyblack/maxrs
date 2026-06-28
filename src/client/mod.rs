@@ -331,7 +331,11 @@ impl MaxClient {
         match self.inner.invoke(opcode, payload).await {
             Ok(response) => Ok(response),
             Err(err) => {
-                self.inner.disconnect().await;
+                // A server rejection doesn't mean the socket is dead; keep it
+                // open and only disconnect on transport failures.
+                if !matches!(&err, Error::Server { .. }) {
+                    self.inner.disconnect().await;
+                }
                 Err(err)
             }
         }
@@ -429,10 +433,41 @@ mod tests {
                     "type": "LINK",
                     "from": 6,
                     "length": 4,
-                    "url": "https://example.test"
+                    "attributes": { "url": "https://example.test" }
                 }
             ])
         );
+    }
+
+    #[test]
+    fn link_element_nests_url_under_attributes() {
+        let element = crate::models::MessageElement::link(6, 4, "https://example.test");
+        let value = serde_json::to_value(&element).unwrap();
+
+        assert_eq!(value["type"], "LINK");
+        assert_eq!(value["attributes"]["url"], "https://example.test");
+        assert!(
+            value.get("url").is_none(),
+            "url must not be serialized at the top level"
+        );
+    }
+
+    #[test]
+    fn formatting_element_omits_attributes() {
+        let value = serde_json::to_value(crate::models::MessageElement::strong(0, 5)).unwrap();
+
+        assert_eq!(value, json!({ "type": "STRONG", "from": 0, "length": 5 }));
+        assert!(value.get("attributes").is_none());
+    }
+
+    #[test]
+    fn link_element_round_trips_through_attributes() {
+        let element = crate::models::MessageElement::link(1, 2, "https://round.trip");
+        let json = serde_json::to_string(&element).unwrap();
+        let parsed: crate::models::MessageElement = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, element);
+        assert_eq!(parsed.url(), Some("https://round.trip"));
     }
 
     #[test]
