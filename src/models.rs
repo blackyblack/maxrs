@@ -98,6 +98,29 @@ impl MaxMessage {
 }
 
 /// Formatting elements supported by Max text messages.
+///
+// TODO(max-protocol): the on-wire schema for a `LINK` element nests its target
+// under an `attributes` object, not a top-level `url` field. The reverse-
+// engineered web-protocol reference documents the shape as:
+//
+//   { "type": "LINK", "from": 258, "length": 50,
+//     "attributes": { "url": "https://example.com/page" } }
+//
+// (see pr0bel1230/max-api-docs `protocol/elements.md`). This struct instead
+// serializes `url` at the top level (`{ "type": "LINK", ..., "url": ... }`),
+// which the server appears to reject — sending a message that contains any LINK
+// element fails MSG_SEND (opcode 64) with a server error frame. Fixing this
+// means emitting `attributes: { "url": ... }` for LINK (and likely an empty/
+// absent `attributes` for the formatting kinds that take no parameters). Do NOT
+// fix yet — confirm the exact accepted shape with the element probe example
+// (`examples/element_probe.rs`) against a real chat first.
+//
+// TODO(max-protocol): confirm the units of `from`/`length`. The web-protocol
+// reference describes them as offsets/lengths "в символах" (in characters),
+// which may mean Unicode scalar values rather than the UTF-16 code units the
+// callers (and Telegram) use. For BMP text (ASCII/Cyrillic) the two agree, but
+// they diverge for astral characters (emoji), so a message mixing emoji with
+// formatting spans may be mis-annotated. Verify with the probe before changing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageElement {
     #[serde(rename = "type")]

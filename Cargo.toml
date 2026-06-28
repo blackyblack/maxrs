@@ -28,3 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[example]]
 name = "cli"
 path = "examples/cli.rs"
+
+[[example]]
+name = "element_probe"
+path = "examples/element_probe.rs"

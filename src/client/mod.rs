@@ -331,6 +331,16 @@ impl MaxClient {
         match self.inner.invoke(opcode, payload).await {
             Ok(response) => Ok(response),
             Err(err) => {
+                // TODO(max-protocol): this disconnects the whole client on ANY
+                // error, including an application-level `Error::Server` rejection
+                // of a single request (e.g. a malformed MSG_SEND, opcode 64).
+                // A rejected message is not a dead connection, yet tearing the
+                // socket down here makes one bad message kill the session: the
+                // background read loop ends and the bot stops responding to all
+                // further commands. Transport failures (`ConnectionClosed`,
+                // `Timeout`, websocket errors) should disconnect; `Error::Server`
+                // should be surfaced to the caller while keeping the connection
+                // alive. Do NOT change yet — left as a TODO per investigation.
                 self.inner.disconnect().await;
                 Err(err)
             }
