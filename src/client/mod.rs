@@ -331,17 +331,16 @@ impl MaxClient {
         match self.inner.invoke(opcode, payload).await {
             Ok(response) => Ok(response),
             Err(err) => {
-                // TODO(max-protocol): this disconnects the whole client on ANY
-                // error, including an application-level `Error::Server` rejection
-                // of a single request (e.g. a malformed MSG_SEND, opcode 64).
-                // A rejected message is not a dead connection, yet tearing the
-                // socket down here makes one bad message kill the session: the
-                // background read loop ends and the bot stops responding to all
-                // further commands. Transport failures (`ConnectionClosed`,
-                // `Timeout`, websocket errors) should disconnect; `Error::Server`
-                // should be surfaced to the caller while keeping the connection
-                // alive. Do NOT change yet — left as a TODO per investigation.
-                self.inner.disconnect().await;
+                // A server-level rejection (`cmd == 3`) of a single request does
+                // not mean the socket is dead — e.g. the server refusing a
+                // malformed MSG_SEND (opcode 64). Surface it to the caller but
+                // keep the connection alive so one bad message doesn't end the
+                // session and stop the bot from handling further commands. Only
+                // transport failures (connection closed, timeout, websocket/io
+                // errors) tear the connection down.
+                if !matches!(err, Error::Server { .. }) {
+                    self.inner.disconnect().await;
+                }
                 Err(err)
             }
         }
@@ -439,10 +438,41 @@ mod tests {
                     "type": "LINK",
                     "from": 6,
                     "length": 4,
-                    "url": "https://example.test"
+                    "attributes": { "url": "https://example.test" }
                 }
             ])
         );
+    }
+
+    #[test]
+    fn link_element_nests_url_under_attributes() {
+        let element = crate::models::MessageElement::link(6, 4, "https://example.test");
+        let value = serde_json::to_value(&element).unwrap();
+
+        assert_eq!(value["type"], "LINK");
+        assert_eq!(value["attributes"]["url"], "https://example.test");
+        assert!(
+            value.get("url").is_none(),
+            "url must not be serialized at the top level"
+        );
+    }
+
+    #[test]
+    fn formatting_element_omits_attributes() {
+        let value = serde_json::to_value(crate::models::MessageElement::strong(0, 5)).unwrap();
+
+        assert_eq!(value, json!({ "type": "STRONG", "from": 0, "length": 5 }));
+        assert!(value.get("attributes").is_none());
+    }
+
+    #[test]
+    fn link_element_round_trips_through_attributes() {
+        let element = crate::models::MessageElement::link(1, 2, "https://round.trip");
+        let json = serde_json::to_string(&element).unwrap();
+        let parsed: crate::models::MessageElement = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, element);
+        assert_eq!(parsed.url(), Some("https://round.trip"));
     }
 
     #[test]

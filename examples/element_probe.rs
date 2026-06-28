@@ -2,15 +2,17 @@
 //!
 //! The bot built on top of `maxrs` sends a plain-text welcome fine, but a
 //! search-results message — which carries formatter `elements` (bold spans and
-//! links) — is rejected by the server with an `Error::Server { opcode: 64 }`.
-//! Because we cannot test against a live account from CI, this example sends a
-//! battery of messages that isolate each element kind so you can see, against a
-//! real chat, exactly which payload shapes the server accepts and which it
-//! rejects.
+//! links) — was rejected by the server. This example sends a battery of
+//! messages that isolate each element kind so you can see, against a real chat,
+//! exactly which payload shapes the server accepts and which it rejects.
 //!
 //! Run with:
 //!
 //! ```text
+//! # list your chats (so you can pick a chat id), then exit:
+//! cargo run --example element_probe
+//!
+//! # send the probes to a chat:
 //! MAX_PROBE_CHAT_ID=<chat id> cargo run --example element_probe
 //! ```
 //!
@@ -18,13 +20,7 @@
 //! - `.max_session_token`: optional saved session token file.
 //! - `MAX_PHONE` / `MAX_PASSWORD` / `MAX_OPERATOR_CHANNEL`: login fallbacks.
 //! - `MAX_PROBE_CHAT_ID`: numeric id of an existing chat to send the probes to.
-//!   You can grab it by logging incoming messages with the `cli` example.
-//!
-//! Each probe is sent on a freshly (re)connected client. This is deliberate:
-//! `MaxClient::invoke` currently disconnects the whole client on any error
-//! (see the TODO in `src/client/mod.rs`), so without reconnecting, the first
-//! rejected probe would make every later probe fail with `ConnectionClosed`
-//! and hide the real per-element result.
+//!   When unset, the example just prints the chats from your login payload.
 
 use std::time::Duration;
 
@@ -50,19 +46,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let chat_id: i64 = std::env::var("MAX_PROBE_CHAT_ID")
-        .map_err(|_| "set MAX_PROBE_CHAT_ID to the numeric id of a chat to probe")?
-        .trim()
-        .parse()
-        .map_err(|_| "MAX_PROBE_CHAT_ID must be a number")?;
-
-    // Each probe is a labelled message. Ordering goes from the simplest payload
-    // (plain text, known-good) to the ones suspected of triggering opcode 64.
-    let probes: Vec<(&str, MaxMessage)> = vec![
-        (
-            "plain text (control, expected OK)",
-            MaxMessage::new("probe: plain text"),
+    let probe_chat_id: Option<i64> = match std::env::var("MAX_PROBE_CHAT_ID") {
+        Ok(value) => Some(
+            value
+                .trim()
+                .parse()
+                .map_err(|_| "MAX_PROBE_CHAT_ID must be a number")?,
         ),
+        Err(_) => None,
+    };
+
+    let config = LoginConfig::from_env()?;
+    let (client, _messages) = MaxClient::new(config)?;
+    let session = client.connect().await?;
+
+    // Show the chats from the login payload so a chat id is easy to find.
+    let chats = session.chats();
+    if chats.is_empty() {
+        println!("No chats found in the login payload.");
+    } else {
+        println!("Available chats ({}):", chats.len());
+        for chat in &chats {
+            let title = if chat.title.is_empty() {
+                "(no title)"
+            } else {
+                chat.title.as_str()
+            };
+            println!("  {:>16}  [{}] {}", chat.id, chat.chat_type, title);
+        }
+    }
+
+    let Some(chat_id) = probe_chat_id else {
+        println!("\nSet MAX_PROBE_CHAT_ID=<chat id> to send the formatting probes to a chat.");
+        return Ok(());
+    };
+
+    // Each probe is a labelled message, ordered from the simplest payload
+    // (plain text) to the shapes that were suspected of triggering opcode 64.
+    let probes: Vec<(&str, MaxMessage)> = vec![
+        ("plain text (control)", MaxMessage::new("probe: plain text")),
         (
             "STRONG span",
             MaxMessage::with_elements("probe: bold word", vec![MessageElement::strong(7, 4)]),
@@ -89,10 +111,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (
             "combined: STRONG + LINK (shape of a search result line)",
             MaxMessage::with_elements(
-                "1. Title\nDetails: /b_42",
+                "1. Title\nDetails: https://example.com/b/42",
                 vec![
                     MessageElement::strong(3, 5),
-                    MessageElement::link(18, 5, "/b_42"),
+                    MessageElement::link(18, 24, "https://example.com/b/42"),
                 ],
             ),
         ),
@@ -102,29 +124,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
 
-    let config = LoginConfig::from_env()?;
-    let (client, _messages) = MaxClient::new(config)?;
-
+    // A server rejection no longer tears down the connection, so all probes run
+    // on the same session and each result is independent.
     for (label, message) in probes {
-        // Reconnect before every probe so a previous rejection (which currently
-        // tears down the connection) does not contaminate this result.
-        if let Err(err) = client.connect().await {
-            eprintln!("[SKIP ] {label}: could not (re)connect: {err}");
-            continue;
-        }
-
         match client.send_text(chat_id, message).await {
             Ok(()) => println!("[ OK  ] {label}"),
             Err(err) => println!("[FAIL ] {label}: {err}"),
         }
-
         // Be gentle with the server between probes.
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 
     println!(
         "\nDone. Compare which probes the server accepted vs rejected to pin \
-         down the element shape that causes the opcode-64 error."
+         down the element shape that causes any opcode-64 error."
     );
     Ok(())
 }

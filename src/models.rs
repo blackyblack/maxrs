@@ -71,6 +71,41 @@ pub struct Session {
     pub login_payload: serde_json::Value,
 }
 
+impl Session {
+    /// Chats returned in the `LOGIN` response (the same shape `GET_CHATS`
+    /// returns). Useful for discovering a `chatId` to send to.
+    pub fn chats(&self) -> Vec<Chat> {
+        self.login_payload["chats"]
+            .as_array()
+            .map(|chats| chats.iter().map(Chat::from_value).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// A chat as described by the server in `LOGIN`/`GET_CHATS` responses.
+///
+/// Only the fields useful for identifying a chat are modelled; the raw object
+/// carries more (last message, participants, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chat {
+    /// Chat id, used as `chatId` when sending messages.
+    pub id: i64,
+    /// `DIALOG`, `CHAT`, or `CHANNEL` (empty if absent).
+    pub chat_type: String,
+    /// Display title / interlocutor name (may be empty for some dialogs).
+    pub title: String,
+}
+
+impl Chat {
+    fn from_value(value: &serde_json::Value) -> Self {
+        Self {
+            id: value["id"].as_i64().unwrap_or_default(),
+            chat_type: value["type"].as_str().unwrap_or_default().to_string(),
+            title: value["title"].as_str().unwrap_or_default().to_string(),
+        }
+    }
+}
+
 /// Outgoing text message with optional Max formatter elements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaxMessage {
@@ -97,38 +132,53 @@ impl MaxMessage {
     }
 }
 
-/// Formatting elements supported by Max text messages.
+/// A single formatter annotation over a span of a message's `text`.
 ///
-// TODO(max-protocol): the on-wire schema for a `LINK` element nests its target
-// under an `attributes` object, not a top-level `url` field. The reverse-
-// engineered web-protocol reference documents the shape as:
-//
-//   { "type": "LINK", "from": 258, "length": 50,
-//     "attributes": { "url": "https://example.com/page" } }
-//
-// (see pr0bel1230/max-api-docs `protocol/elements.md`). This struct instead
-// serializes `url` at the top level (`{ "type": "LINK", ..., "url": ... }`),
-// which the server appears to reject — sending a message that contains any LINK
-// element fails MSG_SEND (opcode 64) with a server error frame. Fixing this
-// means emitting `attributes: { "url": ... }` for LINK (and likely an empty/
-// absent `attributes` for the formatting kinds that take no parameters). Do NOT
-// fix yet — confirm the exact accepted shape with the element probe example
-// (`examples/element_probe.rs`) against a real chat first.
-//
-// TODO(max-protocol): confirm the units of `from`/`length`. The web-protocol
-// reference describes them as offsets/lengths "в символах" (in characters),
-// which may mean Unicode scalar values rather than the UTF-16 code units the
-// callers (and Telegram) use. For BMP text (ASCII/Cyrillic) the two agree, but
-// they diverge for astral characters (emoji), so a message mixing emoji with
-// formatting spans may be mis-annotated. Verify with the probe before changing.
+/// On the wire each element is `{ "type", "from", "length", "attributes"? }`,
+/// where `attributes` is type-specific and omitted for kinds that take no
+/// parameters. A `LINK` carries its target there as `attributes.url`:
+///
+/// ```json
+/// { "type": "LINK", "from": 258, "length": 50,
+///   "attributes": { "url": "https://example.com/page" } }
+/// ```
+///
+/// (see pr0bel1230/max-api-docs `protocol/elements.md`).
+///
+/// `from`/`length` are span offsets into `text`. They are supplied by the
+/// caller; this type does not interpret them. The reverse-engineered reference
+/// describes them "в символах" (in characters); callers should confirm whether
+/// the server treats them as Unicode scalar values or UTF-16 code units (the two
+/// agree for BMP text but diverge for astral characters such as emoji).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageElement {
     #[serde(rename = "type")]
     pub kind: MessageElementKind,
+    /// Span start offset into `text`. May be absent on the wire (treated as 0).
+    #[serde(default)]
     pub from: usize,
     pub length: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Type-specific attributes (e.g. `url` for `LINK`); omitted when empty.
+    #[serde(default, skip_serializing_if = "ElementAttributes::is_empty")]
+    pub attributes: ElementAttributes,
+}
+
+/// Type-specific attributes carried by a [`MessageElement`].
+///
+/// Serializes to an `attributes` object and is omitted entirely when it holds
+/// no values, matching the kinds (STRONG, EMPHASIZED, ...) that take no
+/// parameters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElementAttributes {
+    /// Target URL for a `LINK` element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+impl ElementAttributes {
+    fn is_empty(&self) -> bool {
+        self.url.is_none()
+    }
 }
 
 impl MessageElement {
@@ -162,7 +212,9 @@ impl MessageElement {
             kind: MessageElementKind::Link,
             from,
             length,
-            url: Some(url.into()),
+            attributes: ElementAttributes {
+                url: Some(url.into()),
+            },
         }
     }
 
@@ -171,8 +223,13 @@ impl MessageElement {
             kind,
             from,
             length,
-            url: None,
+            attributes: ElementAttributes::default(),
         }
+    }
+
+    /// Target URL when this is a `LINK` element.
+    pub fn url(&self) -> Option<&str> {
+        self.attributes.url.as_deref()
     }
 }
 
@@ -189,4 +246,48 @@ pub enum MessageElementKind {
     Link,
     Heading,
     Quote,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn session_lists_chats_from_login_payload() {
+        let session = Session {
+            token: "t".into(),
+            login_payload: json!({
+                "chats": [
+                    { "id": 7268926, "type": "DIALOG", "title": "Alice" },
+                    { "id": -100, "type": "CHANNEL" },
+                ]
+            }),
+        };
+
+        assert_eq!(
+            session.chats(),
+            vec![
+                Chat {
+                    id: 7268926,
+                    chat_type: "DIALOG".into(),
+                    title: "Alice".into(),
+                },
+                Chat {
+                    id: -100,
+                    chat_type: "CHANNEL".into(),
+                    title: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_without_chats_is_empty() {
+        let session = Session {
+            token: "t".into(),
+            login_payload: json!({}),
+        };
+        assert!(session.chats().is_empty());
+    }
 }

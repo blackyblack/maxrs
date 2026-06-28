@@ -121,6 +121,30 @@ token (no SMS).
 `cid` is a client-generated negative id used to de-duplicate without colliding
 with server-assigned positive message ids.
 
+### Text formatter elements
+
+`message.elements` is an array of formatter annotations over `text`. Each entry
+is `{ "type", "from", "length", "attributes"? }`:
+
+- `from` — span start offset into `text` (may be omitted; treated as `0`).
+- `length` — span length.
+- `attributes` — type-specific object, omitted for kinds that take no parameters.
+
+Formatting kinds (`STRONG`, `EMPHASIZED`, `UNDERLINE`, `MONOSPACED`, ...) carry
+no `attributes`. A `LINK` carries its target under `attributes.url` (**not** a
+top-level `url`); sending the url at the top level is rejected:
+
+```json
+"elements": [
+  { "type": "STRONG", "from": 0, "length": 5 },
+  { "type": "LINK", "from": 6, "length": 4,
+    "attributes": { "url": "https://example.com" } }
+]
+```
+
+`elements` is not echoed back in the MSG_SEND response; it appears in history
+(GET_HISTORY) and in push notifications for new messages.
+
 ## Typing notification — MSG_TYPING (65)
 
 ```json
