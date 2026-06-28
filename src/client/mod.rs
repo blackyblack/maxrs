@@ -331,13 +331,8 @@ impl MaxClient {
         match self.inner.invoke(opcode, payload).await {
             Ok(response) => Ok(response),
             Err(err) => {
-                // A server-level rejection (`cmd == 3`) of a single request does
-                // not mean the socket is dead — e.g. the server refusing a
-                // malformed MSG_SEND (opcode 64). Surface it to the caller but
-                // keep the connection alive so one bad message doesn't end the
-                // session and stop the bot from handling further commands. Only
-                // transport failures (connection closed, timeout, websocket/io
-                // errors) tear the connection down.
+                // A server rejection doesn't mean the socket is dead; keep it
+                // open and only disconnect on transport failures.
                 if !matches!(err, Error::Server { .. }) {
                     self.inner.disconnect().await;
                 }

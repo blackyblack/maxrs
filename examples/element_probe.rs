@@ -60,7 +60,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (client, _messages) = MaxClient::new(config)?;
     let session = client.connect().await?;
 
-    // Show the chats from the login payload so a chat id is easy to find.
     let chats = session.chats();
     if chats.is_empty() {
         println!("No chats found in the login payload.");
@@ -81,8 +80,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    // Each probe is a labelled message, ordered from the simplest payload
-    // (plain text) to the shapes that were suspected of triggering opcode 64.
     let probes: Vec<(&str, MaxMessage)> = vec![
         ("plain text (control)", MaxMessage::new("probe: plain text")),
         (
@@ -124,14 +121,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ];
 
-    // A server rejection no longer tears down the connection, so all probes run
-    // on the same session and each result is independent.
     for (label, message) in probes {
         match client.send_text(chat_id, message).await {
             Ok(()) => println!("[ OK  ] {label}"),
             Err(err) => println!("[FAIL ] {label}: {err}"),
         }
-        // Be gentle with the server between probes.
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 

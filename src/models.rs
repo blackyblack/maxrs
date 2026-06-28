@@ -72,8 +72,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Chats returned in the `LOGIN` response (the same shape `GET_CHATS`
-    /// returns). Useful for discovering a `chatId` to send to.
+    /// Chats from the `LOGIN` payload, for discovering a `chatId` to send to.
     pub fn chats(&self) -> Vec<Chat> {
         self.login_payload["chats"]
             .as_array()
@@ -82,17 +81,12 @@ impl Session {
     }
 }
 
-/// A chat as described by the server in `LOGIN`/`GET_CHATS` responses.
-///
-/// Only the fields useful for identifying a chat are modelled; the raw object
-/// carries more (last message, participants, ...).
+/// Identifying fields of a chat from a `LOGIN`/`GET_CHATS` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chat {
-    /// Chat id, used as `chatId` when sending messages.
     pub id: i64,
-    /// `DIALOG`, `CHAT`, or `CHANNEL` (empty if absent).
+    /// `DIALOG`, `CHAT`, or `CHANNEL`.
     pub chat_type: String,
-    /// Display title / interlocutor name (may be empty for some dialogs).
     pub title: String,
 }
 
@@ -132,45 +126,25 @@ impl MaxMessage {
     }
 }
 
-/// A single formatter annotation over a span of a message's `text`.
+/// A formatter annotation over a `[from, from + length)` span of `text`.
 ///
-/// On the wire each element is `{ "type", "from", "length", "attributes"? }`,
-/// where `attributes` is type-specific and omitted for kinds that take no
-/// parameters. A `LINK` carries its target there as `attributes.url`:
-///
-/// ```json
-/// { "type": "LINK", "from": 258, "length": 50,
-///   "attributes": { "url": "https://example.com/page" } }
-/// ```
-///
-/// (see pr0bel1230/max-api-docs `protocol/elements.md`).
-///
-/// `from`/`length` are span offsets into `text`. They are supplied by the
-/// caller; this type does not interpret them. The reverse-engineered reference
-/// describes them "в символах" (in characters); callers should confirm whether
-/// the server treats them as Unicode scalar values or UTF-16 code units (the two
-/// agree for BMP text but diverge for astral characters such as emoji).
+/// `LINK` carries its target as `attributes.url`; other kinds have no
+/// attributes. `from`/`length` units (Unicode scalars vs UTF-16 code units) are
+/// caller-defined and unverified against the server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageElement {
     #[serde(rename = "type")]
     pub kind: MessageElementKind,
-    /// Span start offset into `text`. May be absent on the wire (treated as 0).
     #[serde(default)]
     pub from: usize,
     pub length: usize,
-    /// Type-specific attributes (e.g. `url` for `LINK`); omitted when empty.
     #[serde(default, skip_serializing_if = "ElementAttributes::is_empty")]
     pub attributes: ElementAttributes,
 }
 
-/// Type-specific attributes carried by a [`MessageElement`].
-///
-/// Serializes to an `attributes` object and is omitted entirely when it holds
-/// no values, matching the kinds (STRONG, EMPHASIZED, ...) that take no
-/// parameters.
+/// Type-specific attributes of a [`MessageElement`]; skipped when empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ElementAttributes {
-    /// Target URL for a `LINK` element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -227,7 +201,6 @@ impl MessageElement {
         }
     }
 
-    /// Target URL when this is a `LINK` element.
     pub fn url(&self) -> Option<&str> {
         self.attributes.url.as_deref()
     }
