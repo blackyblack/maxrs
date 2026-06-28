@@ -71,35 +71,6 @@ pub struct Session {
     pub login_payload: serde_json::Value,
 }
 
-impl Session {
-    /// Chats from the `LOGIN` payload, for discovering a `chatId` to send to.
-    pub fn chats(&self) -> Vec<Chat> {
-        self.login_payload["chats"]
-            .as_array()
-            .map(|chats| chats.iter().map(Chat::from_value).collect())
-            .unwrap_or_default()
-    }
-}
-
-/// Identifying fields of a chat from a `LOGIN`/`GET_CHATS` response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chat {
-    pub id: i64,
-    /// `DIALOG`, `CHAT`, or `CHANNEL`.
-    pub chat_type: String,
-    pub title: String,
-}
-
-impl Chat {
-    fn from_value(value: &serde_json::Value) -> Self {
-        Self {
-            id: value["id"].as_i64().unwrap_or_default(),
-            chat_type: value["type"].as_str().unwrap_or_default().to_string(),
-            title: value["title"].as_str().unwrap_or_default().to_string(),
-        }
-    }
-}
-
 /// Outgoing text message with optional Max formatter elements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaxMessage {
@@ -219,48 +190,4 @@ pub enum MessageElementKind {
     Link,
     Heading,
     Quote,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn session_lists_chats_from_login_payload() {
-        let session = Session {
-            token: "t".into(),
-            login_payload: json!({
-                "chats": [
-                    { "id": 7268926, "type": "DIALOG", "title": "Alice" },
-                    { "id": -100, "type": "CHANNEL" },
-                ]
-            }),
-        };
-
-        assert_eq!(
-            session.chats(),
-            vec![
-                Chat {
-                    id: 7268926,
-                    chat_type: "DIALOG".into(),
-                    title: "Alice".into(),
-                },
-                Chat {
-                    id: -100,
-                    chat_type: "CHANNEL".into(),
-                    title: String::new(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn session_without_chats_is_empty() {
-        let session = Session {
-            token: "t".into(),
-            login_payload: json!({}),
-        };
-        assert!(session.chats().is_empty());
-    }
 }

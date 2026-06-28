@@ -333,7 +333,7 @@ impl MaxClient {
             Err(err) => {
                 // A server rejection doesn't mean the socket is dead; keep it
                 // open and only disconnect on transport failures.
-                if !matches!(err, Error::Server { .. }) {
+                if !matches!(&err, Error::Server { .. }) {
                     self.inner.disconnect().await;
                 }
                 Err(err)
