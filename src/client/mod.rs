@@ -90,6 +90,18 @@ impl InnerClient {
         self.disconnect().await;
     }
 
+    async fn reset_message_channel(&self) -> mpsc::UnboundedReceiver<IncomingMessage> {
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        *self.msg_tx.lock().await = Some(msg_tx);
+        msg_rx
+    }
+
+    async fn ensure_message_channel(&self) {
+        if self.msg_tx.lock().await.is_none() {
+            self.reset_message_channel().await;
+        }
+    }
+
     async fn store_keepalive(&self, task: tokio::task::JoinHandle<()>) {
         if let Some(previous) = self.state.lock().await.keepalive_task.replace(task) {
             previous.abort();
@@ -111,8 +123,9 @@ impl MaxClient {
     /// Creates a disconnected client handle and message receiver.
     ///
     /// Call [`MaxClient::connect`] to open the WebSocket connection and log in.
-    /// If the returned receiver yields `None`, the connection died unexpectedly
-    /// and a fresh client must be created before reconnecting.
+    /// If the returned receiver yields `None`, the connection died unexpectedly;
+    /// call [`MaxClient::reconnect`] on the same client to reopen the connection
+    /// and obtain a replacement receiver.
     pub fn new(config: LoginConfig) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
@@ -151,12 +164,28 @@ impl MaxClient {
     /// Opens or reopens the WebSocket connection, logs in, and starts the
     /// background read and keepalive tasks.
     ///
-    /// This is the only path that reconnects a disconnected client. If the
-    /// saved session token is missing or rejected, the configured login flow may
+    /// This is the path that connects or reconnects a client. If the saved
+    /// session token is missing or rejected, the configured login flow may
     /// request SMS/password/captcha input. Once this client's message receiver
-    /// yields `None`, create a fresh client instead of calling `connect` again.
+    /// yields `None`, call [`MaxClient::reconnect`] if you also need a replacement
+    /// receiver for incoming messages.
     pub async fn connect(&self) -> Result<Session> {
         let _guard = self.inner.connect_lock.lock().await;
+        self.inner.ensure_message_channel().await;
+        self.connect_locked().await
+    }
+
+    /// Reconnects this client and returns a fresh incoming-message receiver.
+    ///
+    /// Use this after a previous receiver yielded `None` because the old receiver
+    /// cannot be reopened once its channel has been closed.
+    pub async fn reconnect(&self) -> Result<(Session, mpsc::UnboundedReceiver<IncomingMessage>)> {
+        let _guard = self.inner.connect_lock.lock().await;
+        let msg_rx = self.inner.reset_message_channel().await;
+        self.connect_locked().await.map(|session| (session, msg_rx))
+    }
+
+    async fn connect_locked(&self) -> Result<Session> {
         self.inner.disconnect().await;
 
         if let Err(err) = self
@@ -445,6 +474,39 @@ mod tests {
 
         client.inner.fail().await;
         assert!(messages.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_channel_can_be_recreated_after_failure() {
+        let (client, mut old_messages) = MaxClient::new(test_config()).expect("client");
+
+        client.inner.fail().await;
+        assert!(old_messages.recv().await.is_none());
+
+        let mut new_messages = client.inner.reset_message_channel().await;
+        let message = IncomingMessage {
+            chat_id: 1,
+            message_id: 2,
+            sender: 3,
+            text: "after reconnect".into(),
+            time: 4,
+        };
+        client
+            .inner
+            .msg_tx
+            .lock()
+            .await
+            .as_ref()
+            .expect("recreated sender")
+            .send(message.clone())
+            .expect("send message");
+
+        let received = new_messages.recv().await.expect("message");
+        assert_eq!(received.chat_id, message.chat_id);
+        assert_eq!(received.message_id, message.message_id);
+        assert_eq!(received.sender, message.sender);
+        assert_eq!(received.text, message.text);
+        assert_eq!(received.time, message.time);
     }
 
     #[test]
