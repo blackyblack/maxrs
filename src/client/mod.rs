@@ -443,7 +443,10 @@ mod tests {
         *client.inner.msg_tx.lock().await = Some(tx);
 
         client.inner.disconnect().await;
-        assert!(messages.try_recv().is_err());
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
 
         client.inner.fail().await;
         assert!(messages.recv().await.is_none());
