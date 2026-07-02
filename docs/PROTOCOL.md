@@ -168,7 +168,7 @@ top-level `url`); sending the url at the top level is rejected:
 2. HTTP `POST` the raw bytes to `url` with headers:
 
    ```
-   Content-Disposition: attachment; filename=<name>
+   Content-Disposition: attachment; filename=<percent-encoded-name>
    Content-Length: <size>
    Content-Range: 0-<size-1>/<size>
    ```
@@ -182,7 +182,7 @@ top-level `url`); sending the url at the top level is rejected:
    {
      "chatId": 123456,
      "message": { "text": "caption", "cid": -1700000000002, "type": "USER", "elements": [],
-                  "attaches": [ { "type": "FILE", "fileId": 987654 } ] },
+                  "attaches": [ { "_type": "FILE", "fileId": 987654 } ] },
      "notify": true
    }
    ```

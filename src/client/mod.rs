@@ -302,7 +302,10 @@ impl MaxClient {
             .post(&url)
             .header(
                 "Content-Disposition",
-                format!("attachment; filename={file_name}"),
+                format!(
+                    "attachment; filename={}",
+                    percent_encode_file_name(&file_name)
+                ),
             )
             .header("Content-Length", size.to_string())
             .header(
@@ -395,7 +398,7 @@ fn file_message_payload(chat_id: i64, caption: &str, file_id: i64, cid: i64) -> 
             "cid": cid,
             "type": "USER",
             "elements": [],
-            "attaches": [{ "type": "FILE", "fileId": file_id }],
+            "attaches": [{ "_type": "FILE", "fileId": file_id }],
         },
         "notify": true,
     })
@@ -407,6 +410,22 @@ fn normalized_file_name(file_name: String) -> String {
     } else {
         file_name
     }
+}
+
+fn percent_encode_file_name(file_name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(file_name.len());
+    for byte in file_name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    encoded
 }
 
 fn chrono_millis() -> i64 {
@@ -569,7 +588,7 @@ mod tests {
         assert_eq!(payload["message"]["elements"], json!([]));
         assert_eq!(
             payload["message"]["attaches"],
-            json!([{ "type": "FILE", "fileId": 987654 }])
+            json!([{ "_type": "FILE", "fileId": 987654 }])
         );
         assert_eq!(payload["notify"], true);
     }
@@ -578,6 +597,22 @@ mod tests {
     fn empty_buffer_file_name_falls_back_to_file() {
         assert_eq!(normalized_file_name(String::new()), "file");
         assert_eq!(normalized_file_name("report.txt".to_string()), "report.txt");
+    }
+
+    #[test]
+    fn percent_encode_file_name_leaves_ascii_filename_characters_unchanged() {
+        assert_eq!(
+            percent_encode_file_name("reports/report-2026_07.02~final.txt"),
+            "reports/report-2026_07.02~final.txt"
+        );
+    }
+
+    #[test]
+    fn percent_encode_file_name_encodes_utf8_and_spaces() {
+        assert_eq!(
+            percent_encode_file_name("привет мир.txt"),
+            "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80.txt"
+        );
     }
 
     #[test]
