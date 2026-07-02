@@ -90,18 +90,6 @@ impl InnerClient {
         self.disconnect().await;
     }
 
-    async fn reset_message_channel(&self) -> mpsc::UnboundedReceiver<IncomingMessage> {
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        *self.msg_tx.lock().await = Some(msg_tx);
-        msg_rx
-    }
-
-    async fn ensure_message_channel(&self) {
-        if self.msg_tx.lock().await.is_none() {
-            self.reset_message_channel().await;
-        }
-    }
-
     async fn store_keepalive(&self, task: tokio::task::JoinHandle<()>) {
         if let Some(previous) = self.state.lock().await.keepalive_task.replace(task) {
             previous.abort();
@@ -120,32 +108,28 @@ pub struct MaxClient {
 }
 
 impl MaxClient {
-    /// Creates a disconnected client handle and message receiver.
+    /// Creates a disconnected client handle.
     ///
-    /// Call [`MaxClient::connect`] to open the WebSocket connection and log in.
-    /// If the returned receiver yields `None`, the connection died unexpectedly;
-    /// the same client can be connected again with [`MaxClient::connect`].
-    pub fn new(config: LoginConfig) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
+    /// Call [`MaxClient::connect`] to open the WebSocket connection, log in, and
+    /// obtain the incoming-message receiver for that connection. If the receiver
+    /// yields `None`, the connection died unexpectedly; the same client can be
+    /// connected again with [`MaxClient::connect`].
+    pub fn new(config: LoginConfig) -> Result<Self> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
 
     /// Like [`MaxClient::new`] but with a custom [`UserAgent`].
-    pub fn new_with_user_agent(
-        config: LoginConfig,
-        user_agent: UserAgent,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
+    pub fn new_with_user_agent(config: LoginConfig, user_agent: UserAgent) -> Result<Self> {
         let header_user_agent = user_agent.header_user_agent.clone();
         let http = reqwest::Client::builder()
             .user_agent(header_user_agent)
             .build()?;
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-
         let inner = Arc::new(InnerClient {
             transport: Transport::new(),
             file_waiters: Mutex::new(HashMap::new()),
             login_config: Mutex::new(config.clone()),
             connect_lock: Mutex::new(()),
-            msg_tx: Mutex::new(Some(msg_tx)),
+            msg_tx: Mutex::new(None),
             state: Mutex::new(ClientState {
                 seq: 1,
                 cid: -chrono_millis(),
@@ -157,7 +141,7 @@ impl MaxClient {
             http,
         });
 
-        Ok((MaxClient { inner }, msg_rx))
+        Ok(MaxClient { inner })
     }
 
     /// Opens or reopens the WebSocket connection, logs in, and starts the
@@ -165,12 +149,13 @@ impl MaxClient {
     ///
     /// This is the path that connects or reconnects a client. If the saved
     /// session token is missing or rejected, the configured login flow may
-    /// request SMS/password/captcha input. If a previous unexpected failure
-    /// closed the message sender, `connect` recreates it before reconnecting.
-    pub async fn connect(&self) -> Result<Session> {
+    /// request SMS/password/captcha input. Each successful call returns the
+    /// incoming-message receiver for that connection.
+    pub async fn connect(&self) -> Result<(Session, mpsc::UnboundedReceiver<IncomingMessage>)> {
         let _guard = self.inner.connect_lock.lock().await;
-        self.inner.ensure_message_channel().await;
         self.inner.disconnect().await;
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        *self.inner.msg_tx.lock().await = Some(msg_tx);
 
         if let Err(err) = self
             .inner
@@ -178,12 +163,12 @@ impl MaxClient {
             .connect(&self.inner, &self.inner.user_agent.header_user_agent)
             .await
         {
-            self.inner.disconnect().await;
+            self.inner.fail().await;
             return Err(err);
         }
 
         if let Err(err) = self.inner.session_init().await {
-            self.inner.disconnect().await;
+            self.inner.fail().await;
             return Err(err);
         }
 
@@ -193,7 +178,7 @@ impl MaxClient {
         let session = match InnerClient::login(Arc::clone(&self.inner), config.clone()).await {
             Ok(session) => session,
             Err(err) => {
-                self.inner.disconnect().await;
+                self.inner.fail().await;
                 return Err(err);
             }
         };
@@ -201,7 +186,7 @@ impl MaxClient {
         stored_config.session_token = Some(session.token.clone());
         *self.inner.login_config.lock().await = stored_config;
 
-        Ok(session)
+        Ok((session, msg_rx))
     }
 
     async fn spawn_keepalive(&self) {
@@ -451,7 +436,9 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closes_message_channel_but_disconnect_keeps_it_open() {
-        let (client, mut messages) = MaxClient::new(test_config()).expect("client");
+        let client = MaxClient::new(test_config()).expect("client");
+        let (tx, mut messages) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(tx);
 
         client.inner.disconnect().await;
         assert!(messages.try_recv().is_err());
@@ -462,12 +449,15 @@ mod tests {
 
     #[tokio::test]
     async fn message_channel_can_be_recreated_after_failure() {
-        let (client, mut old_messages) = MaxClient::new(test_config()).expect("client");
+        let client = MaxClient::new(test_config()).expect("client");
+        let (old_tx, mut old_messages) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(old_tx);
 
         client.inner.fail().await;
         assert!(old_messages.recv().await.is_none());
 
-        let mut new_messages = client.inner.reset_message_channel().await;
+        let (new_tx, mut new_messages) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(new_tx);
         let message = IncomingMessage {
             chat_id: 1,
             message_id: 2,

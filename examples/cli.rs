@@ -36,8 +36,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let login_config = LoginConfig::from_env()?;
-    let (client, mut messages) = MaxClient::new(login_config)?;
-    let session = client.connect().await?;
+    let client = MaxClient::new(login_config)?;
+    let (session, mut messages) = client.connect().await?;
     println!("Logged in. Session token is stored in {SESSION_TOKEN_FILE} when refreshed.");
     tracing::debug!(token = %session.token, "logged in to Max");
     println!("Listening for incoming messages (Ctrl-C to quit)...");
