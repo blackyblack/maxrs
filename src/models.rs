@@ -61,14 +61,20 @@ pub struct IncomingMessage {
     pub time: i64,
 }
 
-/// The result of a successful login: the in-memory session token plus the raw
-/// login payload (profile, chats, contacts, ...) for callers that need more.
+/// The data that client needs from a successful `LOGIN`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoginData {
+    /// Logged-in user id, when the server includes it in the login response.
+    pub own_user_id: Option<i64>,
+}
+
+/// The result of a successful login.
 #[derive(Debug, Clone)]
-pub struct Session {
+pub struct LoginSession {
     /// Long-lived session token. Keep it to re-login without SMS.
     pub token: String,
-    /// Raw `LOGIN` response payload.
-    pub login_payload: serde_json::Value,
+    /// Parsed `LOGIN` response data used by the client.
+    pub login_data: LoginData,
 }
 
 /// Outgoing text message with optional Max formatter elements.

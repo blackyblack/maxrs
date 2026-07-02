@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::auth::LoginConfig;
 use crate::error::{Error, Result};
-use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent};
+use crate::models::{IncomingMessage, LoginSession, MaxMessage, UserAgent};
 use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
@@ -151,7 +151,9 @@ impl MaxClient {
     /// session token is missing or rejected, the configured login flow may
     /// request SMS/password/captcha input. Each successful call returns the
     /// incoming-message receiver for that connection.
-    pub async fn connect(&self) -> Result<(Session, mpsc::UnboundedReceiver<IncomingMessage>)> {
+    pub async fn connect(
+        &self,
+    ) -> Result<(LoginSession, mpsc::UnboundedReceiver<IncomingMessage>)> {
         let _guard = self.inner.connect_lock.lock().await;
         self.inner.disconnect().await;
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();

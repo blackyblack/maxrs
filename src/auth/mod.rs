@@ -8,11 +8,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::client::InnerClient;
 use crate::error::{Error, Result};
-use crate::models::Session;
+use crate::models::{LoginData, LoginSession};
 use crate::protocol::opcode;
 
 use self::captcha::http::{HttpServer, HttpServerConfig};
@@ -121,7 +122,7 @@ impl Default for AuthCaptchaConfig {
 }
 
 impl InnerClient {
-    pub(crate) async fn login(inner: Arc<Self>, config: LoginConfig) -> Result<Session> {
+    pub(crate) async fn login(inner: Arc<Self>, config: LoginConfig) -> Result<LoginSession> {
         AuthFlow::new(inner, config).login().await
     }
 }
@@ -136,7 +137,7 @@ impl AuthFlow {
         Self { inner, config }
     }
 
-    async fn login(&self) -> Result<Session> {
+    async fn login(&self) -> Result<LoginSession> {
         if let Some(token) = self.config.session_token.as_deref() {
             match self.perform_login(token).await {
                 Ok(session) => return Ok(session),
@@ -215,7 +216,7 @@ impl AuthFlow {
         solver.solve(captcha_link).await
     }
 
-    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<Session> {
+    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<LoginSession> {
         let payload = json!({
             "token": sms_token,
             "verifyCode": code,
@@ -240,7 +241,7 @@ impl AuthFlow {
         &self,
         challenge: &Value,
         password: &str,
-    ) -> Result<Session> {
+    ) -> Result<LoginSession> {
         let track_id = challenge["trackId"].as_str().ok_or_else(|| {
             Error::UnexpectedResponse("missing password challenge trackId".into())
         })?;
@@ -258,7 +259,7 @@ impl AuthFlow {
         self.login_with_auth_payload(&response.payload).await
     }
 
-    async fn login_with_auth_payload(&self, payload: &Value) -> Result<Session> {
+    async fn login_with_auth_payload(&self, payload: &Value) -> Result<LoginSession> {
         let token = login_token_from_auth_payload(payload)?;
         let session = self.perform_login(&token).await?;
         if let Err(err) = store_session_token_file(&session.token).await {
@@ -267,7 +268,7 @@ impl AuthFlow {
         Ok(session)
     }
 
-    async fn perform_login(&self, token: &str) -> Result<Session> {
+    async fn perform_login(&self, token: &str) -> Result<LoginSession> {
         let payload = json!({
             "interactive": true,
             "token": token,
@@ -278,12 +279,13 @@ impl AuthFlow {
             "chatsCount": 40,
         });
         let response = self.inner.invoke(opcode::LOGIN, payload).await?;
-        if let Some(user_id) = own_user_id_from_login_payload(&response.payload) {
+        let login_data = login_data_from_login_payload(&response.payload)?;
+        if let Some(user_id) = login_data.own_user_id {
             self.inner.set_own_user_id(user_id).await;
         }
-        Ok(Session {
+        Ok(LoginSession {
             token: token.to_string(),
-            login_payload: response.payload,
+            login_data,
         })
     }
 }
@@ -315,13 +317,28 @@ fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
         .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))
 }
 
-fn own_user_id_from_login_payload(payload: &Value) -> Option<i64> {
-    let profile = &payload["profile"];
-    profile["id"]
-        .as_i64()
-        .or_else(|| profile["userId"].as_i64())
-        .or_else(|| profile["uid"].as_i64())
-        .or_else(|| payload["userId"].as_i64())
+#[derive(Debug, Deserialize)]
+struct LoginPayload {
+    #[serde(default)]
+    profile: Option<LoginProfile>,
+    #[serde(default, rename = "userId")]
+    user_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginProfile {
+    #[serde(default, alias = "userId", alias = "uid")]
+    id: Option<i64>,
+}
+
+fn login_data_from_login_payload(payload: &Value) -> Result<LoginData> {
+    let payload = serde_json::from_value::<LoginPayload>(payload.clone())?;
+    Ok(LoginData {
+        own_user_id: payload
+            .profile
+            .and_then(|profile| profile.id)
+            .or(payload.user_id),
+    })
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -433,26 +450,54 @@ mod tests {
     }
 
     #[test]
-    fn extracts_own_user_id_from_login_profile() {
+    fn parses_login_data_from_profile_id() {
         assert_eq!(
-            own_user_id_from_login_payload(&json!({ "profile": { "id": 777 } })),
+            login_data_from_login_payload(&json!({ "profile": { "id": 777 } }))
+                .unwrap()
+                .own_user_id,
             Some(777)
         );
         assert_eq!(
-            own_user_id_from_login_payload(&json!({ "profile": { "userId": 778 } })),
+            login_data_from_login_payload(&json!({ "profile": { "userId": 778 } }))
+                .unwrap()
+                .own_user_id,
             Some(778)
         );
         assert_eq!(
-            own_user_id_from_login_payload(&json!({ "profile": { "uid": 779 } })),
+            login_data_from_login_payload(&json!({ "profile": { "uid": 779 } }))
+                .unwrap()
+                .own_user_id,
             Some(779)
         );
         assert_eq!(
-            own_user_id_from_login_payload(&json!({ "profile": {}, "userId": 780 })),
+            login_data_from_login_payload(&json!({ "profile": {}, "userId": 780 }))
+                .unwrap()
+                .own_user_id,
             Some(780)
         );
         assert_eq!(
-            own_user_id_from_login_payload(&json!({ "profile": {} })),
+            login_data_from_login_payload(&json!({ "profile": {} }))
+                .unwrap()
+                .own_user_id,
             None
+        );
+    }
+
+    #[test]
+    fn login_data_ignores_unused_login_response_fields() {
+        let data = login_data_from_login_payload(&json!({
+            "profile": { "id": 777, "name": "Unused" },
+            "chats": [{ "id": 1 }],
+            "contacts": [{ "id": 2 }],
+            "sync": { "timestamp": 3 }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            data,
+            LoginData {
+                own_user_id: Some(777)
+            }
         );
     }
 }
