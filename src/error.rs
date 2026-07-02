@@ -51,6 +51,10 @@ pub enum Error {
     #[error("timed out waiting for captcha challenge {challenge_id}")]
     CaptchaTimeout { challenge_id: String },
 
+    /// The uploaded file was not processed before the attachment timeout.
+    #[error("timed out waiting for file processing for file {0}")]
+    FileProcessingTimeout(i64),
+
     /// Captcha solver reported failure or an invalid callback.
     #[error("captcha solving failed: {0}")]
     CaptchaFailed(String),

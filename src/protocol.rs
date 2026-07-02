@@ -26,6 +26,7 @@ pub const CMD_ERROR: u8 = 3;
 /// are mirrored here.
 pub mod opcode {
     pub const PING: u16 = 1;
+    pub const RECONNECT: u16 = 3;
     pub const SESSION_INIT: u16 = 6;
     pub const AUTH_REQUEST: u16 = 17;
     pub const AUTH: u16 = 18;

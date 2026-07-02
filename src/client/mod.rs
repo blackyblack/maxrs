@@ -33,7 +33,7 @@ pub(crate) struct InnerClient {
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
     login_config: Mutex<LoginConfig>,
     connect_lock: Mutex<()>,
-    msg_tx: mpsc::UnboundedSender<IncomingMessage>,
+    msg_tx: Mutex<Option<mpsc::UnboundedSender<IncomingMessage>>>,
     state: Mutex<ClientState>,
     device_id: String,
     user_agent: UserAgent,
@@ -77,12 +77,17 @@ impl InnerClient {
         self.invoke(opcode::SESSION_INIT, payload).await.map(|_| ())
     }
 
-    async fn disconnect(&self) {
+    pub(crate) async fn disconnect(&self) {
         if let Some(task) = self.state.lock().await.keepalive_task.take() {
             task.abort();
         }
         self.file_waiters.lock().await.clear();
         self.transport.close().await;
+    }
+
+    pub(crate) async fn fail(&self) {
+        self.msg_tx.lock().await.take();
+        self.disconnect().await;
     }
 
     async fn store_keepalive(&self, task: tokio::task::JoinHandle<()>) {
@@ -106,6 +111,8 @@ impl MaxClient {
     /// Creates a disconnected client handle and message receiver.
     ///
     /// Call [`MaxClient::connect`] to open the WebSocket connection and log in.
+    /// If the returned receiver yields `None`, the connection died unexpectedly
+    /// and a fresh client must be created before reconnecting.
     pub fn new(config: LoginConfig) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
@@ -126,7 +133,7 @@ impl MaxClient {
             file_waiters: Mutex::new(HashMap::new()),
             login_config: Mutex::new(config.clone()),
             connect_lock: Mutex::new(()),
-            msg_tx,
+            msg_tx: Mutex::new(Some(msg_tx)),
             state: Mutex::new(ClientState {
                 seq: 1,
                 cid: -chrono_millis(),
@@ -146,7 +153,8 @@ impl MaxClient {
     ///
     /// This is the only path that reconnects a disconnected client. If the
     /// saved session token is missing or rejected, the configured login flow may
-    /// request SMS/password/captcha input.
+    /// request SMS/password/captcha input. Once this client's message receiver
+    /// yields `None`, create a fresh client instead of calling `connect` again.
     pub async fn connect(&self) -> Result<Session> {
         let _guard = self.inner.connect_lock.lock().await;
         self.inner.disconnect().await;
@@ -192,8 +200,8 @@ impl MaxClient {
                     .invoke(opcode::PING, json!({ "interactive": false }))
                     .await
                 {
-                    tracing::debug!(%err, "Max keepalive failed");
-                    inner.disconnect().await;
+                    tracing::warn!(%err, "Max keepalive failed");
+                    inner.fail().await;
                     break;
                 }
             }
@@ -310,13 +318,27 @@ impl MaxClient {
             return Err(err.into());
         }
 
-        // Best effort: wait for processing confirmation, but proceed on timeout.
-        let _ = tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx).await;
+        match tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.inner.file_waiters.lock().await.remove(&file_id);
+                return Err(Error::ConnectionClosed);
+            }
+            Err(_) => {
+                self.inner.file_waiters.lock().await.remove(&file_id);
+                return Err(Error::FileProcessingTimeout(file_id));
+            }
+        }
         self.inner.file_waiters.lock().await.remove(&file_id);
 
         let payload = file_message_payload(chat_id, caption, file_id, self.inner.next_cid().await);
         self.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
+    }
+
+    /// Returns whether the WebSocket sink is present and the read task is still running.
+    pub async fn is_connected(&self) -> bool {
+        self.inner.transport.is_connected().await
     }
 
     /// Sends a single keepalive ping. Mostly useful for tests; the background
@@ -334,7 +356,7 @@ impl MaxClient {
                 // A server rejection doesn't mean the socket is dead; keep it
                 // open and only disconnect on transport failures.
                 if !matches!(&err, Error::Server { .. }) {
-                    self.inner.disconnect().await;
+                    self.inner.fail().await;
                 }
                 Err(err)
             }
@@ -399,6 +421,31 @@ fn chrono_millis() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_config() -> LoginConfig {
+        LoginConfig {
+            phone: None,
+            password: None,
+            session_token: None,
+            captcha: crate::auth::AuthCaptchaConfig {
+                solver_url: None,
+                callback_bind: "127.0.0.1:0".into(),
+                callback_url_base: None,
+            },
+            operator: crate::auth::operator_channels::OperatorChannel::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_closes_message_channel_but_disconnect_keeps_it_open() {
+        let (client, mut messages) = MaxClient::new(test_config()).expect("client");
+
+        client.inner.disconnect().await;
+        assert!(messages.try_recv().is_err());
+
+        client.inner.fail().await;
+        assert!(messages.recv().await.is_none());
+    }
 
     #[test]
     fn text_message_payload_matches_web_schema() {
