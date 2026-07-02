@@ -170,10 +170,6 @@ impl MaxClient {
     pub async fn connect(&self) -> Result<Session> {
         let _guard = self.inner.connect_lock.lock().await;
         self.inner.ensure_message_channel().await;
-        self.connect_locked().await
-    }
-
-    async fn connect_locked(&self) -> Result<Session> {
         self.inner.disconnect().await;
 
         if let Err(err) = self
