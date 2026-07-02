@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::auth::LoginConfig;
 use crate::error::{Error, Result};
-use crate::models::{IncomingMessage, MaxMessage, Session, UserAgent};
+use crate::models::{IncomingMessage, LoginSession, MaxMessage, UserAgent};
 use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
@@ -33,7 +33,7 @@ pub(crate) struct InnerClient {
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
     login_config: Mutex<LoginConfig>,
     connect_lock: Mutex<()>,
-    msg_tx: mpsc::UnboundedSender<IncomingMessage>,
+    msg_tx: Mutex<Option<mpsc::UnboundedSender<IncomingMessage>>>,
     state: Mutex<ClientState>,
     device_id: String,
     user_agent: UserAgent,
@@ -77,12 +77,17 @@ impl InnerClient {
         self.invoke(opcode::SESSION_INIT, payload).await.map(|_| ())
     }
 
-    async fn disconnect(&self) {
+    pub(crate) async fn disconnect(&self) {
         if let Some(task) = self.state.lock().await.keepalive_task.take() {
             task.abort();
         }
         self.file_waiters.lock().await.clear();
         self.transport.close().await;
+    }
+
+    pub(crate) async fn fail(&self) {
+        self.msg_tx.lock().await.take();
+        self.disconnect().await;
     }
 
     async fn store_keepalive(&self, task: tokio::task::JoinHandle<()>) {
@@ -103,30 +108,28 @@ pub struct MaxClient {
 }
 
 impl MaxClient {
-    /// Creates a disconnected client handle and message receiver.
+    /// Creates a disconnected client handle.
     ///
-    /// Call [`MaxClient::connect`] to open the WebSocket connection and log in.
-    pub fn new(config: LoginConfig) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
+    /// Call [`MaxClient::connect`] to open the WebSocket connection, log in, and
+    /// obtain the incoming-message receiver for that connection. If the receiver
+    /// yields `None`, the connection died unexpectedly; the same client can be
+    /// connected again with [`MaxClient::connect`].
+    pub fn new(config: LoginConfig) -> Result<Self> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
 
     /// Like [`MaxClient::new`] but with a custom [`UserAgent`].
-    pub fn new_with_user_agent(
-        config: LoginConfig,
-        user_agent: UserAgent,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingMessage>)> {
+    pub fn new_with_user_agent(config: LoginConfig, user_agent: UserAgent) -> Result<Self> {
         let header_user_agent = user_agent.header_user_agent.clone();
         let http = reqwest::Client::builder()
             .user_agent(header_user_agent)
             .build()?;
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-
         let inner = Arc::new(InnerClient {
             transport: Transport::new(),
             file_waiters: Mutex::new(HashMap::new()),
             login_config: Mutex::new(config.clone()),
             connect_lock: Mutex::new(()),
-            msg_tx,
+            msg_tx: Mutex::new(None),
             state: Mutex::new(ClientState {
                 seq: 1,
                 cid: -chrono_millis(),
@@ -138,18 +141,23 @@ impl MaxClient {
             http,
         });
 
-        Ok((MaxClient { inner }, msg_rx))
+        Ok(MaxClient { inner })
     }
 
     /// Opens or reopens the WebSocket connection, logs in, and starts the
     /// background read and keepalive tasks.
     ///
-    /// This is the only path that reconnects a disconnected client. If the
-    /// saved session token is missing or rejected, the configured login flow may
-    /// request SMS/password/captcha input.
-    pub async fn connect(&self) -> Result<Session> {
+    /// This is the path that connects or reconnects a client. If the saved
+    /// session token is missing or rejected, the configured login flow may
+    /// request SMS/password/captcha input. Each successful call returns the
+    /// incoming-message receiver for that connection.
+    pub async fn connect(
+        &self,
+    ) -> Result<(LoginSession, mpsc::UnboundedReceiver<IncomingMessage>)> {
         let _guard = self.inner.connect_lock.lock().await;
         self.inner.disconnect().await;
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        *self.inner.msg_tx.lock().await = Some(msg_tx);
 
         if let Err(err) = self
             .inner
@@ -157,12 +165,12 @@ impl MaxClient {
             .connect(&self.inner, &self.inner.user_agent.header_user_agent)
             .await
         {
-            self.inner.disconnect().await;
+            self.inner.fail().await;
             return Err(err);
         }
 
         if let Err(err) = self.inner.session_init().await {
-            self.inner.disconnect().await;
+            self.inner.fail().await;
             return Err(err);
         }
 
@@ -172,7 +180,7 @@ impl MaxClient {
         let session = match InnerClient::login(Arc::clone(&self.inner), config.clone()).await {
             Ok(session) => session,
             Err(err) => {
-                self.inner.disconnect().await;
+                self.inner.fail().await;
                 return Err(err);
             }
         };
@@ -180,7 +188,7 @@ impl MaxClient {
         stored_config.session_token = Some(session.token.clone());
         *self.inner.login_config.lock().await = stored_config;
 
-        Ok(session)
+        Ok((session, msg_rx))
     }
 
     async fn spawn_keepalive(&self) {
@@ -192,8 +200,8 @@ impl MaxClient {
                     .invoke(opcode::PING, json!({ "interactive": false }))
                     .await
                 {
-                    tracing::debug!(%err, "Max keepalive failed");
-                    inner.disconnect().await;
+                    tracing::warn!(%err, "Max keepalive failed");
+                    inner.fail().await;
                     break;
                 }
             }
@@ -310,13 +318,27 @@ impl MaxClient {
             return Err(err.into());
         }
 
-        // Best effort: wait for processing confirmation, but proceed on timeout.
-        let _ = tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx).await;
+        match tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.inner.file_waiters.lock().await.remove(&file_id);
+                return Err(Error::ConnectionClosed);
+            }
+            Err(_) => {
+                self.inner.file_waiters.lock().await.remove(&file_id);
+                return Err(Error::FileProcessingTimeout(file_id));
+            }
+        }
         self.inner.file_waiters.lock().await.remove(&file_id);
 
         let payload = file_message_payload(chat_id, caption, file_id, self.inner.next_cid().await);
         self.invoke(opcode::MSG_SEND, payload).await?;
         Ok(())
+    }
+
+    /// Returns whether the WebSocket sink is present and the read task is still running.
+    pub async fn is_connected(&self) -> bool {
+        self.inner.transport.is_connected().await
     }
 
     /// Sends a single keepalive ping. Mostly useful for tests; the background
@@ -334,7 +356,7 @@ impl MaxClient {
                 // A server rejection doesn't mean the socket is dead; keep it
                 // open and only disconnect on transport failures.
                 if !matches!(&err, Error::Server { .. }) {
-                    self.inner.disconnect().await;
+                    self.inner.fail().await;
                 }
                 Err(err)
             }
@@ -399,6 +421,72 @@ fn chrono_millis() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_config() -> LoginConfig {
+        LoginConfig {
+            phone: None,
+            password: None,
+            session_token: None,
+            captcha: crate::auth::AuthCaptchaConfig {
+                solver_url: None,
+                callback_bind: "127.0.0.1:0".into(),
+                callback_url_base: None,
+            },
+            operator: crate::auth::operator_channels::OperatorChannel::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_closes_message_channel_but_disconnect_keeps_it_open() {
+        let client = MaxClient::new(test_config()).expect("client");
+        let (tx, mut messages) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(tx);
+
+        client.inner.disconnect().await;
+        assert!(matches!(
+            messages.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        client.inner.fail().await;
+        assert!(messages.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_channel_can_be_recreated_after_failure() {
+        let client = MaxClient::new(test_config()).expect("client");
+        let (old_tx, mut old_messages) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(old_tx);
+
+        client.inner.fail().await;
+        assert!(old_messages.recv().await.is_none());
+
+        let (new_tx, mut new_messages) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(new_tx);
+        let message = IncomingMessage {
+            chat_id: 1,
+            message_id: 2,
+            sender: 3,
+            text: "after reconnect".into(),
+            time: 4,
+        };
+        client
+            .inner
+            .msg_tx
+            .lock()
+            .await
+            .as_ref()
+            .expect("recreated sender")
+            .send(message.clone())
+            .expect("send message");
+
+        let received = new_messages.recv().await.expect("message");
+        assert_eq!(received.chat_id, message.chat_id);
+        assert_eq!(received.message_id, message.message_id);
+        assert_eq!(received.sender, message.sender);
+        assert_eq!(received.text, message.text);
+        assert_eq!(received.time, message.time);
+    }
 
     #[test]
     fn text_message_payload_matches_web_schema() {

@@ -126,6 +126,15 @@ impl Transport {
         }
     }
 
+    pub(super) async fn is_connected(&self) -> bool {
+        let state = self.state.lock().await;
+        state.sink.is_some()
+            && state
+                .read_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+    }
+
     pub(super) async fn close(&self) {
         let mut state = self.state.lock().await;
         if let Some(task) = state.read_task.take() {

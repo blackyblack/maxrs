@@ -42,11 +42,15 @@ pub(super) async fn read_loop(
         }
     }
 
-    inner.disconnect().await;
+    inner.fail().await;
 }
 
 async fn handle_server_request(inner: &Arc<InnerClient>, packet: Packet) {
     match packet.opcode {
+        opcode::RECONNECT => {
+            tracing::warn!("Max server requested reconnect");
+            inner.fail().await;
+        }
         opcode::NOTIF_MESSAGE => {
             if let Some(message) = parse_incoming(&packet.payload) {
                 // Acknowledge the push, mirroring the official web client.
@@ -57,7 +61,9 @@ async fn handle_server_request(inner: &Arc<InnerClient>, packet: Packet) {
                 );
                 let _ = inner.transport.send(&ack).await;
                 if !is_filtered_incoming_message(&message, inner.own_user_id().await) {
-                    let _ = inner.msg_tx.send(message);
+                    if let Some(tx) = inner.msg_tx.lock().await.as_ref() {
+                        let _ = tx.send(message);
+                    }
                 }
             }
         }
