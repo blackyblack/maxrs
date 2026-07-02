@@ -417,7 +417,7 @@ fn percent_encode_file_name(file_name: &str) -> String {
 
     let mut encoded = String::with_capacity(file_name.len());
     for byte in file_name.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             encoded.push(byte as char);
         } else {
             encoded.push('%');
@@ -602,8 +602,16 @@ mod tests {
     #[test]
     fn percent_encode_file_name_leaves_ascii_filename_characters_unchanged() {
         assert_eq!(
-            percent_encode_file_name("reports/report-2026_07.02~final.txt"),
-            "reports/report-2026_07.02~final.txt"
+            percent_encode_file_name("report-2026_07.02~final.txt"),
+            "report-2026_07.02~final.txt"
+        );
+    }
+
+    #[test]
+    fn percent_encode_file_name_encodes_slashes() {
+        assert_eq!(
+            percent_encode_file_name("reports/report.txt"),
+            "reports%2Freport.txt"
         );
     }
 
