@@ -104,11 +104,13 @@ impl HttpServer {
 impl HttpServerTask {
     fn request_shutdown(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+            if shutdown_tx.send(()).is_err() {
+                tracing::debug!("http callback server shutdown signal receiver already dropped");
+            }
         }
     }
 
-    fn log_task_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+    fn log_task_error(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -123,7 +125,7 @@ impl HttpServerTask {
     pub async fn shutdown(mut self) {
         self.request_shutdown();
         if let Some(handle) = self.handle.take() {
-            Self::log_task_result(handle.await);
+            Self::log_task_error(handle.await);
         }
     }
 }
