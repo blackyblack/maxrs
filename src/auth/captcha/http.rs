@@ -11,6 +11,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
@@ -41,6 +42,7 @@ pub struct HttpServer {
 #[must_use = "dropping the server task stops the HTTP server"]
 pub struct HttpServerTask {
     handle: Option<JoinHandle<Result<()>>>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Clone)]
@@ -89,23 +91,40 @@ impl HttpServer {
     }
 
     pub fn spawn(self) -> HttpServerTask {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         HttpServerTask {
-            handle: Some(tokio::spawn(self.serve(std::future::pending()))),
+            handle: Some(tokio::spawn(self.serve(async move {
+                let _ = shutdown_rx.await;
+            }))),
+            shutdown_tx: Some(shutdown_tx),
         }
     }
 }
 
 impl HttpServerTask {
     pub async fn shutdown(mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
         if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "http callback server task failed during shutdown");
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "http callback server task panicked during shutdown");
+                }
+            }
         }
     }
 }
 
 impl Drop for HttpServerTask {
     fn drop(&mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
         if let Some(handle) = &self.handle {
             handle.abort();
         }
@@ -223,7 +242,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Instant;
-    use tokio::sync::oneshot;
 
     use crate::auth::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 
