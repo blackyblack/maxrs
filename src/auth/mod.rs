@@ -212,8 +212,10 @@ impl AuthFlow {
             solver_url.clone(),
             callback_url,
         ))?);
-        tokio::spawn(server.with_captcha_solver(Arc::clone(&solver)).serve());
-        solver.solve(captcha_link).await
+        let server_task = server.with_captcha_solver(Arc::clone(&solver)).spawn();
+        let result = solver.solve(captcha_link).await;
+        server_task.shutdown().await;
+        result
     }
 
     async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<LoginSession> {
