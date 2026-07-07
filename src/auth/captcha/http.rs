@@ -102,29 +102,35 @@ impl HttpServer {
 }
 
 impl HttpServerTask {
-    pub async fn shutdown(mut self) {
+    fn request_shutdown(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
-        if let Some(handle) = self.handle.take() {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(%err, "http callback server task failed during shutdown");
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "http callback server task panicked during shutdown");
-                }
+    }
+
+    fn log_task_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "http callback server task failed during shutdown");
             }
+            Err(err) => {
+                tracing::warn!(%err, "http callback server task panicked during shutdown");
+            }
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        self.request_shutdown();
+        if let Some(handle) = self.handle.take() {
+            Self::log_task_result(handle.await);
         }
     }
 }
 
 impl Drop for HttpServerTask {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
+        self.request_shutdown();
         if let Some(handle) = &self.handle {
             handle.abort();
         }
