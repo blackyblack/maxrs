@@ -68,11 +68,7 @@ impl HttpServer {
         self.listener.local_addr()
     }
 
-    pub async fn serve(self) -> Result<()> {
-        self.serve_until(std::future::pending::<()>()).await
-    }
-
-    pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<()> {
+    pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
         loop {
             let (stream, _) = tokio::select! {
@@ -94,7 +90,7 @@ impl HttpServer {
 
     pub fn spawn(self) -> HttpServerTask {
         HttpServerTask {
-            handle: Some(tokio::spawn(self.serve())),
+            handle: Some(tokio::spawn(self.serve(std::future::pending()))),
         }
     }
 }
@@ -244,7 +240,7 @@ mod tests {
             .unwrap()
             .with_captcha_solver(Arc::clone(&solver));
         let addr = server.local_addr().unwrap();
-        let server_task = tokio::spawn(server.serve());
+        let server_task = server.spawn();
 
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -267,8 +263,7 @@ mod tests {
         assert_eq!(callback.challenge_id, "challenge-1");
         assert_eq!(callback.token.as_deref(), Some("session"));
 
-        server_task.abort();
-        let _ = server_task.await;
+        server_task.shutdown().await;
     }
 
     #[tokio::test]
@@ -298,7 +293,7 @@ mod tests {
             .unwrap()
             .with_captcha_solver(solver);
         let addr = server.local_addr().unwrap();
-        let server_task = tokio::spawn(server.serve());
+        let server_task = server.spawn();
 
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -321,8 +316,7 @@ mod tests {
             r#"{"error":"unknown captcha challenge: missing"}"#
         );
 
-        server_task.abort();
-        let _ = server_task.await;
+        server_task.shutdown().await;
     }
 
     #[tokio::test]
@@ -331,7 +325,7 @@ mod tests {
             .await
             .unwrap();
         let addr = server.local_addr().unwrap();
-        let server_task = tokio::spawn(server.serve());
+        let server_task = server.spawn();
 
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -354,8 +348,7 @@ mod tests {
             r#"{"error":"captcha solver not configured"}"#
         );
 
-        server_task.abort();
-        let _ = server_task.await;
+        server_task.shutdown().await;
     }
 
     #[tokio::test]
@@ -366,7 +359,7 @@ mod tests {
             .unwrap()
             .with_captcha_solver(solver);
         let addr = server.local_addr().unwrap();
-        let server_task = tokio::spawn(server.serve());
+        let server_task = server.spawn();
 
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -385,7 +378,6 @@ mod tests {
             r#"{"error":"request body too large"}"#
         );
 
-        server_task.abort();
-        let _ = server_task.await;
+        server_task.shutdown().await;
     }
 }
