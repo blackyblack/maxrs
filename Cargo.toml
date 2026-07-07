@@ -11,6 +11,7 @@ readme = "README.md"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-std", "io-util", "fs", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }

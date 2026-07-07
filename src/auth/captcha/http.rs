@@ -11,8 +11,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::error::{Error, Result};
 
@@ -41,8 +41,8 @@ pub struct HttpServer {
 
 #[must_use = "dropping the server task stops the HTTP server"]
 pub struct HttpServerTask {
-    handle: Option<JoinHandle<Result<()>>>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    handle: AbortOnDropHandle<Result<()>>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -91,26 +91,19 @@ impl HttpServer {
     }
 
     pub fn spawn(self) -> HttpServerTask {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
         HttpServerTask {
-            handle: Some(tokio::spawn(self.serve(async move {
-                let _ = shutdown_rx.await;
+            handle: AbortOnDropHandle::new(tokio::spawn(self.serve(async move {
+                shutdown_signal.cancelled().await;
             }))),
-            shutdown_tx: Some(shutdown_tx),
+            shutdown,
         }
     }
 }
 
 impl HttpServerTask {
-    fn request_shutdown(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            if shutdown_tx.send(()).is_err() {
-                tracing::debug!("http callback server shutdown signal receiver already dropped");
-            }
-        }
-    }
-
-    fn log_task_error(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+    fn handle_task_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -122,20 +115,9 @@ impl HttpServerTask {
         }
     }
 
-    pub async fn shutdown(mut self) {
-        self.request_shutdown();
-        if let Some(handle) = self.handle.take() {
-            Self::log_task_error(handle.await);
-        }
-    }
-}
-
-impl Drop for HttpServerTask {
-    fn drop(&mut self) {
-        self.request_shutdown();
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        Self::handle_task_result(self.handle.await);
     }
 }
 
@@ -250,6 +232,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Instant;
+    use tokio::sync::oneshot;
 
     use crate::auth::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 
