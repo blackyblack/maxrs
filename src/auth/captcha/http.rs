@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::error::Error as StdError;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 
@@ -34,6 +36,11 @@ impl HttpServerConfig {
 pub struct HttpServer {
     listener: TcpListener,
     state: Arc<HttpState>,
+}
+
+#[must_use = "dropping the server task stops the HTTP server"]
+pub struct HttpServerTask {
+    handle: Option<JoinHandle<Result<()>>>,
 }
 
 #[derive(Clone)]
@@ -62,8 +69,16 @@ impl HttpServer {
     }
 
     pub async fn serve(self) -> Result<()> {
+        self.serve_until(std::future::pending::<()>()).await
+    }
+
+    pub async fn serve_until(self, shutdown: impl Future<Output = ()>) -> Result<()> {
+        tokio::pin!(shutdown);
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let (stream, _) = tokio::select! {
+                result = self.listener.accept() => result?,
+                () = &mut shutdown => return Ok(()),
+            };
             let state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 let service = service_fn(move |request| route_request(request, Arc::clone(&state)));
@@ -74,6 +89,29 @@ impl HttpServer {
                     tracing::debug!(?err, "http callback connection failed");
                 }
             });
+        }
+    }
+
+    pub fn spawn(self) -> HttpServerTask {
+        HttpServerTask {
+            handle: Some(tokio::spawn(self.serve())),
+        }
+    }
+}
+
+impl HttpServerTask {
+    pub async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for HttpServerTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
         }
     }
 }
@@ -208,7 +246,10 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let server_task = tokio::spawn(server.serve());
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://{addr}/captcha-callback"))
             .json(&json!({
                 "challengeId": "challenge-1",
@@ -231,6 +272,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopped_server_releases_fixed_port_for_retry() {
+        let initial_server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
+            .await
+            .unwrap();
+        let fixed_addr = initial_server.local_addr().unwrap();
+        drop(initial_server);
+
+        for _ in 0..2 {
+            let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
+            let server = HttpServer::bind(HttpServerConfig::new(fixed_addr.to_string()))
+                .await
+                .unwrap()
+                .with_captcha_solver(solver);
+            let server_task = server.spawn();
+            server_task.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn errors_are_returned_as_json() {
         let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
         let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
@@ -240,7 +300,10 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let server_task = tokio::spawn(server.serve());
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://{addr}/captcha-callback"))
             .json(&json!({
                 "challengeId": "missing",
@@ -270,7 +333,10 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let server_task = tokio::spawn(server.serve());
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://{addr}/captcha-callback"))
             .json(&json!({
                 "challengeId": "missing",
@@ -302,7 +368,10 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let server_task = tokio::spawn(server.serve());
 
-        let response = reqwest::Client::new()
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .post(format!("http://{addr}/captcha-callback"))
             .body("x".repeat(DEFAULT_CALLBACK_BODY_LIMIT_BYTES + 1))
             .send()
