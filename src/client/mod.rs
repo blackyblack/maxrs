@@ -142,11 +142,11 @@ impl InnerClient {
         if let Some(sender) = self.msg_tx.lock().await.as_mut() {
             sender.tx.take();
         }
+        self.file_waiters.lock().await.clear();
+        self.transport.close().await;
         if let Some(task) = self.state.lock().await.keepalive_task.take() {
             task.abort();
         }
-        self.file_waiters.lock().await.clear();
-        self.transport.close().await;
     }
 
     pub(crate) async fn fail(&self) {
@@ -555,6 +555,37 @@ mod tests {
 
         client.inner.disconnect().await;
         assert!(messages.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn keepalive_failure_finishes_cleanup_before_self_abort() {
+        let client = MaxClient::new(test_config()).expect("client");
+        let (waiter_tx, _waiter_rx) = oneshot::channel();
+        let mut waiters = client.inner.file_waiters.lock().await;
+        waiters.insert(1, waiter_tx);
+
+        let inner = Arc::clone(&client.inner);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (run_tx, run_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            run_rx.await.unwrap();
+            inner.fail().await;
+            finished_tx.send(()).unwrap();
+        });
+        client.inner.state.lock().await.keepalive_task = Some(task);
+
+        started_rx.await.expect("keepalive task must start");
+        run_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        drop(waiters);
+
+        finished_rx
+            .await
+            .expect("self-abort must happen only after cleanup completes");
+        assert!(client.inner.file_waiters.lock().await.is_empty());
+        assert!(client.inner.state.lock().await.keepalive_task.is_none());
     }
 
     struct NoopHandler;
