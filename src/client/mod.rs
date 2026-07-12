@@ -122,10 +122,23 @@ impl InnerClient {
     }
 
     pub(crate) async fn disconnect(&self) {
-        if let Some(sender) = self.msg_tx.lock().await.take() {
-            sender.root.abort();
-        }
+        let root = self.msg_tx.lock().await.as_mut().map(|sender| {
+            sender.tx.take();
+            Arc::clone(&sender.root)
+        });
+
         self.close_connection().await;
+
+        if let Some(root) = root {
+            let mut dispatcher = self.msg_tx.lock().await;
+            if dispatcher
+                .as_ref()
+                .is_some_and(|sender| Arc::ptr_eq(&sender.root, &root))
+            {
+                dispatcher.take();
+            }
+            root.abort();
+        }
     }
 
     async fn close_connection(&self) {
@@ -208,6 +221,13 @@ impl MaxClient {
     /// session token is missing or rejected, the configured login flow may
     /// request SMS/password/captcha input. Each successful call returns a fresh
     /// [`ConnectedClient`] instance for that connection.
+    ///
+    /// A connection failure does not abort handlers that were already accepted,
+    /// but a subsequent `connect` call does. Before opening the new connection,
+    /// it disconnects the previous one and aborts any handlers still attached to
+    /// its dispatcher. This keeps handlers from the old and new connections from
+    /// overlapping; callers that require graceful handler completion should wait
+    /// for it before reconnecting.
     ///
     /// At most one handler runs per chat. A message arriving while its chat is
     /// busy (including while waiting for global capacity) is dropped and logged.

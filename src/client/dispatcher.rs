@@ -666,6 +666,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_disconnect_finishes_cleanup_before_aborting_handlers() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
+        let handler = TestHandler(Arc::new(move |client, _| {
+            let client = client.clone();
+            let started_tx = started_tx.clone();
+            let finished_tx = Arc::clone(&finished_tx);
+            Box::pin(async move {
+                started_tx.send(()).unwrap();
+                client.disconnect().await;
+                finished_tx
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                Ok(())
+            })
+        }));
+        let client = client();
+        let root = Arc::new(DispatcherRoot::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
+            tx: Some(tx.clone()),
+            root: Arc::clone(&root),
+        });
+        let connected = connected(
+            Arc::clone(&root),
+            client.clone(),
+            handler,
+            ServeConfig { max_concurrent: 1 },
+            rx,
+        );
+        let state_owner = client.clone();
+        let state_guard = state_owner.inner.state.lock().await;
+        let run_task = tokio::spawn(connected.run());
+
+        tx.send(message(1, 1)).unwrap();
+        started_rx.recv().await.unwrap();
+        drop(tx);
+        run_task.await.unwrap();
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        drop(state_guard);
+        finished_rx
+            .await
+            .expect("handler must finish disconnect cleanup before it is aborted");
+        root.wait_chat_free(1).await;
+    }
+
+    #[tokio::test]
     async fn handler_can_use_provided_client() {
         let (used_tx, used_rx) = tokio::sync::oneshot::channel();
         let used_tx = Arc::new(Mutex::new(Some(used_tx)));
