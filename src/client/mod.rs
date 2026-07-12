@@ -22,7 +22,6 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ClientState {
-    seq: u32,
     cid: i64,
     own_user_id: Option<i64>,
     keepalive_task: Option<tokio::task::JoinHandle<()>>,
@@ -41,13 +40,6 @@ pub(crate) struct InnerClient {
 }
 
 impl InnerClient {
-    async fn next_seq(&self) -> u32 {
-        let mut state = self.state.lock().await;
-        let seq = state.seq;
-        state.seq = state.seq.wrapping_add(1);
-        seq
-    }
-
     async fn next_cid(&self) -> i64 {
         let now = -chrono_millis();
         // Client-generated message ids are negative to avoid colliding with
@@ -67,9 +59,7 @@ impl InnerClient {
     }
 
     pub(crate) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
-        self.transport
-            .invoke(self.next_seq().await, opcode, payload)
-            .await
+        self.transport.invoke(opcode, payload).await
     }
 
     async fn session_init(&self) -> Result<()> {
@@ -131,7 +121,6 @@ impl MaxClient {
             connect_lock: Mutex::new(()),
             msg_tx: Mutex::new(None),
             state: Mutex::new(ClientState {
-                seq: 1,
                 cid: -chrono_millis(),
                 own_user_id: None,
                 keepalive_task: None,
@@ -342,6 +331,11 @@ impl MaxClient {
     /// Returns whether the WebSocket sink is present and the read task is still running.
     pub async fn is_connected(&self) -> bool {
         self.inner.transport.is_connected().await
+    }
+
+    /// Closes the WebSocket connection and stops the background keepalive task.
+    pub async fn disconnect(&self) {
+        self.inner.disconnect().await;
     }
 
     /// Sends a single keepalive ping. Mostly useful for tests; the background
