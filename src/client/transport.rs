@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,23 +26,21 @@ pub(super) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
 
 pub(super) struct Transport {
-    request_lock: Mutex<()>,
+    sink: Mutex<Option<WsSink>>,
     state: Mutex<TransportState>,
 }
 
 struct TransportState {
-    sink: Option<WsSink>,
-    pending_response: Option<oneshot::Sender<Packet>>,
+    pending: HashMap<u32, oneshot::Sender<Packet>>,
     read_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Transport {
     pub(super) fn new() -> Self {
         Self {
-            request_lock: Mutex::new(()),
+            sink: Mutex::new(None),
             state: Mutex::new(TransportState {
-                sink: None,
-                pending_response: None,
+                pending: HashMap::new(),
                 read_task: None,
             }),
         }
@@ -52,7 +51,6 @@ impl Transport {
         owner: &Arc<InnerClient>,
         header_user_agent: &str,
     ) -> Result<()> {
-        let _guard = self.request_lock.lock().await;
         self.close().await;
         let mut request = WS_URL.into_client_request()?;
         {
@@ -64,10 +62,7 @@ impl Transport {
         let (stream, _response) = connect_async(request).await?;
         let (sink, read) = stream.split();
 
-        {
-            let mut state = self.state.lock().await;
-            state.sink = Some(sink);
-        }
+        *self.sink.lock().await = Some(sink);
         let task = tokio::spawn(read_loop(read, Arc::clone(owner)));
         self.state.lock().await.read_task = Some(task);
         Ok(())
@@ -75,8 +70,8 @@ impl Transport {
 
     pub(super) async fn send(&self, packet: &Packet) -> Result<()> {
         let text = serde_json::to_string(packet)?;
-        let mut state = self.state.lock().await;
-        let sink = state.sink.as_mut().ok_or(Error::ConnectionClosed)?;
+        let mut sink = self.sink.lock().await;
+        let sink = sink.as_mut().ok_or(Error::ConnectionClosed)?;
         match tokio::time::timeout(DEFAULT_TIMEOUT, sink.send(Message::text(text))).await {
             Ok(result) => result?,
             Err(_) => return Err(Error::Timeout(packet.opcode)),
@@ -85,20 +80,30 @@ impl Transport {
     }
 
     pub(super) async fn invoke(&self, seq: u32, opcode: u16, payload: Value) -> Result<Packet> {
-        let _guard = self.request_lock.lock().await;
+        self.invoke_with_timeout(seq, opcode, payload, DEFAULT_TIMEOUT)
+            .await
+    }
+
+    async fn invoke_with_timeout(
+        &self,
+        seq: u32,
+        opcode: u16,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Packet> {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
-            state.pending_response = Some(tx);
+            state.pending.insert(seq, tx);
         }
 
         let packet = Packet::request(seq, opcode, payload);
         if let Err(err) = self.send(&packet).await {
-            self.close().await;
+            self.state.lock().await.pending.remove(&seq);
             return Err(err);
         }
 
-        match tokio::time::timeout(DEFAULT_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
                 if response.cmd == CMD_ERROR {
                     return Err(Error::Server {
@@ -110,25 +115,29 @@ impl Transport {
             }
             // Sender dropped -> connection closed.
             Ok(Err(_)) => {
-                self.close().await;
+                self.state.lock().await.pending.remove(&seq);
                 Err(Error::ConnectionClosed)
             }
             Err(_) => {
-                self.close().await;
+                self.state.lock().await.pending.remove(&seq);
                 Err(Error::Timeout(opcode))
             }
         }
     }
 
     pub(super) async fn receive_response(&self, packet: Packet) {
-        if let Some(tx) = self.state.lock().await.pending_response.take() {
+        let seq = packet.seq;
+        if let Some(tx) = self.state.lock().await.pending.remove(&seq) {
             let _ = tx.send(packet);
+        } else {
+            tracing::warn!(seq, "dropping response with unknown sequence number");
         }
     }
 
     pub(super) async fn is_connected(&self) -> bool {
+        let has_sink = self.sink.lock().await.is_some();
         let state = self.state.lock().await;
-        state.sink.is_some()
+        has_sink
             && state
                 .read_task
                 .as_ref()
@@ -136,12 +145,14 @@ impl Transport {
     }
 
     pub(super) async fn close(&self) {
-        let mut state = self.state.lock().await;
-        if let Some(task) = state.read_task.take() {
-            task.abort();
+        {
+            let mut state = self.state.lock().await;
+            if let Some(task) = state.read_task.take() {
+                task.abort();
+            }
+            state.pending.drain().for_each(drop);
         }
-        state.sink = None;
-        state.pending_response = None;
+        self.sink.lock().await.take();
     }
 }
 
@@ -157,12 +168,166 @@ fn error_message(payload: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    type ServerStream = WebSocketStream<TcpStream>;
+
+    async fn connected_transport() -> (Arc<Transport>, ServerStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        let client =
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client), Role::Client, None)
+                .await;
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let (sink, _) = client.split();
+        let transport = Arc::new(Transport::new());
+        *transport.sink.lock().await = Some(sink);
+        (transport, server)
+    }
+
+    async fn next_request(server: &mut ServerStream) -> Packet {
+        let message = tokio::time::timeout(Duration::from_secs(1), server.next())
+            .await
+            .expect("request timed out")
+            .expect("stream closed")
+            .expect("websocket error");
+        serde_json::from_str(message.to_text().unwrap()).unwrap()
+    }
 
     #[test]
     fn extracts_error_message() {
         assert_eq!(error_message(&json!({ "error": "boom" })), "boom");
         assert_eq!(error_message(&json!({ "message": "m" })), "m");
         assert_eq!(error_message(&json!({})), "unknown error");
+    }
+
+    #[tokio::test]
+    async fn concurrent_invokes_match_out_of_order_responses_by_sequence() {
+        let (transport, mut server) = connected_transport().await;
+        let first = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .invoke(10, 100, json!({ "request": "first" }))
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .invoke(20, 200, json!({ "request": "second" }))
+                    .await
+            }
+        });
+
+        let sent_a = next_request(&mut server).await;
+        let sent_b = next_request(&mut server).await;
+        assert_eq!([sent_a.seq, sent_b.seq].into_iter().sum::<u32>(), 30);
+
+        transport
+            .receive_response(Packet::response(20, 200, json!({ "reply": "second" })))
+            .await;
+        transport
+            .receive_response(Packet::response(10, 100, json!({ "reply": "first" })))
+            .await;
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(first.seq, 10);
+        assert_eq!(first.payload["reply"], "first");
+        assert_eq!(second.seq, 20);
+        assert_eq!(second.payload["reply"], "second");
+    }
+
+    #[tokio::test]
+    async fn unknown_sequence_response_is_ignored() {
+        let (transport, mut server) = connected_transport().await;
+        let invoke = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move { transport.invoke(7, 70, Value::Null).await }
+        });
+        next_request(&mut server).await;
+
+        transport
+            .receive_response(Packet::response(999, 70, json!({ "wrong": true })))
+            .await;
+        assert!(!invoke.is_finished());
+
+        transport
+            .receive_response(Packet::response(7, 70, json!({ "right": true })))
+            .await;
+        assert_eq!(invoke.await.unwrap().unwrap().payload["right"], true);
+    }
+
+    #[tokio::test]
+    async fn close_resolves_all_pending_invokes_as_connection_closed() {
+        let (transport, mut server) = connected_transport().await;
+        let first = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move { transport.invoke(1, 10, Value::Null).await }
+        });
+        let second = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move { transport.invoke(2, 20, Value::Null).await }
+        });
+        next_request(&mut server).await;
+        next_request(&mut server).await;
+
+        transport.close().await;
+
+        assert!(matches!(first.await.unwrap(), Err(Error::ConnectionClosed)));
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(Error::ConnectionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn timeout_removes_only_its_waiter_and_late_response_is_dropped() {
+        let (transport, mut server) = connected_transport().await;
+        let timed_out = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .invoke_with_timeout(1, 10, Value::Null, Duration::from_millis(20))
+                    .await
+            }
+        });
+        let waiting = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move { transport.invoke(2, 20, Value::Null).await }
+        });
+        next_request(&mut server).await;
+        next_request(&mut server).await;
+
+        assert!(matches!(timed_out.await.unwrap(), Err(Error::Timeout(10))));
+        assert_eq!(
+            transport
+                .state
+                .lock()
+                .await
+                .pending
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        transport
+            .receive_response(Packet::response(1, 10, json!({ "late": true })))
+            .await;
+        assert!(!waiting.is_finished());
+        transport
+            .receive_response(Packet::response(2, 20, json!({ "ok": true })))
+            .await;
+        assert_eq!(waiting.await.unwrap().unwrap().payload["ok"], true);
     }
 }

@@ -344,6 +344,11 @@ impl MaxClient {
         self.inner.transport.is_connected().await
     }
 
+    /// Closes the WebSocket connection and stops the background keepalive task.
+    pub async fn disconnect(&self) {
+        self.inner.disconnect().await;
+    }
+
     /// Sends a single keepalive ping. Mostly useful for tests; the background
     /// task pings automatically.
     pub async fn ping(&self) -> Result<()> {
