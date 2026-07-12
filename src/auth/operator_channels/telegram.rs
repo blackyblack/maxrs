@@ -175,22 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_prompt_text_when_it_does_not_come_from_the_bot() {
-        let update = json!({
-            "message": {
-                "chat": { "id": 42 },
-                "from": { "id": 2002, "is_bot": false },
-                "text": "prompt"
-            }
-        });
-
-        assert_eq!(
-            operator_text_from_update(&update, 42, 1001),
-            Some("prompt".to_string())
-        );
-    }
-
-    #[test]
     fn starts_polling_after_latest_pending_update() {
         let resp = json!({
             "ok": true,

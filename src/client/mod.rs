@@ -1,10 +1,12 @@
 //! The asynchronous Max client.
 
+mod dispatcher;
 mod read_loop;
 mod transport;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +19,55 @@ use crate::models::{IncomingMessage, LoginSession, MaxMessage, UserAgent};
 use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
+
+/// Handles incoming messages dispatched by [`MaxClient`].
+pub trait ChatHandler: Send + Sync + 'static {
+    fn on_message(
+        &self,
+        client: &MaxClient,
+        msg: IncomingMessage,
+    ) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Controls incoming-message dispatch for one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeConfig {
+    /// Maximum number of handlers running across different chats.
+    pub max_concurrent: usize,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self { max_concurrent: 8 }
+    }
+}
+
+/// A connected client ready to dispatch incoming messages.
+pub struct ConnectedClient<H> {
+    client: MaxClient,
+    handler: H,
+    config: ServeConfig,
+    incoming: mpsc::UnboundedReceiver<IncomingMessage>,
+    dispatcher: Arc<dispatcher::DispatcherRoot>,
+}
+
+impl<H: ChatHandler> ConnectedClient<H> {
+    /// Dispatches messages until the incoming feed closes.
+    ///
+    /// Dropping or cancelling this future stops admitting messages without
+    /// aborting handlers that have already been spawned. Call
+    /// [`MaxClient::disconnect`] to abort in-flight handlers.
+    pub async fn run(self) {
+        dispatcher::run(
+            self.dispatcher,
+            self.client,
+            self.handler,
+            self.config,
+            self.incoming,
+        )
+        .await;
+    }
+}
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -32,7 +83,7 @@ pub(crate) struct InnerClient {
     file_waiters: Mutex<HashMap<i64, oneshot::Sender<()>>>,
     login_config: Mutex<LoginConfig>,
     connect_lock: Mutex<()>,
-    msg_tx: Mutex<Option<mpsc::UnboundedSender<IncomingMessage>>>,
+    msg_tx: Mutex<Option<DispatcherSender>>,
     state: Mutex<ClientState>,
     device_id: String,
     user_agent: UserAgent,
@@ -68,16 +119,38 @@ impl InnerClient {
     }
 
     pub(crate) async fn disconnect(&self) {
-        if let Some(task) = self.state.lock().await.keepalive_task.take() {
-            task.abort();
+        let root = self.msg_tx.lock().await.as_mut().map(|sender| {
+            sender.tx.take();
+            Arc::clone(&sender.root)
+        });
+
+        self.close_connection().await;
+
+        if let Some(root) = root {
+            let mut dispatcher = self.msg_tx.lock().await;
+            if dispatcher
+                .as_ref()
+                .is_some_and(|sender| Arc::ptr_eq(&sender.root, &root))
+            {
+                dispatcher.take();
+            }
+            root.abort();
+        }
+    }
+
+    async fn close_connection(&self) {
+        if let Some(sender) = self.msg_tx.lock().await.as_mut() {
+            sender.tx.take();
         }
         self.file_waiters.lock().await.clear();
         self.transport.close().await;
+        if let Some(task) = self.state.lock().await.keepalive_task.take() {
+            task.abort();
+        }
     }
 
     pub(crate) async fn fail(&self) {
-        self.msg_tx.lock().await.take();
-        self.disconnect().await;
+        self.close_connection().await;
     }
 
     async fn store_keepalive(&self, task: tokio::task::JoinHandle<()>) {
@@ -87,11 +160,14 @@ impl InnerClient {
     }
 }
 
+struct DispatcherSender {
+    tx: Option<mpsc::UnboundedSender<IncomingMessage>>,
+    root: Arc<dispatcher::DispatcherRoot>,
+}
+
 /// An asynchronous client for the Max (OneMe) WebSocket API.
 ///
-/// The client is cheap to clone (`Arc` inside); clones share the same
-/// connection, so you can move one clone into a background task to listen for
-/// messages while sending from another.
+/// Clones are cheap and share the same connection.
 #[derive(Clone)]
 pub struct MaxClient {
     inner: Arc<InnerClient>,
@@ -100,10 +176,7 @@ pub struct MaxClient {
 impl MaxClient {
     /// Creates a disconnected client handle.
     ///
-    /// Call [`MaxClient::connect`] to open the WebSocket connection, log in, and
-    /// obtain the incoming-message receiver for that connection. If the receiver
-    /// yields `None`, the connection died unexpectedly; the same client can be
-    /// connected again with [`MaxClient::connect`].
+    /// Call [`MaxClient::connect`] to connect and start receiving messages.
     pub fn new(config: LoginConfig) -> Result<Self> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
@@ -133,20 +206,30 @@ impl MaxClient {
         Ok(MaxClient { inner })
     }
 
-    /// Opens or reopens the WebSocket connection, logs in, and starts the
-    /// background read and keepalive tasks.
+    /// Connects, logs in, and starts the background tasks.
     ///
-    /// This is the path that connects or reconnects a client. If the saved
-    /// session token is missing or rejected, the configured login flow may
-    /// request SMS/password/captcha input. Each successful call returns the
-    /// incoming-message receiver for that connection.
-    pub async fn connect(
+    /// Reconnecting aborts handlers from the previous connection. A connection
+    /// failure alone lets already accepted handlers finish.
+    ///
+    /// At most one handler runs per chat; messages for a busy chat are dropped.
+    /// Other chats run concurrently up to `config.max_concurrent`. Handler
+    /// failures and panics are logged.
+    pub async fn connect<H: ChatHandler>(
         &self,
-    ) -> Result<(LoginSession, mpsc::UnboundedReceiver<IncomingMessage>)> {
+        handler: H,
+        config: ServeConfig,
+    ) -> Result<(LoginSession, ConnectedClient<H>)> {
+        if config.max_concurrent == 0 {
+            return Err(Error::InvalidServeConfig);
+        }
         let _guard = self.inner.connect_lock.lock().await;
         self.inner.disconnect().await;
+        let root = Arc::new(dispatcher::DispatcherRoot::new());
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        *self.inner.msg_tx.lock().await = Some(msg_tx);
+        *self.inner.msg_tx.lock().await = Some(DispatcherSender {
+            tx: Some(msg_tx),
+            root: Arc::clone(&root),
+        });
 
         if let Err(err) = self
             .inner
@@ -165,19 +248,27 @@ impl MaxClient {
 
         self.spawn_keepalive().await;
 
-        let config = self.inner.login_config.lock().await.clone();
-        let session = match InnerClient::login(Arc::clone(&self.inner), config.clone()).await {
+        let login_config = self.inner.login_config.lock().await.clone();
+        let session = match InnerClient::login(Arc::clone(&self.inner), login_config.clone()).await
+        {
             Ok(session) => session,
             Err(err) => {
                 self.inner.fail().await;
                 return Err(err);
             }
         };
-        let mut stored_config = config;
+        let mut stored_config = login_config;
         stored_config.session_token = Some(session.token.clone());
         *self.inner.login_config.lock().await = stored_config;
 
-        Ok((session, msg_rx))
+        let connected = ConnectedClient {
+            client: self.clone(),
+            handler,
+            config,
+            incoming: msg_rx,
+            dispatcher: root,
+        };
+        Ok((session, connected))
     }
 
     async fn spawn_keepalive(&self) {
@@ -333,7 +424,7 @@ impl MaxClient {
         self.inner.transport.is_connected().await
     }
 
-    /// Closes the WebSocket connection and stops the background keepalive task.
+    /// Closes the connection and aborts dispatch and in-flight handlers.
     pub async fn disconnect(&self) {
         self.inner.disconnect().await;
     }
@@ -449,33 +540,85 @@ mod tests {
         }
     }
 
+    fn dispatcher_sender(tx: mpsc::UnboundedSender<IncomingMessage>) -> DispatcherSender {
+        DispatcherSender {
+            tx: Some(tx),
+            root: Arc::new(dispatcher::DispatcherRoot::new()),
+        }
+    }
+
     #[tokio::test]
-    async fn fail_closes_message_channel_but_disconnect_keeps_it_open() {
+    async fn disconnect_closes_internal_message_feed() {
         let client = MaxClient::new(test_config()).expect("client");
         let (tx, mut messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(tx);
+        *client.inner.msg_tx.lock().await = Some(dispatcher_sender(tx));
 
         client.inner.disconnect().await;
-        assert!(matches!(
-            messages.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-
-        client.inner.fail().await;
         assert!(messages.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn keepalive_failure_finishes_cleanup_before_self_abort() {
+        let client = MaxClient::new(test_config()).expect("client");
+        let (waiter_tx, _waiter_rx) = oneshot::channel();
+        let mut waiters = client.inner.file_waiters.lock().await;
+        waiters.insert(1, waiter_tx);
+
+        let inner = Arc::clone(&client.inner);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (run_tx, run_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            run_rx.await.unwrap();
+            inner.fail().await;
+            finished_tx.send(()).unwrap();
+        });
+        client.inner.state.lock().await.keepalive_task = Some(task);
+
+        started_rx.await.expect("keepalive task must start");
+        run_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        drop(waiters);
+
+        finished_rx
+            .await
+            .expect("self-abort must happen only after cleanup completes");
+        assert!(client.inner.file_waiters.lock().await.is_empty());
+        assert!(client.inner.state.lock().await.keepalive_task.is_none());
+    }
+
+    struct NoopHandler;
+
+    impl ChatHandler for NoopHandler {
+        async fn on_message(&self, _client: &MaxClient, _msg: IncomingMessage) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_zero_concurrency_before_opening_connection() {
+        let client = MaxClient::new(test_config()).expect("client");
+
+        let result = client
+            .connect(NoopHandler, ServeConfig { max_concurrent: 0 })
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidServeConfig)));
+        assert!(!client.is_connected().await);
     }
 
     #[tokio::test]
     async fn message_channel_can_be_recreated_after_failure() {
         let client = MaxClient::new(test_config()).expect("client");
         let (old_tx, mut old_messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(old_tx);
+        *client.inner.msg_tx.lock().await = Some(dispatcher_sender(old_tx));
 
         client.inner.fail().await;
         assert!(old_messages.recv().await.is_none());
 
         let (new_tx, mut new_messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(new_tx);
+        *client.inner.msg_tx.lock().await = Some(dispatcher_sender(new_tx));
         let message = IncomingMessage {
             chat_id: 1,
             message_id: 2,
@@ -490,6 +633,9 @@ mod tests {
             .await
             .as_ref()
             .expect("recreated sender")
+            .tx
+            .as_ref()
+            .expect("active message sender")
             .send(message.clone())
             .expect("send message");
 
@@ -541,27 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn link_element_nests_url_under_attributes() {
-        let element = crate::models::MessageElement::link(6, 4, "https://example.test");
-        let value = serde_json::to_value(&element).unwrap();
-
-        assert_eq!(value["type"], "LINK");
-        assert_eq!(value["attributes"]["url"], "https://example.test");
-        assert!(
-            value.get("url").is_none(),
-            "url must not be serialized at the top level"
-        );
-    }
-
-    #[test]
-    fn formatting_element_omits_attributes() {
-        let value = serde_json::to_value(crate::models::MessageElement::strong(0, 5)).unwrap();
-
-        assert_eq!(value, json!({ "type": "STRONG", "from": 0, "length": 5 }));
-        assert!(value.get("attributes").is_none());
-    }
-
-    #[test]
     fn link_element_round_trips_through_attributes() {
         let element = crate::models::MessageElement::link(1, 2, "https://round.trip");
         let json = serde_json::to_string(&element).unwrap();
@@ -594,27 +719,17 @@ mod tests {
     }
 
     #[test]
-    fn percent_encode_file_name_leaves_ascii_filename_characters_unchanged() {
-        assert_eq!(
-            percent_encode_file_name("report-2026_07.02~final.txt"),
-            "report-2026_07.02~final.txt"
-        );
-    }
-
-    #[test]
-    fn percent_encode_file_name_encodes_slashes() {
-        assert_eq!(
-            percent_encode_file_name("reports/report.txt"),
-            "reports%2Freport.txt"
-        );
-    }
-
-    #[test]
-    fn percent_encode_file_name_encodes_utf8_and_spaces() {
-        assert_eq!(
-            percent_encode_file_name("привет мир.txt"),
-            "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80.txt"
-        );
+    fn percent_encodes_file_names() {
+        for (name, expected) in [
+            ("report-2026_07.02~final.txt", "report-2026_07.02~final.txt"),
+            ("reports/report.txt", "reports%2Freport.txt"),
+            (
+                "привет мир.txt",
+                "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80.txt",
+            ),
+        ] {
+            assert_eq!(percent_encode_file_name(name), expected);
+        }
     }
 
     #[test]

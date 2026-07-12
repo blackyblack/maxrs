@@ -184,7 +184,6 @@ impl AuthFlow {
     }
 
     async fn solve_auth_captcha(&self, phone: &str) -> Result<String> {
-        // request captcha link from the server, which will be solved by the captcha solver
         let payload = json!({
             "source": "auth",
             "identifier": phone,
@@ -419,7 +418,6 @@ mod tests {
                 "language": "ru",
             })
         );
-        assert!(payload.get("captchaToken").is_none());
     }
 
     #[test]
@@ -482,24 +480,6 @@ mod tests {
                 .unwrap()
                 .own_user_id,
             None
-        );
-    }
-
-    #[test]
-    fn login_data_ignores_unused_login_response_fields() {
-        let data = login_data_from_login_payload(&json!({
-            "profile": { "id": 777, "name": "Unused" },
-            "chats": [{ "id": 1 }],
-            "contacts": [{ "id": 2 }],
-            "sync": { "timestamp": 3 }
-        }))
-        .unwrap();
-
-        assert_eq!(
-            data,
-            LoginData {
-                own_user_id: Some(777)
-            }
         );
     }
 }

@@ -29,8 +29,7 @@ impl CaptchaSolverConfig {
         }
     }
 
-    /// Builds disabled configuration. Useful for making captcha support
-    /// explicitly optional in applications.
+    /// Builds disabled configuration.
     pub fn disabled() -> Self {
         Self::default()
     }
@@ -72,11 +71,7 @@ impl CaptchaSolver {
         self.config.solver_url.is_some()
     }
 
-    /// Starts solving `captcha_url` and waits for the callback token.
-    ///
-    /// This method gives the solver at most one hour total for the initial
-    /// `/solve` response and [`CaptchaSolver::handle_callback_json`] callback to
-    /// produce an `ok` or `failed` result for the generated challenge id.
+    /// Starts solving `captcha_url` and waits up to one hour for its callback.
     pub async fn solve(&self, captcha_url: &str) -> Result<String> {
         self.cleanup_expired().await;
 
@@ -148,10 +143,7 @@ impl CaptchaSolver {
         }
     }
 
-    /// Handles a solver callback `POST` body.
-    ///
-    /// Applications should expose an HTTP route at the configured callback URL
-    /// and pass the JSON request body to this method.
+    /// Handles a solver callback JSON body.
     pub async fn handle_callback_json(&self, body: &[u8]) -> Result<()> {
         let callback: CaptchaCallback = serde_json::from_slice(body)?;
         self.handle_callback(callback).await
@@ -218,35 +210,29 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn solve_request_serializes_solver_payload() {
-        let request = SolveRequest {
+    fn solve_request_serialization() {
+        let with_callback = SolveRequest {
             challenge_id: "id-1".into(),
             captcha_url: "https://id.vk.ru/not_robot_captcha".into(),
             callback_url: Some("https://max-login.example/captcha-callback".into()),
         };
 
-        let value = serde_json::to_value(request).unwrap();
         assert_eq!(
-            value,
+            serde_json::to_value(with_callback).unwrap(),
             json!({
                 "challengeId": "id-1",
                 "captchaUrl": "https://id.vk.ru/not_robot_captcha",
                 "callbackUrl": "https://max-login.example/captcha-callback",
             })
         );
-    }
-
-    #[test]
-    fn solve_request_omits_optional_callback_url() {
-        let request = SolveRequest {
+        let without_callback = SolveRequest {
             challenge_id: "id-1".into(),
             captcha_url: "https://id.vk.ru/not_robot_captcha".into(),
             callback_url: None,
         };
 
-        let value = serde_json::to_value(request).unwrap();
         assert_eq!(
-            value,
+            serde_json::to_value(without_callback).unwrap(),
             json!({
                 "challengeId": "id-1",
                 "captchaUrl": "https://id.vk.ru/not_robot_captcha",
