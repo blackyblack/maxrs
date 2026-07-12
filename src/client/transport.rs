@@ -26,11 +26,13 @@ pub(super) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
 
 pub(super) struct Transport {
+    send_order: Mutex<()>,
     sink: Mutex<Option<WsSink>>,
     state: Mutex<TransportState>,
 }
 
 struct TransportState {
+    next_seq: u32,
     pending: HashMap<u32, oneshot::Sender<Packet>>,
     read_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -38,8 +40,10 @@ struct TransportState {
 impl Transport {
     pub(super) fn new() -> Self {
         Self {
+            send_order: Mutex::new(()),
             sink: Mutex::new(None),
             state: Mutex::new(TransportState {
+                next_seq: 1,
                 pending: HashMap::new(),
                 read_task: None,
             }),
@@ -79,21 +83,45 @@ impl Transport {
         Ok(())
     }
 
-    pub(super) async fn invoke(&self, seq: u32, opcode: u16, payload: Value) -> Result<Packet> {
-        self.invoke_with_timeout(seq, opcode, payload, DEFAULT_TIMEOUT)
-            .await
+    pub(super) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
+        let send_guard = self.send_order.lock().await;
+        let seq = {
+            let mut state = self.state.lock().await;
+            let seq = state.next_seq;
+            state.next_seq = state.next_seq.wrapping_add(1);
+            seq
+        };
+        let rx = self.register_and_send(seq, opcode, payload).await?;
+        drop(send_guard);
+        self.await_response(seq, opcode, rx, DEFAULT_TIMEOUT).await
     }
 
-    async fn invoke_with_timeout(
+    #[cfg(test)]
+    async fn invoke_with_seq_and_timeout(
         &self,
         seq: u32,
         opcode: u16,
         payload: Value,
         timeout: Duration,
     ) -> Result<Packet> {
+        let send_guard = self.send_order.lock().await;
+        let rx = self.register_and_send(seq, opcode, payload).await?;
+        drop(send_guard);
+        self.await_response(seq, opcode, rx, timeout).await
+    }
+
+    async fn register_and_send(
+        &self,
+        seq: u32,
+        opcode: u16,
+        payload: Value,
+    ) -> Result<oneshot::Receiver<Packet>> {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
+            if state.pending.contains_key(&seq) {
+                return Err(Error::DuplicateSequence(seq));
+            }
             state.pending.insert(seq, tx);
         }
 
@@ -102,7 +130,16 @@ impl Transport {
             self.state.lock().await.pending.remove(&seq);
             return Err(err);
         }
+        Ok(rx)
+    }
 
+    async fn await_response(
+        &self,
+        seq: u32,
+        opcode: u16,
+        rx: oneshot::Receiver<Packet>,
+        timeout: Duration,
+    ) -> Result<Packet> {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
                 if response.cmd == CMD_ERROR {
@@ -150,7 +187,7 @@ impl Transport {
             if let Some(task) = state.read_task.take() {
                 task.abort();
             }
-            state.pending.drain().for_each(drop);
+            state.pending.clear();
         }
         self.sink.lock().await.take();
     }
@@ -215,7 +252,12 @@ mod tests {
             let transport = Arc::clone(&transport);
             async move {
                 transport
-                    .invoke(10, 100, json!({ "request": "first" }))
+                    .invoke_with_seq_and_timeout(
+                        10,
+                        100,
+                        json!({ "request": "first" }),
+                        DEFAULT_TIMEOUT,
+                    )
                     .await
             }
         });
@@ -223,7 +265,12 @@ mod tests {
             let transport = Arc::clone(&transport);
             async move {
                 transport
-                    .invoke(20, 200, json!({ "request": "second" }))
+                    .invoke_with_seq_and_timeout(
+                        20,
+                        200,
+                        json!({ "request": "second" }),
+                        DEFAULT_TIMEOUT,
+                    )
                     .await
             }
         });
@@ -248,11 +295,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_invokes_are_emitted_in_sequence_order() {
+        let (transport, mut server) = connected_transport().await;
+        let mut invokes = Vec::new();
+        for request in 0..4 {
+            invokes.push(tokio::spawn({
+                let transport = Arc::clone(&transport);
+                async move { transport.invoke(100, json!({ "request": request })).await }
+            }));
+        }
+
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            requests.push(next_request(&mut server).await);
+        }
+        assert_eq!(
+            requests.iter().map(|packet| packet.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+
+        for packet in requests.into_iter().rev() {
+            transport
+                .receive_response(Packet::response(packet.seq, packet.opcode, packet.payload))
+                .await;
+        }
+        for invoke in invokes {
+            invoke.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_in_flight_sequence_is_rejected_without_replacing_waiter() {
+        let (transport, mut server) = connected_transport().await;
+        let original = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(7, 70, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
+        });
+        next_request(&mut server).await;
+
+        let duplicate = transport
+            .invoke_with_seq_and_timeout(7, 71, Value::Null, DEFAULT_TIMEOUT)
+            .await;
+        assert!(matches!(duplicate, Err(Error::DuplicateSequence(7))));
+        assert_eq!(transport.state.lock().await.pending.len(), 1);
+
+        transport
+            .receive_response(Packet::response(7, 70, json!({ "original": true })))
+            .await;
+        assert_eq!(original.await.unwrap().unwrap().payload["original"], true);
+    }
+
+    #[tokio::test]
     async fn unknown_sequence_response_is_ignored() {
         let (transport, mut server) = connected_transport().await;
         let invoke = tokio::spawn({
             let transport = Arc::clone(&transport);
-            async move { transport.invoke(7, 70, Value::Null).await }
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(7, 70, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
         });
         next_request(&mut server).await;
 
@@ -272,11 +378,19 @@ mod tests {
         let (transport, mut server) = connected_transport().await;
         let first = tokio::spawn({
             let transport = Arc::clone(&transport);
-            async move { transport.invoke(1, 10, Value::Null).await }
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(1, 10, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
         });
         let second = tokio::spawn({
             let transport = Arc::clone(&transport);
-            async move { transport.invoke(2, 20, Value::Null).await }
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(2, 20, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
         });
         next_request(&mut server).await;
         next_request(&mut server).await;
@@ -297,13 +411,17 @@ mod tests {
             let transport = Arc::clone(&transport);
             async move {
                 transport
-                    .invoke_with_timeout(1, 10, Value::Null, Duration::from_millis(20))
+                    .invoke_with_seq_and_timeout(1, 10, Value::Null, Duration::from_millis(20))
                     .await
             }
         });
         let waiting = tokio::spawn({
             let transport = Arc::clone(&transport);
-            async move { transport.invoke(2, 20, Value::Null).await }
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(2, 20, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
         });
         next_request(&mut server).await;
         next_request(&mut server).await;

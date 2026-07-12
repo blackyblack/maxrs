@@ -67,6 +67,10 @@ pub enum Error {
     #[error("timed out waiting for response to opcode {0}")]
     Timeout(u16),
 
+    /// A request attempted to reuse a sequence number that is still in flight.
+    #[error("sequence number {0} is already in flight")]
+    DuplicateSequence(u32),
+
     /// The connection was closed while a request was in flight.
     #[error("connection closed")]
     ConnectionClosed,
