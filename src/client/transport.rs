@@ -119,6 +119,7 @@ impl Transport {
         let (tx, rx) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
+            state.pending.retain(|_, waiter| !waiter.is_closed());
             if state.pending.contains_key(&seq) {
                 return Err(Error::DuplicateSequence(seq));
             }
@@ -347,6 +348,44 @@ mod tests {
             .receive_response(Packet::response(7, 70, json!({ "original": true })))
             .await;
         assert_eq!(original.await.unwrap().unwrap().payload["original"], true);
+    }
+
+    #[tokio::test]
+    async fn registering_request_prunes_cancelled_waiters() {
+        let (transport, mut server) = connected_transport().await;
+        let cancelled = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(7, 70, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
+        });
+        next_request(&mut server).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(transport.state.lock().await.pending.contains_key(&7));
+
+        let replacement = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .invoke_with_seq_and_timeout(7, 71, Value::Null, DEFAULT_TIMEOUT)
+                    .await
+            }
+        });
+        let request = next_request(&mut server).await;
+        assert_eq!(request.seq, 7);
+        assert_eq!(request.opcode, 71);
+        assert_eq!(transport.state.lock().await.pending.len(), 1);
+
+        transport
+            .receive_response(Packet::response(7, 71, json!({ "replacement": true })))
+            .await;
+        assert_eq!(
+            replacement.await.unwrap().unwrap().payload["replacement"],
+            true
+        );
     }
 
     #[tokio::test]
