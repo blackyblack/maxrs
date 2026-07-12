@@ -1,11 +1,4 @@
-//! Low-level wire protocol: the JSON envelope and opcode constants.
-//!
-//! Every message exchanged with `wss://ws-api.oneme.ru/websocket` is a JSON
-//! object of the form:
-//!
-//! ```json
-//! {"ver": 11, "cmd": 0, "seq": 1, "opcode": 6, "payload": { ... }}
-//! ```
+//! JSON frame types and opcodes for the Max wire protocol.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,9 +14,6 @@ pub const CMD_RESPONSE: u8 = 1;
 pub const CMD_ERROR: u8 = 3;
 
 /// Operation codes used by this client.
-///
-/// The full list lives in PronikFire's Max-API-Guide; only the handful we need
-/// are mirrored here.
 pub mod opcode {
     pub const PING: u16 = 1;
     pub const RECONNECT: u16 = 3;

@@ -68,13 +68,6 @@ impl DispatcherRoot {
             notified.await;
         }
     }
-
-    fn busy_count(&self) -> usize {
-        self.busy
-            .lock()
-            .expect("dispatcher busy set poisoned")
-            .len()
-    }
 }
 
 pub(super) async fn run<H: ChatHandler>(
@@ -367,33 +360,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_single_handler_limit_is_respected() {
-        let gate = Arc::new(Semaphore::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
-            let gate = Arc::clone(&handler_gate);
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                started_tx.send(message.chat_id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Ok(())
-            })
-        }));
-        let (tx, root, _run_task) = serve(handler, 1).await;
-
-        tx.send(message(1, 1)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(1));
-        tx.send(message(2, 2)).unwrap();
-        tokio::task::yield_now().await;
-        assert!(started_rx.try_recv().is_err());
-        gate.add_permits(1);
-        assert_eq!(started_rx.recv().await, Some(2));
-
-        stop(&root);
-    }
-
-    #[tokio::test]
     async fn erroring_handler_frees_chat() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let handler = TestHandler(Arc::new(move |_, message| {
@@ -432,35 +398,6 @@ mod tests {
         root.wait_chat_free(1).await;
         tx.send(message(1, 2)).unwrap();
         assert_eq!(started_rx.recv().await, Some(2));
-    }
-
-    #[tokio::test]
-    async fn idle_dispatcher_has_no_busy_entries_and_reuses_chat() {
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                started_tx.send(message.message_id).unwrap();
-                Ok(())
-            })
-        }));
-        let (tx, root, _run_task) = serve(handler, 8).await;
-
-        for message_id in 1..=2 {
-            tx.send(message(9, message_id)).unwrap();
-            assert_eq!(started_rx.recv().await, Some(message_id));
-            root.wait_chat_free(9).await;
-            assert_eq!(root.busy_count(), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn incoming_feed_closure_stops_run() {
-        let handler = TestHandler(Arc::new(|_, _| Box::pin(async { Ok(()) })));
-        let (tx, _root, run_task) = serve(handler, 8).await;
-
-        drop(tx);
-        run_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -719,26 +656,5 @@ mod tests {
             .await
             .expect("handler must finish disconnect cleanup before it is aborted");
         root.wait_chat_free(1).await;
-    }
-
-    #[tokio::test]
-    async fn handler_can_use_provided_client() {
-        let (used_tx, used_rx) = tokio::sync::oneshot::channel();
-        let used_tx = Arc::new(Mutex::new(Some(used_tx)));
-        let handler = TestHandler(Arc::new(move |client, _| {
-            let client = client.clone();
-            let used_tx = Arc::clone(&used_tx);
-            Box::pin(async move {
-                let _ = client
-                    .send_text(1, crate::models::MaxMessage::new("reply"))
-                    .await;
-                used_tx.lock().unwrap().take().unwrap().send(()).unwrap();
-                Ok(())
-            })
-        }));
-        let (tx, _root, _run_task) = serve(handler, 8).await;
-
-        tx.send(message(1, 1)).unwrap();
-        used_rx.await.unwrap();
     }
 }

@@ -1,28 +1,16 @@
 # maxrs
 
-`maxrs` is an unofficial asynchronous Rust client for the Max messenger.
-
-It supports SMS/session-token login, incoming messages, typing notifications,
-text messages, file upload, explicit reconnects, and optional captcha solving.
+`maxrs` is an unofficial asynchronous Rust client for the Max messenger. It
+supports SMS/session-token login, concurrent chat handlers, text and file
+messages, typing notifications, reconnects, and optional captcha solving.
 
 This project is not affiliated with Max or VK. The internal API can change
 without notice.
 
-## Features
+## Quick start
 
-- WebSocket login and explicit reconnects through `MaxClient::connect`
-- SMS authentication and saved session-token login
-- Captcha-free SMS auth by default, with optional `max_captcha_solver` fallback
-- Incoming message channel
-- Text messages, file messages, typing notifications, and keepalive pings
-
-## Prerequisites
-
-- Current stable Rust toolchain: <https://rustup.rs/>
-- Phone number that can receive a Max verification SMS
-- Optional captcha solver: [`blackyblack/max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver)
-
-## Installation
+Install the current stable Rust toolchain, copy `.env.template` to `.env`, then
+run:
 
 ```bash
 cargo run --example cli
@@ -30,8 +18,7 @@ cargo run --example cli
 
 ## Configuration
 
-The example CLI loads `.env` before reading the process environment. Copy
-`.env.template` to `.env` and fill only the values you need.
+The CLI loads `.env` before reading the process environment.
 
 - `.max_session_token`: optional saved token file. One token line; refreshed
   after SMS/password login.
@@ -50,12 +37,11 @@ The example CLI loads `.env` before reading the process environment. Copy
   `{port}`.
 - `RUST_LOG`: tracing filter. CLI default: `maxrs=info`.
 
-## Captcha Solver
+## Captcha solver
 
-SMS auth is attempted without captcha first.
-Max may still require captcha for some accounts or requests; in that case `maxrs`
-falls back to the optional solver. For a local solver running on the host, the
-defaults are enough:
+SMS auth starts without captcha and falls back to the optional
+[`max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver) when
+required. Empty values disable it:
 
 ```env
 MAX_SOLVER_URL=
@@ -63,8 +49,7 @@ MAX_CALLBACK_BIND=
 MAX_CALLBACK_URL_BASE=
 ```
 
-For a containerized solver, publish the solver ports and point callbacks back to
-the host:
+For a containerized solver, publish its ports and point callbacks to the host:
 
 ```env
 MAX_SOLVER_URL=http://127.0.0.1:3000
@@ -76,17 +61,7 @@ On Linux, Docker may need a `host-gateway` mapping for `host.docker.internal`.
 The solve API must be reachable from `maxrs`; the callback URL must be reachable
 from the solver.
 
-## Usage
-
-Run the CLI example after configuring the needed environment variables:
-
-```bash
-cargo run --example cli
-```
-
-The CLI logs in to Max and listens for incoming messages until Ctrl-C.
-
-## Protocol Notes
+## Protocol notes
 
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for protocol details.
 

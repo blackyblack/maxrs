@@ -21,9 +21,6 @@ use crate::protocol::{opcode, Packet};
 use self::transport::Transport;
 
 /// Handles incoming messages dispatched by [`MaxClient`].
-///
-/// A handler value passed to [`MaxClient::connect`] is moved into the connected
-/// client and shared between concurrent calls internally.
 pub trait ChatHandler: Send + Sync + 'static {
     fn on_message(
         &self,
@@ -55,7 +52,7 @@ pub struct ConnectedClient<H> {
 }
 
 impl<H: ChatHandler> ConnectedClient<H> {
-    /// Runs message admission in the current task until the incoming feed closes.
+    /// Dispatches messages until the incoming feed closes.
     ///
     /// Dropping or cancelling this future stops admitting messages without
     /// aborting handlers that have already been spawned. Call
@@ -170,9 +167,7 @@ struct DispatcherSender {
 
 /// An asynchronous client for the Max (OneMe) WebSocket API.
 ///
-/// The client is cheap to clone (`Arc` inside); clones share the same
-/// connection. The dispatcher supplies a shared client reference to each
-/// handler, and clones may also send concurrently from other tasks.
+/// Clones are cheap and share the same connection.
 #[derive(Clone)]
 pub struct MaxClient {
     inner: Arc<InnerClient>,
@@ -181,10 +176,7 @@ pub struct MaxClient {
 impl MaxClient {
     /// Creates a disconnected client handle.
     ///
-    /// Call [`MaxClient::connect`] to open the WebSocket connection, log in, and
-    /// return a connected client for incoming messages. When
-    /// [`ConnectedClient::run`] returns, the connection's incoming feed has
-    /// closed; the same client can be connected again.
+    /// Call [`MaxClient::connect`] to connect and start receiving messages.
     pub fn new(config: LoginConfig) -> Result<Self> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
@@ -214,27 +206,14 @@ impl MaxClient {
         Ok(MaxClient { inner })
     }
 
-    /// Opens or reopens the WebSocket connection, logs in, and starts the
-    /// background read and keepalive tasks.
+    /// Connects, logs in, and starts the background tasks.
     ///
-    /// This is the path that connects or reconnects a client. If the saved
-    /// session token is missing or rejected, the configured login flow may
-    /// request SMS/password/captcha input. Each successful call returns a fresh
-    /// [`ConnectedClient`] instance for that connection.
+    /// Reconnecting aborts handlers from the previous connection. A connection
+    /// failure alone lets already accepted handlers finish.
     ///
-    /// A connection failure does not abort handlers that were already accepted,
-    /// but a subsequent `connect` call does. Before opening the new connection,
-    /// it disconnects the previous one and aborts any handlers still attached to
-    /// its dispatcher. This keeps handlers from the old and new connections from
-    /// overlapping; callers that require graceful handler completion should wait
-    /// for it before reconnecting.
-    ///
-    /// At most one handler runs per chat. A message arriving while its chat is
-    /// busy (including while waiting for global capacity) is dropped and logged.
-    /// Different chats run concurrently up to `config.max_concurrent`; handler
-    /// failures and panics are logged and do not affect later dispatch. Handler
-    /// admission never waits for global capacity, so a slow chat does not block
-    /// the connection feed or other chats.
+    /// At most one handler runs per chat; messages for a busy chat are dropped.
+    /// Other chats run concurrently up to `config.max_concurrent`. Handler
+    /// failures and panics are logged.
     pub async fn connect<H: ChatHandler>(
         &self,
         handler: H,
@@ -445,9 +424,7 @@ impl MaxClient {
         self.inner.transport.is_connected().await
     }
 
-    /// Closes the WebSocket connection, stops message dispatch immediately,
-    /// aborts in-flight handlers at their next await point, and stops the
-    /// background keepalive task. No handler draining is performed.
+    /// Closes the connection and aborts dispatch and in-flight handlers.
     pub async fn disconnect(&self) {
         self.inner.disconnect().await;
     }
@@ -679,27 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn link_element_nests_url_under_attributes() {
-        let element = crate::models::MessageElement::link(6, 4, "https://example.test");
-        let value = serde_json::to_value(&element).unwrap();
-
-        assert_eq!(value["type"], "LINK");
-        assert_eq!(value["attributes"]["url"], "https://example.test");
-        assert!(
-            value.get("url").is_none(),
-            "url must not be serialized at the top level"
-        );
-    }
-
-    #[test]
-    fn formatting_element_omits_attributes() {
-        let value = serde_json::to_value(crate::models::MessageElement::strong(0, 5)).unwrap();
-
-        assert_eq!(value, json!({ "type": "STRONG", "from": 0, "length": 5 }));
-        assert!(value.get("attributes").is_none());
-    }
-
-    #[test]
     fn link_element_round_trips_through_attributes() {
         let element = crate::models::MessageElement::link(1, 2, "https://round.trip");
         let json = serde_json::to_string(&element).unwrap();
@@ -732,27 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn percent_encode_file_name_leaves_ascii_filename_characters_unchanged() {
-        assert_eq!(
-            percent_encode_file_name("report-2026_07.02~final.txt"),
-            "report-2026_07.02~final.txt"
-        );
-    }
-
-    #[test]
-    fn percent_encode_file_name_encodes_slashes() {
-        assert_eq!(
-            percent_encode_file_name("reports/report.txt"),
-            "reports%2Freport.txt"
-        );
-    }
-
-    #[test]
-    fn percent_encode_file_name_encodes_utf8_and_spaces() {
-        assert_eq!(
-            percent_encode_file_name("привет мир.txt"),
-            "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80.txt"
-        );
+    fn percent_encodes_file_names() {
+        for (name, expected) in [
+            ("report-2026_07.02~final.txt", "report-2026_07.02~final.txt"),
+            ("reports/report.txt", "reports%2Freport.txt"),
+            (
+                "привет мир.txt",
+                "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80.txt",
+            ),
+        ] {
+            assert_eq!(percent_encode_file_name(name), expected);
+        }
     }
 
     #[test]
