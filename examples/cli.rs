@@ -15,7 +15,26 @@
 //! - `MAX_TELEGRAM_BOT_TOKEN` and `MAX_TELEGRAM_CHAT_ID`: required for Telegram.
 
 use maxrs::auth::{LoginConfig, SESSION_TOKEN_FILE};
-use maxrs::client::MaxClient;
+use maxrs::client::{ChatHandler, MaxClient, ServeConfig};
+use maxrs::models::IncomingMessage;
+
+struct PrintHandler;
+
+impl ChatHandler for PrintHandler {
+    async fn on_message(
+        &self,
+        _client: &MaxClient,
+        msg: IncomingMessage,
+    ) -> Result<(), maxrs::error::Error> {
+        let text = if msg.text.trim().is_empty() {
+            "[non-text message]"
+        } else {
+            msg.text.trim()
+        };
+        println!("\n<< {text}");
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -37,28 +56,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let login_config = LoginConfig::from_env()?;
     let client = MaxClient::new(login_config)?;
-    let (session, mut messages) = client.connect().await?;
+    let (session, connected) = client.connect(PrintHandler, ServeConfig::default()).await?;
     println!("Logged in. Session token is stored in {SESSION_TOKEN_FILE} when refreshed.");
     tracing::debug!(token = %session.token, "logged in to Max");
     println!("Listening for incoming messages (Ctrl-C to quit)...");
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            msg = messages.recv() => {
-                let Some(msg) = msg else {
-                    tracing::warn!("incoming message stream closed");
-                    break;
-                };
-                let text = if msg.text.trim().is_empty() {
-                    "[non-text message]"
-                } else {
-                    msg.text.trim()
-                };
-                println!("\n<< {text}");
-            }
+    let run = connected.run();
+    tokio::pin!(run);
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = &mut run => {
+            tracing::warn!("connection closed");
         }
     }
+    client.disconnect().await;
 
     Ok(())
 }

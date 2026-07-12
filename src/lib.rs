@@ -5,20 +5,28 @@
 //!
 //! ```no_run
 //! use maxrs::auth::LoginConfig;
-//! use maxrs::client::MaxClient;
-//! use maxrs::models::MaxMessage;
+//! use maxrs::client::{ChatHandler, MaxClient, ServeConfig};
+//! use maxrs::models::{IncomingMessage, MaxMessage};
+//!
+//! struct Handler;
+//!
+//! impl ChatHandler for Handler {
+//!     async fn on_message(
+//!         &self,
+//!         client: &MaxClient,
+//!         msg: IncomingMessage,
+//!     ) -> Result<(), maxrs::error::Error> {
+//!         println!("[{}] {}", msg.chat_id, msg.text);
+//!         client.send_text(msg.chat_id, MaxMessage::new("Received")).await
+//!     }
+//! }
 //!
 //! # async fn run() -> maxrs::error::Result<()> {
 //! let client = MaxClient::new(LoginConfig::from_env()?)?;
-//! let (session, mut messages) = client.connect().await?;
-//!
-//! tokio::spawn(async move {
-//!     while let Some(msg) = messages.recv().await {
-//!         println!("[{}] {}", msg.chat_id, msg.text);
-//!     }
-//! });
+//! let (session, connected) = client.connect(Handler, ServeConfig::default()).await?;
 //!
 //! client.send_text(123, MaxMessage::new("Hello from Rust!")).await?;
+//! connected.run().await;
 //! # let _ = session;
 //! # Ok(())
 //! # }

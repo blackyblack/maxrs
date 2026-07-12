@@ -61,7 +61,13 @@ async fn handle_server_request(inner: &Arc<InnerClient>, packet: Packet) {
                 );
                 let _ = inner.transport.send(&ack).await;
                 if !is_filtered_incoming_message(&message, inner.own_user_id().await) {
-                    if let Some(tx) = inner.msg_tx.lock().await.as_ref() {
+                    if let Some(tx) = inner
+                        .msg_tx
+                        .lock()
+                        .await
+                        .as_ref()
+                        .and_then(|dispatcher| dispatcher.tx.as_ref())
+                    {
                         let _ = tx.send(message);
                     }
                 }
