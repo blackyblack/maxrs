@@ -20,8 +20,28 @@ use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
 
+/// Which dispatch contour a message runs in.
+pub enum Lane {
+    /// Runs immediately, unbounded, never queued.
+    Fast,
+    /// Bounded by `ServeConfig.max_concurrent`; may wait for a slot.
+    Long,
+}
+
 /// Handles incoming messages dispatched by [`MaxClient`].
 pub trait ChatHandler: Send + Sync + 'static {
+    /// Classifies the message and sends any acknowledgment (e.g. "Downloading...")
+    /// BEFORE the message can be parked in the long lane, so a single message
+    /// covers both queue wait and execution. Async so the app can consult
+    /// caches (e.g. "is this file already downloaded?"). Default: `Lane::Long`.
+    fn accept(
+        &self,
+        _client: &MaxClient,
+        _msg: &IncomingMessage,
+    ) -> impl Future<Output = Result<Lane>> + Send {
+        async { Ok(Lane::Long) }
+    }
+
     fn on_message(
         &self,
         client: &MaxClient,
@@ -212,7 +232,8 @@ impl MaxClient {
     /// failure alone lets already accepted handlers finish.
     ///
     /// At most one handler runs per chat; messages for a busy chat are dropped.
-    /// Other chats run concurrently up to `config.max_concurrent`. Handler
+    /// Fast-lane handlers run immediately, unbounded. Long-lane handlers for
+    /// other chats run concurrently up to `config.max_concurrent`. Handler
     /// failures and panics are logged.
     pub async fn connect<H: ChatHandler>(
         &self,
