@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::models::IncomingMessage;
 
-use super::{ChatHandler, MaxClient, ServeConfig};
+use super::{ChatHandler, Lane, MaxClient, ServeConfig};
 
 pub(super) struct DispatcherRoot {
     shutdown: CancellationToken,
@@ -130,45 +130,53 @@ async fn run_handler<H: ChatHandler>(
     let message_id = message.message_id;
     let busy = BusyEntry { root, chat_id };
 
-    let permit = tokio::select! {
+    let lane = tokio::select! {
         biased;
-        _ = busy.root.shutdown.cancelled() => None,
-        permit = semaphore.acquire_owned() => permit.ok(),
-    };
-    let Some(permit) = permit else {
-        return;
+        _ = busy.root.shutdown.cancelled() => return,
+        result = handler.accept(&client, &message) => match result {
+            Ok(lane) => lane,
+            Err(err) => {
+                tracing::warn!(
+                    chat_id,
+                    message_id,
+                    %err,
+                    "message accept failed"
+                );
+                return;
+            }
+        },
     };
 
-    if busy.root.shutdown.is_cancelled() {
-        return;
-    }
-
-    let mut task = tokio::spawn(async move {
-        let _permit = permit;
-        handler.on_message(&client, message).await
-    });
+    let _permit = match lane {
+        Lane::Fast => None,
+        Lane::Long => {
+            let permit = tokio::select! {
+                biased;
+                _ = busy.root.shutdown.cancelled() => return,
+                permit = semaphore.acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            chat_id,
+                            message_id,
+                            "could not acquire semaphore permit for long lane message because semaphore was closed"
+                        );
+                        return;
+                    }
+                },
+            };
+            Some(permit)
+        }
+    };
 
     tokio::select! {
         biased;
-        _ = busy.root.shutdown.cancelled() => {
-            task.abort();
-            let _ = task.await;
+        _ = busy.root.shutdown.cancelled() => {}
+        result = handler.on_message(&client, message) => {
+            if let Err(err) = result {
+                tracing::warn!(chat_id, message_id, %err, "message handler failed");
+            }
         }
-        outcome = &mut task => match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => tracing::warn!(
-                chat_id,
-                message_id,
-                %err,
-                "message handler failed"
-            ),
-            Err(err) => tracing::warn!(
-                chat_id,
-                message_id,
-                %err,
-                "message handler task failed"
-            ),
-        },
     }
 }
 
@@ -185,14 +193,41 @@ mod tests {
 
     use super::*;
 
+    type AcceptFuture = Pin<Box<dyn Future<Output = Result<Lane>> + Send>>;
+    type AcceptCallback = dyn Fn(&MaxClient, &IncomingMessage) -> AcceptFuture + Send + Sync;
     type HandlerFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
     type HandlerCallback = dyn Fn(&MaxClient, IncomingMessage) -> HandlerFuture + Send + Sync;
 
-    struct TestHandler(Arc<HandlerCallback>);
+    struct TestHandler(Arc<AcceptCallback>, Arc<HandlerCallback>);
+
+    impl TestHandler {
+        fn new(on_message: Arc<HandlerCallback>) -> Self {
+            Self(
+                Arc::new(|_, _| Box::pin(async { Ok(Lane::Long) })),
+                on_message,
+            )
+        }
+
+        fn with_accept<F>(mut self, accept: F) -> Self
+        where
+            F: Fn(&MaxClient, &IncomingMessage) -> AcceptFuture + Send + Sync + 'static,
+        {
+            self.0 = Arc::new(accept);
+            self
+        }
+    }
 
     impl ChatHandler for TestHandler {
+        fn accept(
+            &self,
+            client: &MaxClient,
+            msg: &IncomingMessage,
+        ) -> impl Future<Output = Result<Lane>> + Send {
+            (self.0)(client, msg)
+        }
+
         async fn on_message(&self, client: &MaxClient, message: IncomingMessage) -> Result<()> {
-            (self.0)(client, message).await
+            (self.1)(client, message).await
         }
     }
 
@@ -268,7 +303,7 @@ mod tests {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -292,7 +327,7 @@ mod tests {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -321,48 +356,74 @@ mod tests {
     #[tokio::test]
     async fn concurrency_never_exceeds_configured_maximum() {
         let gate = Arc::new(Semaphore::new(0));
-        let running = Arc::new(AtomicUsize::new(0));
-        let high_water = Arc::new(AtomicUsize::new(0));
+        let long_running = Arc::new(AtomicUsize::new(0));
+        let long_high_water = Arc::new(AtomicUsize::new(0));
+        let fast_running = Arc::new(AtomicUsize::new(0));
         let handler_gate = Arc::clone(&gate);
-        let handler_high_water = Arc::clone(&high_water);
+        let handler_long_running = Arc::clone(&long_running);
+        let handler_long_high_water = Arc::clone(&long_high_water);
+        let handler_fast_running = Arc::clone(&fast_running);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
-            let running = Arc::clone(&running);
-            let high_water = Arc::clone(&handler_high_water);
+            let long_running = Arc::clone(&handler_long_running);
+            let long_high_water = Arc::clone(&handler_long_high_water);
+            let fast_running = Arc::clone(&handler_fast_running);
             let started_tx = started_tx.clone();
             Box::pin(async move {
-                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                high_water.fetch_max(now, Ordering::SeqCst);
-                started_tx.send(message.chat_id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                running.fetch_sub(1, Ordering::SeqCst);
+                if message.message_id == 0 {
+                    let now = fast_running.fetch_add(1, Ordering::SeqCst) + 1;
+                    started_tx.send((message.chat_id, now)).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    fast_running.fetch_sub(1, Ordering::SeqCst);
+                } else {
+                    let now = long_running.fetch_add(1, Ordering::SeqCst) + 1;
+                    long_high_water.fetch_max(now, Ordering::SeqCst);
+                    started_tx.send((message.chat_id, now)).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    long_running.fetch_sub(1, Ordering::SeqCst);
+                }
                 Ok(())
             })
-        }));
-        let observed_high_water = Arc::clone(&high_water);
+        }))
+        .with_accept(|_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
+            if message.message_id == 0 {
+                Box::pin(async { Ok(Lane::Fast) })
+            } else {
+                Box::pin(async { Ok(Lane::Long) })
+            }
+        });
+        let observed_long_high_water = Arc::clone(&long_high_water);
         let (tx, root, _run_task) = serve(handler, 2).await;
 
-        for chat_id in 1..=5 {
-            tx.send(message(chat_id, chat_id)).unwrap();
-        }
-        started_rx.recv().await.unwrap();
-        started_rx.recv().await.unwrap();
-        assert_eq!(observed_high_water.load(Ordering::SeqCst), 2);
-        gate.add_permits(5);
-        for _ in 0..3 {
+        // Two long-lane chats plus three fast-lane chats.
+        tx.send(message(1, 1)).unwrap();
+        tx.send(message(2, 2)).unwrap();
+        tx.send(message(3, 0)).unwrap();
+        tx.send(message(4, 0)).unwrap();
+        tx.send(message(5, 0)).unwrap();
+
+        // Wait for all five handlers to start.
+        for _ in 0..5 {
             started_rx.recv().await.unwrap();
         }
+
+        // Fast lane runs unbounded alongside the long lane.
+        assert_eq!(fast_running.load(Ordering::SeqCst), 3);
+        // Long lane is still capped by max_concurrent.
+        assert_eq!(observed_long_high_water.load(Ordering::SeqCst), 2);
+
+        gate.add_permits(5);
         for chat_id in 1..=5 {
             root.wait_chat_free(chat_id).await;
         }
-        assert_eq!(observed_high_water.load(Ordering::SeqCst), 2);
+        assert_eq!(observed_long_high_water.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn erroring_handler_frees_chat() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
@@ -381,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn panicking_handler_frees_chat() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
@@ -407,7 +468,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -442,7 +503,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler(Arc::new(move |_, _| {
+        let handler = TestHandler::new(Arc::new(move |_, _| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -481,7 +542,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -530,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_after_connection_failure_still_aborts_handler() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
@@ -568,7 +629,7 @@ mod tests {
     async fn disconnect_stops_run_aborts_handler_and_rejects_new_messages() {
         let gate = Arc::new(Semaphore::new(0));
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -607,7 +668,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler(Arc::new(move |client, _| {
+        let handler = TestHandler::new(Arc::new(move |client, _| {
             let client = client.clone();
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -656,5 +717,284 @@ mod tests {
             .await
             .expect("handler must finish disconnect cleanup before it is aborted");
         root.wait_chat_free(1).await;
+    }
+
+    #[tokio::test]
+    async fn fast_lane_runs_when_long_lane_is_saturated() {
+        let gate = Arc::new(Semaphore::new(0));
+        let handler_gate = Arc::clone(&gate);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = TestHandler::new(Arc::new(move |_, message| {
+            let gate = Arc::clone(&handler_gate);
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(message.chat_id).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(())
+            })
+        }))
+        .with_accept(|_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
+            if message.chat_id == 2 {
+                Box::pin(async { Ok(Lane::Fast) })
+            } else {
+                Box::pin(async { Ok(Lane::Long) })
+            }
+        });
+        let (tx, root, _run_task) = serve(handler, 1).await;
+
+        tx.send(message(1, 1)).unwrap();
+        assert_eq!(started_rx.recv().await, Some(1));
+
+        tx.send(message(2, 2)).unwrap();
+        assert_eq!(started_rx.recv().await, Some(2));
+
+        gate.add_permits(2);
+        root.wait_chat_free(1).await;
+        root.wait_chat_free(2).await;
+    }
+
+    #[tokio::test]
+    async fn long_lane_waits_for_permit_in_fifo_order() {
+        let gate = Arc::new(Semaphore::new(0));
+        let handler_gate = Arc::clone(&gate);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = TestHandler::new(Arc::new(move |_, message| {
+            let gate = Arc::clone(&handler_gate);
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(message.chat_id).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(())
+            })
+        }));
+        let (tx, root, _run_task) = serve(handler, 1).await;
+
+        tx.send(message(1, 1)).unwrap();
+        assert_eq!(started_rx.recv().await, Some(1));
+
+        tx.send(message(2, 2)).unwrap();
+        tx.send(message(3, 3)).unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(started_rx.try_recv().is_err());
+
+        gate.add_permits(1);
+        assert_eq!(started_rx.recv().await, Some(2));
+
+        gate.add_permits(1);
+        assert_eq!(started_rx.recv().await, Some(3));
+        gate.add_permits(1);
+
+        root.wait_chat_free(1).await;
+        root.wait_chat_free(2).await;
+        root.wait_chat_free(3).await;
+    }
+
+    #[tokio::test]
+    async fn accept_called_once_before_on_message() {
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let on_message_count = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+        let handler_accept_count = Arc::clone(&accept_count);
+        let handler_on_message_count = Arc::clone(&on_message_count);
+        let handler_done_tx = Arc::clone(&done_tx);
+        let handler = TestHandler::new(Arc::new(move |_, _| {
+            handler_on_message_count.fetch_add(1, Ordering::SeqCst);
+            let done_tx = Arc::clone(&handler_done_tx);
+            Box::pin(async move {
+                done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                Ok(())
+            })
+        }))
+        .with_accept(move |_: &MaxClient, _: &IncomingMessage| -> AcceptFuture {
+            handler_accept_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Lane::Long) })
+        });
+        let (tx, root, _run_task) = serve(handler, 8).await;
+
+        tx.send(message(1, 1)).unwrap();
+        done_rx.await.unwrap();
+
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+        assert_eq!(on_message_count.load(Ordering::SeqCst), 1);
+        root.wait_chat_free(1).await;
+    }
+
+    #[tokio::test]
+    async fn erroring_accept_frees_chat_and_skips_on_message() {
+        let on_message_count = Arc::new(AtomicUsize::new(0));
+        let (accept_done_tx, accept_done_rx) = tokio::sync::oneshot::channel();
+        let accept_done_tx = Arc::new(Mutex::new(Some(accept_done_tx)));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler_on_message_count = Arc::clone(&on_message_count);
+        let handler_accept_done_tx = Arc::clone(&accept_done_tx);
+        let handler = TestHandler::new(Arc::new(move |_, _| {
+            handler_on_message_count.fetch_add(1, Ordering::SeqCst);
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(()).unwrap();
+                Ok(())
+            })
+        }))
+        .with_accept(move |_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
+            if message.message_id == 1 {
+                let done_tx = Arc::clone(&handler_accept_done_tx);
+                Box::pin(async move {
+                    done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    Err(Error::UnexpectedResponse("accept error".into()))
+                })
+            } else {
+                Box::pin(async { Ok(Lane::Long) })
+            }
+        });
+        let (tx, root, _run_task) = serve(handler, 8).await;
+
+        tx.send(message(1, 1)).unwrap();
+        accept_done_rx.await.unwrap();
+        root.wait_chat_free(1).await;
+
+        tx.send(message(1, 2)).unwrap();
+        started_rx.recv().await.unwrap();
+        root.wait_chat_free(1).await;
+
+        assert_eq!(on_message_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn panicking_accept_frees_chat_and_skips_on_message() {
+        let on_message_count = Arc::new(AtomicUsize::new(0));
+        let (accept_done_tx, accept_done_rx) = tokio::sync::oneshot::channel();
+        let accept_done_tx = Arc::new(Mutex::new(Some(accept_done_tx)));
+        let handler_on_message_count = Arc::clone(&on_message_count);
+        let handler_accept_done_tx = Arc::clone(&accept_done_tx);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = TestHandler::new(Arc::new(move |_, _| {
+            handler_on_message_count.fetch_add(1, Ordering::SeqCst);
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(()).unwrap();
+                Ok(())
+            })
+        }))
+        .with_accept(move |_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
+            if message.message_id == 1 {
+                let done_tx = Arc::clone(&handler_accept_done_tx);
+                Box::pin(async move {
+                    done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    panic!("expected accept panic");
+                })
+            } else {
+                Box::pin(async { Ok(Lane::Long) })
+            }
+        });
+        let (tx, root, _run_task) = serve(handler, 8).await;
+
+        tx.send(message(1, 1)).unwrap();
+        accept_done_rx.await.unwrap();
+        root.wait_chat_free(1).await;
+
+        tx.send(message(1, 2)).unwrap();
+        started_rx.recv().await.unwrap();
+        root.wait_chat_free(1).await;
+
+        assert_eq!(on_message_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn busy_message_dropped_while_chat_waits_in_long_lane() {
+        let gate = Arc::new(Semaphore::new(0));
+        let handler_gate = Arc::clone(&gate);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = TestHandler::new(Arc::new(move |_, message| {
+            let gate = Arc::clone(&handler_gate);
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(message.message_id).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(())
+            })
+        }));
+        let (tx, root, _run_task) = serve(handler, 1).await;
+
+        tx.send(message(1, 1)).unwrap();
+        assert_eq!(started_rx.recv().await, Some(1));
+
+        tx.send(message(1, 2)).unwrap();
+        tx.send(message(2, 3)).unwrap();
+        tx.send(message(2, 4)).unwrap();
+
+        gate.add_permits(1);
+        assert_eq!(started_rx.recv().await, Some(3));
+        gate.add_permits(1);
+        root.wait_chat_free(2).await;
+
+        tx.send(message(2, 5)).unwrap();
+        assert_eq!(started_rx.recv().await, Some(5));
+        gate.add_permits(1);
+
+        root.wait_chat_free(1).await;
+        root.wait_chat_free(2).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_accept_aborts_cleanly() {
+        let accept_gate = Arc::new(Semaphore::new(0));
+        let handler_accept_gate = Arc::clone(&accept_gate);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = TestHandler::new(Arc::new(move |_, message| {
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(message.message_id).unwrap();
+                Ok(())
+            })
+        }))
+        .with_accept(move |_: &MaxClient, _: &IncomingMessage| -> AcceptFuture {
+            let gate = Arc::clone(&handler_accept_gate);
+            Box::pin(async move {
+                gate.acquire().await.unwrap().forget();
+                Ok(Lane::Long)
+            })
+        });
+        let (tx, root, run_task) = serve(handler, 8).await;
+
+        tx.send(message(1, 1)).unwrap();
+        tokio::task::yield_now().await;
+
+        stop(&root);
+        run_task.await.unwrap();
+        root.wait_chat_free(1).await;
+
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_while_parked_in_long_lane_aborts_cleanly() {
+        let gate = Arc::new(Semaphore::new(0));
+        let handler_gate = Arc::clone(&gate);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = TestHandler::new(Arc::new(move |_, message| {
+            let gate = Arc::clone(&handler_gate);
+            let started_tx = started_tx.clone();
+            Box::pin(async move {
+                started_tx.send(message.chat_id).unwrap();
+                gate.acquire().await.unwrap().forget();
+                Ok(())
+            })
+        }));
+        let (tx, root, run_task) = serve(handler, 1).await;
+
+        tx.send(message(1, 1)).unwrap();
+        assert_eq!(started_rx.recv().await, Some(1));
+
+        tx.send(message(2, 2)).unwrap();
+        tokio::task::yield_now().await;
+
+        stop(&root);
+        run_task.await.unwrap();
+        root.wait_chat_free(1).await;
+        root.wait_chat_free(2).await;
+
+        assert!(started_rx.try_recv().is_err());
     }
 }
