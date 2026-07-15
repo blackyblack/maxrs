@@ -30,17 +30,23 @@ pub enum Lane {
 
 /// Handles incoming messages dispatched by [`MaxClient`].
 pub trait ChatHandler: Send + Sync + 'static {
-    /// Classifies the message and sends any acknowledgment (e.g. "Searching…")
+    /// Classifies the message and sends any acknowledgment (e.g. "Downloading...")
     /// BEFORE the message can be parked in the long lane, so a single message
     /// covers both queue wait and execution. Async so the app can consult
-    /// caches (e.g. "is this book already downloaded?"). Default: `Lane::Long`.
-    fn accept(&self, _client: &MaxClient, _msg: &IncomingMessage)
-        -> impl Future<Output = Result<Lane>> + Send {
+    /// caches (e.g. "is this file already downloaded?"). Default: `Lane::Long`.
+    fn accept(
+        &self,
+        _client: &MaxClient,
+        _msg: &IncomingMessage,
+    ) -> impl Future<Output = Result<Lane>> + Send {
         async { Ok(Lane::Long) }
     }
 
-    fn on_message(&self, client: &MaxClient, msg: IncomingMessage)
-        -> impl Future<Output = Result<()>> + Send;
+    fn on_message(
+        &self,
+        client: &MaxClient,
+        msg: IncomingMessage,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Controls incoming-message dispatch for one connection.

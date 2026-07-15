@@ -837,17 +837,19 @@ mod tests {
                 Ok(())
             })
         }))
-        .with_accept(move |_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
-            if message.message_id == 1 {
-                let done_tx = Arc::clone(&handler_accept_done_tx);
-                Box::pin(async move {
-                    done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
-                    Err(Error::UnexpectedResponse("accept error".into()))
-                })
-            } else {
-                Box::pin(async { Ok(Lane::Long) })
-            }
-        });
+        .with_accept(
+            move |_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
+                if message.message_id == 1 {
+                    let done_tx = Arc::clone(&handler_accept_done_tx);
+                    Box::pin(async move {
+                        done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                        Err(Error::UnexpectedResponse("accept error".into()))
+                    })
+                } else {
+                    Box::pin(async { Ok(Lane::Long) })
+                }
+            },
+        );
         let (tx, root, _run_task) = serve(handler, 8).await;
 
         tx.send(message(1, 1)).unwrap();
@@ -877,17 +879,19 @@ mod tests {
                 Ok(())
             })
         }))
-        .with_accept(move |_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
-            if message.message_id == 1 {
-                let done_tx = Arc::clone(&handler_accept_done_tx);
-                Box::pin(async move {
-                    done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
-                    panic!("expected accept panic");
-                })
-            } else {
-                Box::pin(async { Ok(Lane::Long) })
-            }
-        });
+        .with_accept(
+            move |_: &MaxClient, message: &IncomingMessage| -> AcceptFuture {
+                if message.message_id == 1 {
+                    let done_tx = Arc::clone(&handler_accept_done_tx);
+                    Box::pin(async move {
+                        done_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                        panic!("expected accept panic");
+                    })
+                } else {
+                    Box::pin(async { Ok(Lane::Long) })
+                }
+            },
+        );
         let (tx, root, _run_task) = serve(handler, 8).await;
 
         tx.send(message(1, 1)).unwrap();
