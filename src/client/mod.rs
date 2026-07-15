@@ -57,6 +57,7 @@ impl LongLane {
 
 /// Permit for the bounded long-task lane. Releases the slot on drop.
 #[allow(dead_code)]
+#[must_use = "holding the permit keeps the long-task slot reserved"]
 pub struct LongLanePermit(OwnedSemaphorePermit);
 
 /// Handles incoming messages dispatched by [`MaxClient`].
