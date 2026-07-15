@@ -79,7 +79,7 @@ pub(super) async fn run<H: ChatHandler>(
 ) {
     let handler = Arc::new(handler);
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
-    let lane = LongLane::new(semaphore, root.shutdown.clone());
+    let lane = LongLane::with_shutdown(semaphore, root.shutdown.clone());
 
     loop {
         let message = tokio::select! {
