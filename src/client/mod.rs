@@ -33,7 +33,21 @@ pub struct LongLane {
 }
 
 impl LongLane {
-    pub(crate) fn new(semaphore: Arc<Semaphore>, shutdown: CancellationToken) -> Self {
+    /// Creates a standalone long-task lane with the requested concurrency.
+    ///
+    /// The lane remains active until all its handles are dropped.
+    pub fn new(max_concurrent: usize) -> Self {
+        assert!(
+            max_concurrent > 0,
+            "max_concurrent must be greater than zero"
+        );
+        Self::with_shutdown(
+            Arc::new(Semaphore::new(max_concurrent)),
+            CancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn with_shutdown(semaphore: Arc<Semaphore>, shutdown: CancellationToken) -> Self {
         Self {
             semaphore,
             shutdown,
@@ -642,6 +656,21 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn public_long_lane_constructor_builds_a_bounded_lane() {
+        let lane = LongLane::new(1);
+        let permit = lane.enter().await.expect("first permit");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), lane.enter())
+                .await
+                .is_err()
+        );
+
+        drop(permit);
+        let _permit = lane.enter().await.expect("permit after release");
     }
 
     #[tokio::test]
