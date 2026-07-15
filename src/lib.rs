@@ -15,6 +15,7 @@
 //!         &self,
 //!         client: &MaxClient,
 //!         msg: IncomingMessage,
+//!         _lane: &maxrs::client::LongLane,
 //!     ) -> Result<(), maxrs::error::Error> {
 //!         println!("[{}] {}", msg.chat_id, msg.text);
 //!         client.send_text(msg.chat_id, MaxMessage::new("Received")).await

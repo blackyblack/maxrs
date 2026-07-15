@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::LoginConfig;
 use crate::error::{Error, Result};
@@ -20,32 +21,53 @@ use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
 
-/// Which dispatch contour a message runs in.
-pub enum Lane {
-    /// Runs immediately, unbounded, never queued.
-    Fast,
-    /// Bounded by `ServeConfig.max_concurrent`; may wait for a slot.
-    Long,
+/// Handle to the connection's bounded long-task lane.
+///
+/// Cheap to use; [`LongLane::enter`] parks in FIFO order until a slot frees.
+/// The intended pattern is to send an acknowledgment, then acquire a permit,
+/// then do the heavy work so one message covers both queue wait and execution.
+#[derive(Clone)]
+pub struct LongLane {
+    semaphore: Arc<Semaphore>,
+    shutdown: CancellationToken,
 }
+
+impl LongLane {
+    pub(crate) fn new(semaphore: Arc<Semaphore>, shutdown: CancellationToken) -> Self {
+        Self {
+            semaphore,
+            shutdown,
+        }
+    }
+
+    /// Waits for a long-task slot. Resolves to a permit that releases the
+    /// slot on drop, or `Err` if the connection is shutting down.
+    pub async fn enter(&self) -> Result<LongLanePermit> {
+        let semaphore = Arc::clone(&self.semaphore);
+        tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => Err(Error::ConnectionClosed),
+            result = semaphore.acquire_owned() => match result {
+                Ok(permit) => Ok(LongLanePermit(permit)),
+                Err(_) => Err(Error::ConnectionClosed),
+            },
+        }
+    }
+}
+
+/// Permit for the bounded long-task lane. Releases the slot on drop.
+#[allow(dead_code)]
+#[must_use = "holding the permit keeps the long-task slot reserved"]
+pub struct LongLanePermit(OwnedSemaphorePermit);
 
 /// Handles incoming messages dispatched by [`MaxClient`].
 pub trait ChatHandler: Send + Sync + 'static {
-    /// Classifies the message and sends any acknowledgment (e.g. "Downloading...")
-    /// BEFORE the message can be parked in the long lane, so a single message
-    /// covers both queue wait and execution. Async so the app can consult
-    /// caches (e.g. "is this file already downloaded?"). Default: `Lane::Long`.
-    fn accept(
-        &self,
-        _client: &MaxClient,
-        _msg: &IncomingMessage,
-    ) -> impl Future<Output = Result<Lane>> + Send {
-        async { Ok(Lane::Long) }
-    }
-
+    /// Called for each admitted incoming message.
     fn on_message(
         &self,
         client: &MaxClient,
         msg: IncomingMessage,
+        lane: &LongLane,
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -229,12 +251,12 @@ impl MaxClient {
     /// Connects, logs in, and starts the background tasks.
     ///
     /// Reconnecting aborts handlers from the previous connection. A connection
-    /// failure alone lets already accepted handlers finish.
+    /// failure alone lets already admitted handlers finish.
     ///
     /// At most one handler runs per chat; messages for a busy chat are dropped.
-    /// Fast-lane handlers run immediately, unbounded. Long-lane handlers for
-    /// other chats run concurrently up to `config.max_concurrent`. Handler
-    /// failures and panics are logged.
+    /// Handlers that never call [`LongLane::enter`] run immediately, unbounded.
+    /// Handlers that call [`LongLane::enter`] for different chats run concurrently
+    /// up to `config.max_concurrent`. Handler failures and panics are logged.
     pub async fn connect<H: ChatHandler>(
         &self,
         handler: H,
@@ -612,7 +634,12 @@ mod tests {
     struct NoopHandler;
 
     impl ChatHandler for NoopHandler {
-        async fn on_message(&self, _client: &MaxClient, _msg: IncomingMessage) -> Result<()> {
+        async fn on_message(
+            &self,
+            _client: &MaxClient,
+            _msg: IncomingMessage,
+            _lane: &LongLane,
+        ) -> Result<()> {
             Ok(())
         }
     }

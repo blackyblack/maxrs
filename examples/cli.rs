@@ -1,7 +1,7 @@
 //! Minimal interactive client. See the README for configuration.
 
 use maxrs::auth::{LoginConfig, SESSION_TOKEN_FILE};
-use maxrs::client::{ChatHandler, MaxClient, ServeConfig};
+use maxrs::client::{ChatHandler, LongLane, MaxClient, ServeConfig};
 use maxrs::models::IncomingMessage;
 
 struct PrintHandler;
@@ -11,6 +11,7 @@ impl ChatHandler for PrintHandler {
         &self,
         _client: &MaxClient,
         msg: IncomingMessage,
+        _lane: &LongLane,
     ) -> Result<(), maxrs::error::Error> {
         let text = if msg.text.trim().is_empty() {
             "[non-text message]"
