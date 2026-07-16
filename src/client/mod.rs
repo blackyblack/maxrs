@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::auth::LoginConfig;
 use crate::error::{Error, Result};
@@ -21,59 +20,6 @@ use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
 
-/// Handle to the connection's bounded long-task lane.
-///
-/// Cheap to use; [`LongLane::enter`] parks in FIFO order until a slot frees.
-/// The intended pattern is to send an acknowledgment, then acquire a permit,
-/// then do the heavy work so one message covers both queue wait and execution.
-#[derive(Clone)]
-pub struct LongLane {
-    semaphore: Arc<Semaphore>,
-    shutdown: CancellationToken,
-}
-
-impl LongLane {
-    /// Creates a standalone long-task lane with the requested concurrency.
-    ///
-    /// The lane remains active until all its handles are dropped.
-    pub fn new(max_concurrent: usize) -> Self {
-        assert!(
-            max_concurrent > 0,
-            "max_concurrent must be greater than zero"
-        );
-        Self::with_shutdown(
-            Arc::new(Semaphore::new(max_concurrent)),
-            CancellationToken::new(),
-        )
-    }
-
-    pub(crate) fn with_shutdown(semaphore: Arc<Semaphore>, shutdown: CancellationToken) -> Self {
-        Self {
-            semaphore,
-            shutdown,
-        }
-    }
-
-    /// Waits for a long-task slot. Resolves to a permit that releases the
-    /// slot on drop, or `Err` if the connection is shutting down.
-    pub async fn enter(&self) -> Result<LongLanePermit> {
-        let semaphore = Arc::clone(&self.semaphore);
-        tokio::select! {
-            biased;
-            _ = self.shutdown.cancelled() => Err(Error::ConnectionClosed),
-            result = semaphore.acquire_owned() => match result {
-                Ok(permit) => Ok(LongLanePermit(permit)),
-                Err(_) => Err(Error::ConnectionClosed),
-            },
-        }
-    }
-}
-
-/// Permit for the bounded long-task lane. Releases the slot on drop.
-#[allow(dead_code)]
-#[must_use = "holding the permit keeps the long-task slot reserved"]
-pub struct LongLanePermit(OwnedSemaphorePermit);
-
 /// Handles incoming messages dispatched by [`MaxClient`].
 pub trait ChatHandler: Send + Sync + 'static {
     /// Called for each admitted incoming message.
@@ -81,28 +27,13 @@ pub trait ChatHandler: Send + Sync + 'static {
         &self,
         client: &MaxClient,
         msg: IncomingMessage,
-        lane: &LongLane,
     ) -> impl Future<Output = Result<()>> + Send;
-}
-
-/// Controls incoming-message dispatch for one connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServeConfig {
-    /// Maximum number of handlers running across different chats.
-    pub max_concurrent: usize,
-}
-
-impl Default for ServeConfig {
-    fn default() -> Self {
-        Self { max_concurrent: 8 }
-    }
 }
 
 /// A connected client ready to dispatch incoming messages.
 pub struct ConnectedClient<H> {
     client: MaxClient,
     handler: H,
-    config: ServeConfig,
     incoming: mpsc::UnboundedReceiver<IncomingMessage>,
     dispatcher: Arc<dispatcher::DispatcherRoot>,
 }
@@ -114,14 +45,7 @@ impl<H: ChatHandler> ConnectedClient<H> {
     /// aborting handlers that have already been spawned. Call
     /// [`MaxClient::disconnect`] to abort in-flight handlers.
     pub async fn run(self) {
-        dispatcher::run(
-            self.dispatcher,
-            self.client,
-            self.handler,
-            self.config,
-            self.incoming,
-        )
-        .await;
+        dispatcher::run(self.dispatcher, self.client, self.handler, self.incoming).await;
     }
 }
 
@@ -268,17 +192,11 @@ impl MaxClient {
     /// failure alone lets already admitted handlers finish.
     ///
     /// At most one handler runs per chat; messages for a busy chat are dropped.
-    /// Handlers that never call [`LongLane::enter`] run immediately, unbounded.
-    /// Handlers that call [`LongLane::enter`] for different chats run concurrently
-    /// up to `config.max_concurrent`. Handler failures and panics are logged.
+    /// Other chats run concurrently. Handler failures and panics are logged.
     pub async fn connect<H: ChatHandler>(
         &self,
         handler: H,
-        config: ServeConfig,
     ) -> Result<(LoginSession, ConnectedClient<H>)> {
-        if config.max_concurrent == 0 {
-            return Err(Error::InvalidServeConfig);
-        }
         let _guard = self.inner.connect_lock.lock().await;
         self.inner.disconnect().await;
         let root = Arc::new(dispatcher::DispatcherRoot::new());
@@ -321,7 +239,6 @@ impl MaxClient {
         let connected = ConnectedClient {
             client: self.clone(),
             handler,
-            config,
             incoming: msg_rx,
             dispatcher: root,
         };
@@ -643,46 +560,6 @@ mod tests {
             .expect("self-abort must happen only after cleanup completes");
         assert!(client.inner.file_waiters.lock().await.is_empty());
         assert!(client.inner.state.lock().await.keepalive_task.is_none());
-    }
-
-    struct NoopHandler;
-
-    impl ChatHandler for NoopHandler {
-        async fn on_message(
-            &self,
-            _client: &MaxClient,
-            _msg: IncomingMessage,
-            _lane: &LongLane,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn public_long_lane_constructor_builds_a_bounded_lane() {
-        let lane = LongLane::new(1);
-        let permit = lane.enter().await.expect("first permit");
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), lane.enter())
-                .await
-                .is_err()
-        );
-
-        drop(permit);
-        let _permit = lane.enter().await.expect("permit after release");
-    }
-
-    #[tokio::test]
-    async fn connect_rejects_zero_concurrency_before_opening_connection() {
-        let client = MaxClient::new(test_config()).expect("client");
-
-        let result = client
-            .connect(NoopHandler, ServeConfig { max_concurrent: 0 })
-            .await;
-
-        assert!(matches!(result, Err(Error::InvalidServeConfig)));
-        assert!(!client.is_connected().await);
     }
 
     #[tokio::test]

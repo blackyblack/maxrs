@@ -5,7 +5,7 @@
 //!
 //! ```no_run
 //! use maxrs::auth::LoginConfig;
-//! use maxrs::client::{ChatHandler, MaxClient, ServeConfig};
+//! use maxrs::client::{ChatHandler, MaxClient};
 //! use maxrs::models::{IncomingMessage, MaxMessage};
 //!
 //! struct Handler;
@@ -15,7 +15,6 @@
 //!         &self,
 //!         client: &MaxClient,
 //!         msg: IncomingMessage,
-//!         _lane: &maxrs::client::LongLane,
 //!     ) -> Result<(), maxrs::error::Error> {
 //!         println!("[{}] {}", msg.chat_id, msg.text);
 //!         client.send_text(msg.chat_id, MaxMessage::new("Received")).await
@@ -24,7 +23,7 @@
 //!
 //! # async fn run() -> maxrs::error::Result<()> {
 //! let client = MaxClient::new(LoginConfig::from_env()?)?;
-//! let (session, connected) = client.connect(Handler, ServeConfig::default()).await?;
+//! let (session, connected) = client.connect(Handler).await?;
 //!
 //! client.send_text(123, MaxMessage::new("Hello from Rust!")).await?;
 //! connected.run().await;

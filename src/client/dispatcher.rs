@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::Notify;
-use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::IncomingMessage;
 
-use super::{ChatHandler, LongLane, MaxClient, ServeConfig};
+use super::{ChatHandler, MaxClient};
 
 pub(super) struct DispatcherRoot {
     shutdown: CancellationToken,
@@ -74,12 +74,9 @@ pub(super) async fn run<H: ChatHandler>(
     root: Arc<DispatcherRoot>,
     client: MaxClient,
     handler: H,
-    config: ServeConfig,
     mut incoming: mpsc::UnboundedReceiver<IncomingMessage>,
 ) {
     let handler = Arc::new(handler);
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
-    let lane = LongLane::with_shutdown(semaphore, root.shutdown.clone());
 
     loop {
         let message = tokio::select! {
@@ -114,7 +111,6 @@ pub(super) async fn run<H: ChatHandler>(
             Arc::clone(&root),
             client.clone(),
             Arc::clone(&handler),
-            lane.clone(),
             message,
         ));
     }
@@ -124,7 +120,6 @@ async fn run_handler<H: ChatHandler>(
     root: Arc<DispatcherRoot>,
     client: MaxClient,
     handler: Arc<H>,
-    lane: LongLane,
     message: IncomingMessage,
 ) {
     let chat_id = message.chat_id;
@@ -134,7 +129,7 @@ async fn run_handler<H: ChatHandler>(
     tokio::select! {
         biased;
         _ = busy.root.shutdown.cancelled() => {}
-        result = handler.on_message(&client, message, &lane) => {
+        result = handler.on_message(&client, message) => {
             if let Err(err) = result {
                 tracing::warn!(chat_id, message_id, %err, "message handler failed");
             }
@@ -146,7 +141,6 @@ async fn run_handler<H: ChatHandler>(
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::Semaphore;
 
@@ -156,8 +150,7 @@ mod tests {
     use super::*;
 
     type HandlerFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-    type HandlerCallback =
-        dyn Fn(&MaxClient, IncomingMessage, LongLane) -> HandlerFuture + Send + Sync;
+    type HandlerCallback = dyn Fn(&MaxClient, IncomingMessage) -> HandlerFuture + Send + Sync;
 
     struct TestHandler(Arc<HandlerCallback>);
 
@@ -172,10 +165,8 @@ mod tests {
             &self,
             client: &MaxClient,
             message: IncomingMessage,
-            lane: &LongLane,
         ) -> impl Future<Output = Result<()>> + Send {
-            let lane = lane.clone();
-            (self.0)(client, message, lane)
+            (self.0)(client, message)
         }
     }
 
@@ -208,13 +199,11 @@ mod tests {
         root: Arc<DispatcherRoot>,
         client: MaxClient,
         handler: TestHandler,
-        config: ServeConfig,
         incoming: mpsc::UnboundedReceiver<IncomingMessage>,
     ) -> super::super::ConnectedClient<TestHandler> {
         super::super::ConnectedClient {
             client,
             handler,
-            config,
             incoming,
             dispatcher: root,
         }
@@ -222,7 +211,6 @@ mod tests {
 
     async fn serve(
         handler: TestHandler,
-        max_concurrent: usize,
     ) -> (
         mpsc::UnboundedSender<IncomingMessage>,
         Arc<DispatcherRoot>,
@@ -231,13 +219,7 @@ mod tests {
         let client = client();
         let root = Arc::new(DispatcherRoot::new());
         let (tx, rx) = mpsc::unbounded_channel();
-        let connected = connected(
-            Arc::clone(&root),
-            client,
-            handler,
-            ServeConfig { max_concurrent },
-            rx,
-        );
+        let connected = connected(Arc::clone(&root), client, handler, rx);
         let run_task = tokio::spawn(connected.run());
         (tx, root, run_task)
     }
@@ -251,7 +233,7 @@ mod tests {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -260,7 +242,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, _run_task) = serve(handler, 2).await;
+        let (tx, root, _run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -275,7 +257,7 @@ mod tests {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -286,7 +268,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, _run_task) = serve(handler, 8).await;
+        let (tx, root, _run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -302,78 +284,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrency_never_exceeds_configured_maximum() {
-        let gate = Arc::new(Semaphore::new(0));
-        let long_running = Arc::new(AtomicUsize::new(0));
-        let long_high_water = Arc::new(AtomicUsize::new(0));
-        let fast_running = Arc::new(AtomicUsize::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let handler_long_running = Arc::clone(&long_running);
-        let handler_long_high_water = Arc::clone(&long_high_water);
-        let handler_fast_running = Arc::clone(&fast_running);
+    async fn erroring_handler_frees_chat() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
-            let gate = Arc::clone(&handler_gate);
-            let long_running = Arc::clone(&handler_long_running);
-            let long_high_water = Arc::clone(&handler_long_high_water);
-            let fast_running = Arc::clone(&handler_fast_running);
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
-                if message.message_id == 0 {
-                    let now = fast_running.fetch_add(1, Ordering::SeqCst) + 1;
-                    started_tx.send((message.chat_id, now)).unwrap();
-                    gate.acquire().await.unwrap().forget();
-                    fast_running.fetch_sub(1, Ordering::SeqCst);
-                } else {
-                    let _permit = lane.enter().await?;
-                    let now = long_running.fetch_add(1, Ordering::SeqCst) + 1;
-                    long_high_water.fetch_max(now, Ordering::SeqCst);
-                    started_tx.send((message.chat_id, now)).unwrap();
-                    gate.acquire().await.unwrap().forget();
-                    long_running.fetch_sub(1, Ordering::SeqCst);
-                }
-                Ok(())
-            })
-        }));
-        let observed_long_high_water = Arc::clone(&long_high_water);
-        let (tx, root, _run_task) = serve(handler, 2).await;
-
-        // Two long-lane chats plus three fast-lane chats.
-        tx.send(message(1, 1)).unwrap();
-        tx.send(message(2, 2)).unwrap();
-        tx.send(message(3, 0)).unwrap();
-        tx.send(message(4, 0)).unwrap();
-        tx.send(message(5, 0)).unwrap();
-
-        // Wait for all five handlers to start.
-        for _ in 0..5 {
-            started_rx.recv().await.unwrap();
-        }
-
-        // Fast lane runs unbounded alongside the long lane.
-        assert_eq!(fast_running.load(Ordering::SeqCst), 3);
-        // Long lane is still capped by max_concurrent.
-        assert_eq!(observed_long_high_water.load(Ordering::SeqCst), 2);
-
-        gate.add_permits(5);
-        for chat_id in 1..=5 {
-            root.wait_chat_free(chat_id).await;
-        }
-        assert_eq!(observed_long_high_water.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn erroring_handler_releases_permit_and_frees_chat() {
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                let _permit = lane.enter().await?;
                 started_tx.send(message.message_id).unwrap();
                 Err(Error::UnexpectedResponse("expected test error".into()))
             })
         }));
-        let (tx, root, _run_task) = serve(handler, 1).await;
+        let (tx, root, _run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -383,12 +303,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panicking_handler_releases_permit_and_frees_chat() {
+    async fn panicking_handler_frees_chat() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
-                let _permit = lane.enter().await?;
                 started_tx.send(message.message_id).unwrap();
                 if message.message_id == 1 {
                     panic!("expected test panic");
@@ -396,7 +315,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, _run_task) = serve(handler, 1).await;
+        let (tx, root, _run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -412,7 +331,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |_, message, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -429,7 +348,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, run_task) = serve(handler, 8).await;
+        let (tx, root, run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -447,7 +366,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |_, _, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, _| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -464,7 +383,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, run_task) = serve(handler, 8).await;
+        let (tx, root, run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         started_rx.recv().await.unwrap();
@@ -486,7 +405,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |_, message, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -510,13 +429,7 @@ mod tests {
             tx: Some(tx.clone()),
             root: Arc::clone(&root),
         });
-        let connected = connected(
-            Arc::clone(&root),
-            client.clone(),
-            handler,
-            ServeConfig { max_concurrent: 8 },
-            rx,
-        );
+        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
         let run_task = tokio::spawn(connected.run());
 
         tx.send(message(2, 1)).unwrap();
@@ -535,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_after_connection_failure_still_aborts_handler() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
@@ -550,13 +463,7 @@ mod tests {
             tx: Some(tx.clone()),
             root: Arc::clone(&root),
         });
-        let connected = connected(
-            Arc::clone(&root),
-            client.clone(),
-            handler,
-            ServeConfig { max_concurrent: 8 },
-            rx,
-        );
+        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
         let run_task = tokio::spawn(connected.run());
 
         tx.send(message(3, 1)).unwrap();
@@ -573,7 +480,7 @@ mod tests {
     async fn disconnect_stops_run_aborts_handler_and_rejects_new_messages() {
         let gate = Arc::new(Semaphore::new(0));
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, _lane| {
+        let handler = TestHandler::new(Arc::new(move |_, message| {
             let gate = Arc::clone(&gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -589,13 +496,7 @@ mod tests {
             tx: Some(tx.clone()),
             root: Arc::clone(&root),
         });
-        let connected = connected(
-            Arc::clone(&root),
-            client.clone(),
-            handler,
-            ServeConfig { max_concurrent: 1 },
-            rx,
-        );
+        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
         let run_task = tokio::spawn(connected.run());
 
         tx.send(message(1, 1)).unwrap();
@@ -612,7 +513,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |client, _, _lane| {
+        let handler = TestHandler::new(Arc::new(move |client, _| {
             let client = client.clone();
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -636,13 +537,7 @@ mod tests {
             tx: Some(tx.clone()),
             root: Arc::clone(&root),
         });
-        let connected = connected(
-            Arc::clone(&root),
-            client.clone(),
-            handler,
-            ServeConfig { max_concurrent: 1 },
-            rx,
-        );
+        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
         let state_owner = client.clone();
         let state_guard = state_owner.inner.state.lock().await;
         let run_task = tokio::spawn(connected.run());
@@ -661,141 +556,5 @@ mod tests {
             .await
             .expect("handler must finish disconnect cleanup before it is aborted");
         root.wait_chat_free(1).await;
-    }
-
-    #[tokio::test]
-    async fn handler_without_enter_runs_when_lane_is_saturated() {
-        let gate = Arc::new(Semaphore::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
-            let gate = Arc::clone(&handler_gate);
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                started_tx.send(message.chat_id).unwrap();
-                if message.chat_id != 2 {
-                    let _permit = lane.enter().await?;
-                }
-                gate.acquire().await.unwrap().forget();
-                Ok(())
-            })
-        }));
-        let (tx, root, _run_task) = serve(handler, 1).await;
-
-        tx.send(message(1, 1)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(1));
-
-        tx.send(message(2, 2)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(2));
-
-        gate.add_permits(2);
-        root.wait_chat_free(1).await;
-        root.wait_chat_free(2).await;
-    }
-
-    #[tokio::test]
-    async fn long_lane_waits_for_permit_in_fifo_order() {
-        let gate = Arc::new(Semaphore::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
-            let gate = Arc::clone(&handler_gate);
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                let _permit = lane.enter().await?;
-                started_tx.send(message.chat_id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Ok(())
-            })
-        }));
-        let (tx, root, _run_task) = serve(handler, 1).await;
-
-        tx.send(message(1, 1)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(1));
-
-        tx.send(message(2, 2)).unwrap();
-        tx.send(message(3, 3)).unwrap();
-        tokio::task::yield_now().await;
-
-        assert!(started_rx.try_recv().is_err());
-
-        gate.add_permits(1);
-        assert_eq!(started_rx.recv().await, Some(2));
-
-        gate.add_permits(1);
-        assert_eq!(started_rx.recv().await, Some(3));
-        gate.add_permits(1);
-
-        root.wait_chat_free(1).await;
-        root.wait_chat_free(2).await;
-        root.wait_chat_free(3).await;
-    }
-
-    #[tokio::test]
-    async fn busy_message_dropped_while_chat_parked_in_enter() {
-        let gate = Arc::new(Semaphore::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
-            let gate = Arc::clone(&handler_gate);
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                let _permit = lane.enter().await?;
-                started_tx.send(message.message_id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Ok(())
-            })
-        }));
-        let (tx, root, _run_task) = serve(handler, 1).await;
-
-        tx.send(message(1, 1)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(1));
-
-        tx.send(message(1, 2)).unwrap();
-        tx.send(message(2, 3)).unwrap();
-        tx.send(message(2, 4)).unwrap();
-
-        gate.add_permits(1);
-        assert_eq!(started_rx.recv().await, Some(3));
-        gate.add_permits(1);
-        root.wait_chat_free(2).await;
-
-        tx.send(message(2, 5)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(5));
-        gate.add_permits(1);
-
-        root.wait_chat_free(1).await;
-        root.wait_chat_free(2).await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_while_parked_in_long_lane_aborts_cleanly() {
-        let gate = Arc::new(Semaphore::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message, lane| {
-            let gate = Arc::clone(&handler_gate);
-            let started_tx = started_tx.clone();
-            Box::pin(async move {
-                let _permit = lane.enter().await?;
-                started_tx.send(message.chat_id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                Ok(())
-            })
-        }));
-        let (tx, root, run_task) = serve(handler, 1).await;
-
-        tx.send(message(1, 1)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(1));
-
-        tx.send(message(2, 2)).unwrap();
-        tokio::task::yield_now().await;
-
-        stop(&root);
-        run_task.await.unwrap();
-        root.wait_chat_free(1).await;
-        root.wait_chat_free(2).await;
-
-        assert!(started_rx.try_recv().is_err());
     }
 }
