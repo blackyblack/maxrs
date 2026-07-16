@@ -75,10 +75,6 @@ pub enum Error {
     #[error("connection closed")]
     ConnectionClosed,
 
-    /// Message dispatch requires at least one global handler slot.
-    #[error("ServeConfig.max_concurrent must be greater than zero")]
-    InvalidServeConfig,
-
     /// A response payload was missing an expected field.
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),

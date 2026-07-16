@@ -1,7 +1,7 @@
 //! Minimal interactive client. See the README for configuration.
 
 use maxrs::auth::{LoginConfig, SESSION_TOKEN_FILE};
-use maxrs::client::{ChatHandler, LongLane, MaxClient, ServeConfig};
+use maxrs::client::{ChatHandler, MaxClient};
 use maxrs::models::IncomingMessage;
 
 struct PrintHandler;
@@ -11,7 +11,6 @@ impl ChatHandler for PrintHandler {
         &self,
         _client: &MaxClient,
         msg: IncomingMessage,
-        _lane: &LongLane,
     ) -> Result<(), maxrs::error::Error> {
         let text = if msg.text.trim().is_empty() {
             "[non-text message]"
@@ -43,7 +42,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let login_config = LoginConfig::from_env()?;
     let client = MaxClient::new(login_config)?;
-    let (session, connected) = client.connect(PrintHandler, ServeConfig::default()).await?;
+    let (session, connected) = client.connect(PrintHandler).await?;
     println!("Logged in. Session token is stored in {SESSION_TOKEN_FILE} when refreshed.");
     tracing::debug!(token = %session.token, "logged in to Max");
     println!("Listening for incoming messages (Ctrl-C to quit)...");
