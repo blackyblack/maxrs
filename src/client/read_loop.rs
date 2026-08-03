@@ -59,7 +59,7 @@ fn frame_text(
             close.code, close.reason
         )),
         Ok(Message::Close(None)) => {
-            Err("Max WebSocket peer closed the connection without a close frame".into())
+            Err("Max WebSocket peer closed the connection without close details".into())
         }
         Err(error) => Err(format!("Max WebSocket read failed: {error}")),
         Ok(_) => Ok(None),
