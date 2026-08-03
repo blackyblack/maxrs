@@ -56,6 +56,8 @@ impl Transport {
         header_user_agent: &str,
     ) -> Result<()> {
         self.close().await;
+        let next_seq = self.state.lock().await.next_seq;
+        tracing::info!(next_seq, url = WS_URL, "Opening Max WebSocket");
         let mut request = WS_URL.into_client_request()?;
         {
             let headers = request.headers_mut();
@@ -63,12 +65,17 @@ impl Transport {
             headers.insert("User-Agent", HeaderValue::from_str(header_user_agent)?);
         }
 
-        let (stream, _response) = connect_async(request).await?;
+        let (stream, response) = connect_async(request).await?;
         let (sink, read) = stream.split();
 
         *self.sink.lock().await = Some(sink);
         let task = tokio::spawn(read_loop(read, Arc::clone(owner)));
         self.state.lock().await.read_task = Some(task);
+        tracing::info!(
+            next_seq,
+            status = %response.status(),
+            "Max WebSocket opened"
+        );
         Ok(())
     }
 
