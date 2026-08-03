@@ -16,15 +16,18 @@ pub(super) async fn read_loop(
     mut read: futures_util::stream::SplitStream<WsStream>,
     inner: Arc<InnerClient>,
 ) {
-    while let Some(frame) = read.next().await {
-        let text = match frame {
-            Ok(Message::Text(text)) => text.to_string(),
-            Ok(Message::Binary(bin)) => match String::from_utf8(bin.to_vec()) {
-                Ok(text) => text,
-                Err(_) => continue,
-            },
-            Ok(Message::Close(_)) | Err(_) => break,
-            Ok(_) => continue,
+    loop {
+        let Some(frame) = read.next().await else {
+            tracing::warn!("Max WebSocket stream ended without a close frame");
+            break;
+        };
+        let text = match frame_text(frame) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(reason) => {
+                tracing::warn!(%reason, "Max WebSocket read loop stopped");
+                break;
+            }
         };
 
         let packet: Packet = match serde_json::from_str(&text) {
@@ -43,6 +46,24 @@ pub(super) async fn read_loop(
     }
 
     inner.fail().await;
+}
+
+fn frame_text(
+    frame: Result<Message, tokio_tungstenite::tungstenite::Error>,
+) -> Result<Option<String>, String> {
+    match frame {
+        Ok(Message::Text(text)) => Ok(Some(text.to_string())),
+        Ok(Message::Binary(bytes)) => Ok(String::from_utf8(bytes.to_vec()).ok()),
+        Ok(Message::Close(Some(close))) => Err(format!(
+            "Max WebSocket peer closed the connection: code={}, reason={}",
+            close.code, close.reason
+        )),
+        Ok(Message::Close(None)) => {
+            Err("Max WebSocket peer closed the connection without a close frame".into())
+        }
+        Err(error) => Err(format!("Max WebSocket read failed: {error}")),
+        Ok(_) => Ok(None),
+    }
 }
 
 async fn handle_server_request(inner: &Arc<InnerClient>, packet: Packet) {
@@ -112,6 +133,29 @@ fn is_security_service_message(message: &IncomingMessage) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+    #[test]
+    fn websocket_close_details_are_preserved_for_logging() {
+        let close = CloseFrame {
+            code: CloseCode::Away,
+            reason: "maintenance".into(),
+        };
+
+        assert_eq!(
+            frame_text(Ok(Message::Close(Some(close)))),
+            Err("Max WebSocket peer closed the connection: code=1001, reason=maintenance".into())
+        );
+    }
+
+    #[test]
+    fn websocket_read_errors_are_preserved_for_logging() {
+        assert_eq!(
+            frame_text(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)),
+            Err("Max WebSocket read failed: Connection closed normally".into())
+        );
+    }
 
     #[test]
     fn parses_incoming_notif_message() {

@@ -198,6 +198,12 @@ impl MaxClient {
         handler: H,
     ) -> Result<(LoginSession, ConnectedClient<H>)> {
         let _guard = self.inner.connect_lock.lock().await;
+        let has_session_token = self.inner.login_config.lock().await.session_token.is_some();
+        tracing::info!(
+            device_id = %self.inner.device_id,
+            has_session_token,
+            "Starting Max connection"
+        );
         self.inner.disconnect().await;
         let root = Arc::new(dispatcher::DispatcherRoot::new());
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
@@ -212,11 +218,23 @@ impl MaxClient {
             .connect(&self.inner, &self.inner.user_agent.header_user_agent)
             .await
         {
+            tracing::warn!(
+                device_id = %self.inner.device_id,
+                stage = "websocket",
+                %err,
+                "Max connection failed"
+            );
             self.inner.fail().await;
             return Err(err);
         }
 
         if let Err(err) = self.inner.session_init().await {
+            tracing::warn!(
+                device_id = %self.inner.device_id,
+                stage = "session_init",
+                %err,
+                "Max connection failed"
+            );
             self.inner.fail().await;
             return Err(err);
         }
@@ -228,6 +246,12 @@ impl MaxClient {
         {
             Ok(session) => session,
             Err(err) => {
+                tracing::warn!(
+                    device_id = %self.inner.device_id,
+                    stage = "login",
+                    %err,
+                    "Max connection failed"
+                );
                 self.inner.fail().await;
                 return Err(err);
             }
@@ -242,6 +266,7 @@ impl MaxClient {
             incoming: msg_rx,
             dispatcher: root,
         };
+        tracing::info!(device_id = %self.inner.device_id, "Max connection established");
         Ok((session, connected))
     }
 
