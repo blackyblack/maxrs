@@ -281,9 +281,7 @@ impl AuthFlow {
         });
         let response = self.inner.invoke(opcode::LOGIN, payload).await?;
         let login_data = login_data_from_login_payload(&response.payload)?;
-        if let Some(user_id) = login_data.own_user_id {
-            self.inner.set_own_user_id(user_id).await;
-        }
+        self.inner.set_own_user_id(login_data.own_user_id).await;
         Ok(LoginSession {
             token: token.to_string(),
             login_data,
@@ -320,25 +318,23 @@ fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
 
 #[derive(Debug, Deserialize)]
 struct LoginPayload {
-    #[serde(default)]
-    profile: Option<LoginProfile>,
-    #[serde(default, rename = "userId")]
-    user_id: Option<i64>,
+    profile: LoginProfile,
 }
 
 #[derive(Debug, Deserialize)]
 struct LoginProfile {
-    #[serde(default, alias = "userId", alias = "uid")]
-    id: Option<i64>,
+    contact: LoginContact,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginContact {
+    id: i64,
 }
 
 fn login_data_from_login_payload(payload: &Value) -> Result<LoginData> {
     let payload = serde_json::from_value::<LoginPayload>(payload.clone())?;
     Ok(LoginData {
-        own_user_id: payload
-            .profile
-            .and_then(|profile| profile.id)
-            .or(payload.user_id),
+        own_user_id: payload.profile.contact.id,
     })
 }
 
@@ -450,36 +446,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_login_data_from_profile_id() {
+    fn parses_login_data_from_profile_contact_id() {
         assert_eq!(
-            login_data_from_login_payload(&json!({ "profile": { "id": 777 } }))
-                .unwrap()
-                .own_user_id,
-            Some(777)
+            login_data_from_login_payload(&json!({
+                "profile": {
+                    "contact": { "id": 777 }
+                }
+            }))
+            .unwrap()
+            .own_user_id,
+            777
         );
-        assert_eq!(
-            login_data_from_login_payload(&json!({ "profile": { "userId": 778 } }))
-                .unwrap()
-                .own_user_id,
-            Some(778)
-        );
-        assert_eq!(
-            login_data_from_login_payload(&json!({ "profile": { "uid": 779 } }))
-                .unwrap()
-                .own_user_id,
-            Some(779)
-        );
-        assert_eq!(
-            login_data_from_login_payload(&json!({ "profile": {}, "userId": 780 }))
-                .unwrap()
-                .own_user_id,
-            Some(780)
-        );
-        assert_eq!(
-            login_data_from_login_payload(&json!({ "profile": {} }))
-                .unwrap()
-                .own_user_id,
-            None
-        );
+    }
+
+    #[test]
+    fn rejects_login_data_without_profile_contact_id() {
+        assert!(login_data_from_login_payload(&json!({ "profile": {} })).is_err());
     }
 }

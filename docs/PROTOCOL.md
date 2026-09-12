@@ -102,7 +102,8 @@ the server does not drop the connection.
    }
    ```
 
-   Response payload contains `profile`, `chats`, `contacts`, etc.
+   Response payload contains `profile`, `chats`, `contacts`, etc. The logged-in
+   account id is at `profile.contact.id`.
 
 Re-login on subsequent runs is just SESSION_INIT + LOGIN with the saved session
 token (no SMS).
@@ -112,7 +113,7 @@ token (no SMS).
 ```json
 {
   "chatId": 123456,
-  "message": { "text": "hello", "cid": -1700000000001, "type": "USER",
+  "message": { "text": "hello", "cid": -1700000000001,
                "elements": [], "attaches": [] },
   "notify": true
 }
@@ -156,7 +157,7 @@ top-level `url`); sending the url at the top level is rejected:
 1. Request an upload slot:
 
    ```json
-   { "count": 1 }
+   { "count": 1, "type": 0, "uploaderType": 0, "profile": false }
    ```
 
    Response:
@@ -181,7 +182,7 @@ top-level `url`); sending the url at the top level is rejected:
    ```json
    {
      "chatId": 123456,
-     "message": { "text": "caption", "cid": -1700000000002, "type": "USER", "elements": [],
+     "message": { "text": "caption", "cid": -1700000000002, "elements": [],
                   "attaches": [ { "_type": "FILE", "fileId": 987654 } ] },
      "notify": true
    }
