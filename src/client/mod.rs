@@ -357,7 +357,7 @@ impl MaxClient {
     ) -> Result<()> {
         let file_name = normalized_file_name(file_name);
         let response = self
-            .invoke(opcode::FILE_UPLOAD, json!({ "count": 1 }))
+            .invoke(opcode::FILE_UPLOAD, file_upload_payload())
             .await?;
         let info = response.payload["info"]
             .get(0)
@@ -466,7 +466,6 @@ fn text_message_payload(chat_id: i64, message: &MaxMessage, cid: i64) -> Value {
         "message": {
             "text": text,
             "cid": cid,
-            "type": "USER",
             "elements": elements,
             "attaches": [],
         },
@@ -480,11 +479,19 @@ fn file_message_payload(chat_id: i64, caption: &str, file_id: i64, cid: i64) -> 
         "message": {
             "text": caption,
             "cid": cid,
-            "type": "USER",
             "elements": [],
             "attaches": [{ "_type": "FILE", "fileId": file_id }],
         },
         "notify": true,
+    })
+}
+
+fn file_upload_payload() -> Value {
+    json!({
+        "count": 1,
+        "type": 0,
+        "uploaderType": 0,
+        "profile": false,
     })
 }
 
@@ -634,7 +641,7 @@ mod tests {
         assert_eq!(payload["chatId"], 295438091);
         assert_eq!(payload["message"]["text"], "hello");
         assert_eq!(payload["message"]["cid"], -1_700_000_000_001i64);
-        assert_eq!(payload["message"]["type"], "USER");
+        assert!(payload["message"].get("type").is_none());
         assert_eq!(payload["message"]["elements"], json!([]));
         assert_eq!(payload["message"]["attaches"], json!([]));
         assert_eq!(payload["notify"], true);
@@ -682,7 +689,7 @@ mod tests {
         assert_eq!(payload["chatId"], 295438091);
         assert_eq!(payload["message"]["text"], "caption");
         assert_eq!(payload["message"]["cid"], -1_700_000_000_003i64);
-        assert_eq!(payload["message"]["type"], "USER");
+        assert!(payload["message"].get("type").is_none());
         assert_eq!(payload["message"]["elements"], json!([]));
         assert_eq!(
             payload["message"]["attaches"],
@@ -721,6 +728,24 @@ mod tests {
         assert_eq!(
             payload["userAgent"]["headerUserAgent"],
             user_agent.header_user_agent
+        );
+        assert_eq!(payload["userAgent"]["appVersion"], "26.8.4");
+        assert_eq!(payload["userAgent"]["locale"], "ru");
+        assert_eq!(payload["userAgent"]["deviceLocale"], "ru");
+        assert_eq!(payload["userAgent"]["osVersion"], "Linux");
+        assert_eq!(payload["userAgent"]["deviceName"], "Chrome");
+    }
+
+    #[test]
+    fn file_upload_payload_matches_current_web_schema() {
+        assert_eq!(
+            file_upload_payload(),
+            json!({
+                "count": 1,
+                "type": 0,
+                "uploaderType": 0,
+                "profile": false,
+            })
         );
     }
 }

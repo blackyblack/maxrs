@@ -27,19 +27,19 @@ pub struct UserAgent {
 
 /// User-agent string used both as the WS `User-Agent` header and inside the
 /// `userAgent` payload.
-pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 impl Default for UserAgent {
     fn default() -> Self {
         Self {
             device_type: "WEB".to_string(),
-            locale: "ru_RU".to_string(),
-            device_locale: "ru_RU".to_string(),
-            os_version: "Windows".to_string(),
-            device_name: "maxrs".to_string(),
+            locale: "ru".to_string(),
+            device_locale: "ru".to_string(),
+            os_version: "Linux".to_string(),
+            device_name: "Chrome".to_string(),
             header_user_agent: BROWSER_USER_AGENT.to_string(),
-            app_version: "25.9.15".to_string(),
+            app_version: "26.8.4".to_string(),
             screen: "1080x1920 1.0x".to_string(),
             timezone: "Europe/Moscow".to_string(),
         }
@@ -62,10 +62,10 @@ pub struct IncomingMessage {
 }
 
 /// The data that client needs from a successful `LOGIN`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginData {
-    /// Logged-in user id, when the server includes it in the login response.
-    pub own_user_id: Option<i64>,
+    /// Logged-in user id.
+    pub own_user_id: i64,
 }
 
 /// The result of a successful login.
