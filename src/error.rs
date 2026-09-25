@@ -7,6 +7,9 @@ pub enum Error {
     #[error("websocket error: {0}")]
     WebSocket(#[source] Box<tungstenite::Error>),
 
+    #[error("timed out opening Max WebSocket")]
+    WebSocketConnectTimeout,
+
     #[error("invalid HTTP header value: {0}")]
     InvalidHeaderValue(#[from] tungstenite::http::header::InvalidHeaderValue),
 

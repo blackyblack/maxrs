@@ -8,7 +8,8 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::handshake::client::Response;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Request};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
@@ -21,6 +22,7 @@ use super::InnerClient;
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
 const ORIGIN: &str = "https://web.max.ru";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(super) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
@@ -65,7 +67,7 @@ impl Transport {
             headers.insert("User-Agent", HeaderValue::from_str(header_user_agent)?);
         }
 
-        let (stream, response) = connect_async(request).await?;
+        let (stream, response) = connect_with_timeout(request, CONNECT_TIMEOUT).await?;
         let (sink, read) = stream.split();
 
         *self.sink.lock().await = Some(sink);
@@ -201,6 +203,16 @@ impl Transport {
     }
 }
 
+async fn connect_with_timeout(
+    request: Request<()>,
+    timeout: Duration,
+) -> Result<(WsStream, Response)> {
+    tokio::time::timeout(timeout, connect_async(request))
+        .await
+        .map_err(|_| Error::WebSocketConnectTimeout)?
+        .map_err(Error::from)
+}
+
 fn error_message(payload: &Value) -> String {
     payload["error"]
         .as_str()
@@ -244,6 +256,22 @@ mod tests {
             .expect("stream closed")
             .expect("websocket error");
         serde_json::from_str(message.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_times_out_when_server_never_responds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request = format!("ws://{}/", listener.local_addr().unwrap())
+            .into_client_request()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let result = connect_with_timeout(request, Duration::from_millis(20)).await;
+        assert!(matches!(result, Err(Error::WebSocketConnectTimeout)));
+        server.abort();
     }
 
     #[test]
