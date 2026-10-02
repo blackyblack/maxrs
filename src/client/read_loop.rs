@@ -8,13 +8,14 @@ use crate::models::IncomingMessage;
 use crate::protocol::{opcode, Packet};
 
 use super::transport::WsStream;
-use super::InnerClient;
+use super::{recovery::Connection, InnerClient};
 
 const SECURITY_SERVICE_USER_ID: i64 = 543_835;
 
 pub(super) async fn read_loop(
     mut read: futures_util::stream::SplitStream<WsStream>,
     inner: Arc<InnerClient>,
+    connection: Arc<Connection>,
 ) {
     loop {
         let Some(frame) = read.next().await else {
@@ -39,13 +40,13 @@ pub(super) async fn read_loop(
         };
 
         if packet.is_request() {
-            handle_server_request(&inner, packet).await;
+            handle_server_request(&inner, &connection, packet).await;
         } else {
             inner.transport.receive_response(packet).await;
         }
     }
 
-    inner.fail().await;
+    inner.fail(&connection).await;
 }
 
 fn frame_text(
@@ -66,11 +67,15 @@ fn frame_text(
     }
 }
 
-async fn handle_server_request(inner: &Arc<InnerClient>, packet: Packet) {
+async fn handle_server_request(
+    inner: &Arc<InnerClient>,
+    connection: &Arc<Connection>,
+    packet: Packet,
+) {
     match packet.opcode {
         opcode::RECONNECT => {
             tracing::warn!("Max server requested reconnect");
-            inner.fail().await;
+            inner.fail(connection).await;
         }
         opcode::NOTIF_MESSAGE => {
             if let Some(message) = parse_incoming(&packet.payload) {
@@ -96,8 +101,8 @@ async fn handle_server_request(inner: &Arc<InnerClient>, packet: Packet) {
         }
         opcode::NOTIF_ATTACH => {
             if let Some(file_id) = packet.payload["fileId"].as_i64() {
-                if let Some(tx) = inner.file_waiters.lock().await.remove(&file_id) {
-                    let _ = tx.send(());
+                if let Some(waiter) = inner.file_waiters.lock().await.remove(&file_id) {
+                    let _ = waiter.sender.send(());
                 }
             }
         }

@@ -42,6 +42,12 @@ pub enum Error {
     #[error("no operator channel is configured for SMS code entry")]
     NoOperatorChannel,
 
+    #[error("Max credentials are not configured; provide a session token or MAX_PHONE")]
+    MissingCredentials,
+
+    #[error("Max client already has a recovery runner")]
+    ClientAlreadyRunning,
+
     /// Telegram was selected as operator channel but required env vars are missing or invalid.
     #[error("telegram operator channel is requested but configuration is missing or invalid: {0}")]
     TelegramConfigMissing(String),
