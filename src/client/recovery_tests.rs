@@ -434,7 +434,108 @@ async fn reconnect_replays_an_in_flight_document_upload() {
 }
 
 #[tokio::test]
-async fn runner_rejects_competing_run_and_manual_connect_without_stopping_owner() {
+async fn reconnect_replays_a_file_message_with_the_same_cid() {
+    let (client, listener) = local_client().await;
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upload_url = format!("http://{}/", http.local_addr().unwrap());
+    let (release_server, server_released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut first = authenticated(&listener).await;
+        let upload = next_packet(&mut first).await;
+        assert_eq!(upload.opcode, opcode::FILE_UPLOAD);
+        respond(
+            &mut first,
+            &upload,
+            json!({"info": [{"url": upload_url, "fileId": 100}]}),
+        )
+        .await;
+        receive_upload(&http).await;
+        first
+            .send(Message::text(
+                serde_json::to_string(&Packet::request(
+                    998,
+                    opcode::NOTIF_ATTACH,
+                    json!({"fileId": 100}),
+                ))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let first_message = next_packet(&mut first).await;
+        assert_eq!(first_message.opcode, opcode::MSG_SEND);
+        drop(first);
+
+        let mut second = authenticated(&listener).await;
+        let upload = next_packet(&mut second).await;
+        assert_eq!(upload.opcode, opcode::FILE_UPLOAD);
+        respond(
+            &mut second,
+            &upload,
+            json!({"info": [{"url": upload_url, "fileId": 101}]}),
+        )
+        .await;
+        receive_upload(&http).await;
+        second
+            .send(Message::text(
+                serde_json::to_string(&Packet::request(
+                    999,
+                    opcode::NOTIF_ATTACH,
+                    json!({"fileId": 101}),
+                ))
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let replayed = next_packet(&mut second).await;
+        assert_eq!(replayed.opcode, opcode::MSG_SEND);
+        assert_eq!(replayed.payload["message"]["attaches"][0]["fileId"], 101);
+        assert_eq!(
+            replayed.payload["message"]["cid"],
+            first_message.payload["message"]["cid"]
+        );
+        respond(&mut second, &replayed, json!({})).await;
+        let _ = server_released.await;
+    });
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(Handler).await }
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.send_file_bytes(7, "book.fb2", b"book contents".as_slice(), "caption"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let _ = release_server.send(());
+    server.await.unwrap();
+    client.disconnect().await;
+    runner.await.unwrap().unwrap();
+}
+
+async fn receive_upload(listener: &TcpListener) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut upload, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0; 4096];
+        let size = upload.read(&mut buffer).await.unwrap();
+        assert!(size > 0);
+        request.extend_from_slice(&buffer[..size]);
+        if request.ends_with(b"book contents") {
+            break;
+        }
+    }
+    upload
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runner_rejects_competing_run_without_stopping_owner() {
     let (client, listener) = local_client().await;
     let runner = tokio::spawn({
         let client = client.clone();
@@ -443,10 +544,6 @@ async fn runner_rejects_competing_run_and_manual_connect_without_stopping_owner(
     let (socket, _) = listener.accept().await.unwrap();
     assert!(matches!(
         client.run(Handler).await,
-        Err(Error::ClientAlreadyRunning)
-    ));
-    assert!(matches!(
-        client.connect(Handler).await,
         Err(Error::ClientAlreadyRunning)
     ));
     assert!(!client.is_connected().await);

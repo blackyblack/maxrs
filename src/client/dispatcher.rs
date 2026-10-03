@@ -8,12 +8,10 @@ use crate::models::IncomingMessage;
 use super::ChatHandler;
 
 pub(super) async fn run<H: ChatHandler>(
-    shutdown: Arc<CancellationToken>,
-    handler: H,
+    shutdown: CancellationToken,
+    handler: Arc<H>,
     mut incoming: mpsc::UnboundedReceiver<IncomingMessage>,
 ) {
-    let handler = Arc::new(handler);
-
     loop {
         let message = tokio::select! {
             biased;
@@ -24,16 +22,12 @@ pub(super) async fn run<H: ChatHandler>(
             },
         };
 
-        tokio::spawn(run_handler(
-            Arc::clone(&shutdown),
-            Arc::clone(&handler),
-            message,
-        ));
+        tokio::spawn(run_handler(shutdown.clone(), Arc::clone(&handler), message));
     }
 }
 
 async fn run_handler<H: ChatHandler>(
-    shutdown: Arc<CancellationToken>,
+    shutdown: CancellationToken,
     handler: Arc<H>,
     message: IncomingMessage,
 ) {
@@ -117,29 +111,16 @@ mod tests {
         }
     }
 
-    fn connected(
-        shutdown: Arc<CancellationToken>,
-        handler: TestHandler,
-        incoming: mpsc::UnboundedReceiver<IncomingMessage>,
-    ) -> super::super::ConnectedClient<TestHandler> {
-        super::super::ConnectedClient {
-            handler,
-            incoming,
-            shutdown,
-        }
-    }
-
     async fn serve(
         handler: TestHandler,
     ) -> (
         mpsc::UnboundedSender<IncomingMessage>,
-        Arc<CancellationToken>,
+        CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
-        let root = Arc::new(CancellationToken::new());
+        let root = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();
-        let connected = connected(Arc::clone(&root), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
         (tx, root, run_task)
     }
 
@@ -314,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_failure_does_not_cancel_accepted_handler() {
+    async fn reconnect_does_not_cancel_accepted_handler() {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
@@ -340,25 +321,22 @@ mod tests {
         let client = client();
         let connection = client.inner.recovery.begin_attempt().unwrap();
         client.inner.recovery.connected(&connection).unwrap();
-        let root = Arc::new(CancellationToken::new());
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            shutdown: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(2, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         drop(tx);
-        client.inner.fail(&connection).await;
+        client.inner.close_connection(Some(&connection)).await;
         run_task.await.unwrap();
+        client.inner.close_connection(None).await;
 
         gate.add_permits(1);
         finished_rx
             .await
-            .expect("connection failure must not abort accepted handler");
+            .expect("reconnect must not abort accepted handler");
     }
 
     #[tokio::test]
@@ -379,19 +357,15 @@ mod tests {
         let client = client();
         let connection = client.inner.recovery.begin_attempt().unwrap();
         client.inner.recovery.connected(&connection).unwrap();
-        let root = Arc::new(CancellationToken::new());
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            shutdown: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(3, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         drop(tx);
-        client.inner.fail(&connection).await;
+        client.inner.close_connection(Some(&connection)).await;
         run_task.await.unwrap();
 
         client.disconnect().await;
@@ -416,14 +390,10 @@ mod tests {
             })
         }));
         let client = client();
-        let root = Arc::new(CancellationToken::new());
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            shutdown: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -458,16 +428,12 @@ mod tests {
                 Ok(())
             })
         }));
-        let root = Arc::new(CancellationToken::new());
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            shutdown: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), handler, rx);
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
         let state_owner = client.clone();
         let state_guard = state_owner.inner.state.lock().await;
-        let run_task = tokio::spawn(connected.run());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(1, 1)).unwrap();
         started_rx.recv().await.unwrap();

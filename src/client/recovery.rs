@@ -92,27 +92,22 @@ impl Recovery {
         Ok(())
     }
 
-    pub(super) fn disconnected(&self) {
+    pub(super) fn disconnect(&self, current: Option<&Arc<Connection>>) -> bool {
         let mut state = self.state.lock().expect("Max recovery state");
+        if let Some(current) = current {
+            let is_current = state
+                .connection()
+                .is_some_and(|connection| Arc::ptr_eq(connection, current));
+            if !is_current {
+                return false;
+            }
+        }
         if matches!(*state, State::Stopped) {
-            return;
+            return current.is_none();
         }
         if let Some(connection) = state.connection() {
             connection.cancel();
         }
-        *state = State::Disconnected(None);
-        self.changed.notify_waiters();
-    }
-
-    pub(super) fn disconnect_if_current(&self, connection: &Arc<Connection>) -> bool {
-        let mut state = self.state.lock().expect("Max recovery state");
-        let is_current = state
-            .connection()
-            .is_some_and(|current| Arc::ptr_eq(current, connection));
-        if !is_current {
-            return false;
-        }
-        connection.cancel();
         *state = State::Disconnected(None);
         self.changed.notify_waiters();
         true

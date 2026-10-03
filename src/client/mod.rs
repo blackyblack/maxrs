@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::LoginConfig;
 use crate::error::{Error, Result};
-use crate::models::{IncomingMessage, LoginSession, MaxMessage, UserAgent};
+use crate::models::{IncomingMessage, MaxMessage, UserAgent};
 use crate::protocol::{opcode, Packet};
 
 use self::transport::Transport;
@@ -29,30 +29,6 @@ use self::transport::Transport;
 pub trait ChatHandler: Send + Sync + 'static {
     /// Called for each admitted incoming message.
     fn on_message(&self, msg: IncomingMessage) -> impl Future<Output = Result<()>> + Send;
-}
-
-/// A connected client ready to dispatch incoming messages.
-pub struct ConnectedClient<H> {
-    handler: H,
-    incoming: mpsc::UnboundedReceiver<IncomingMessage>,
-    shutdown: Arc<CancellationToken>,
-}
-
-impl<H: ChatHandler> ConnectedClient<H> {
-    /// Dispatches messages until the incoming feed closes.
-    ///
-    /// Dropping or cancelling this future stops admitting messages without
-    /// aborting handlers that have already been spawned. Call
-    /// [`MaxClient::disconnect`] to abort in-flight handlers.
-    pub async fn run(self) {
-        dispatcher::run(self.shutdown, self.handler, self.incoming).await;
-    }
-}
-
-impl<H: ChatHandler> ChatHandler for Arc<H> {
-    async fn on_message(&self, msg: IncomingMessage) -> Result<()> {
-        self.as_ref().on_message(msg).await
-    }
 }
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -76,7 +52,8 @@ pub(crate) struct InnerClient {
     connect_lock: Mutex<()>,
     run_lock: Mutex<()>,
     recovery: recovery::Recovery,
-    msg_tx: Mutex<Option<DispatcherSender>>,
+    handler_shutdown: CancellationToken,
+    msg_tx: Mutex<Option<mpsc::UnboundedSender<IncomingMessage>>>,
     state: Mutex<ClientState>,
     device_id: String,
     user_agent: UserAgent,
@@ -111,45 +88,16 @@ impl InnerClient {
         self.invoke(opcode::SESSION_INIT, payload).await.map(|_| ())
     }
 
-    pub(crate) async fn disconnect(&self) {
-        let shutdown = self.msg_tx.lock().await.as_mut().map(|sender| {
-            sender.tx.take();
-            Arc::clone(&sender.shutdown)
-        });
-
-        self.close_connection().await;
-
-        if let Some(shutdown) = shutdown {
-            let mut dispatcher = self.msg_tx.lock().await;
-            if dispatcher
-                .as_ref()
-                .is_some_and(|sender| Arc::ptr_eq(&sender.shutdown, &shutdown))
-            {
-                dispatcher.take();
-            }
-            shutdown.cancel();
+    async fn close_connection(&self, current: Option<&Arc<recovery::Connection>>) {
+        if !self.recovery.disconnect(current) {
+            return;
         }
-    }
 
-    async fn close_connection(&self) {
-        self.recovery.disconnected();
-        self.close_connection_resources().await;
-    }
-
-    async fn close_connection_resources(&self) {
-        if let Some(sender) = self.msg_tx.lock().await.as_mut() {
-            sender.tx.take();
-        }
+        self.msg_tx.lock().await.take();
         self.file_waiters.lock().await.clear();
         self.transport.close().await;
         if let Some(task) = self.state.lock().await.keepalive_task.take() {
             task.abort();
-        }
-    }
-
-    async fn fail(&self, connection: &Arc<recovery::Connection>) {
-        if self.recovery.disconnect_if_current(connection) {
-            self.close_connection_resources().await;
         }
     }
 
@@ -158,11 +106,6 @@ impl InnerClient {
             previous.abort();
         }
     }
-}
-
-struct DispatcherSender {
-    tx: Option<mpsc::UnboundedSender<IncomingMessage>>,
-    shutdown: Arc<CancellationToken>,
 }
 
 /// An asynchronous client for the Max (OneMe) WebSocket API.
@@ -174,7 +117,7 @@ pub struct MaxClient {
 }
 
 // Cancelling the recovery future must wake pending sends and clean up the socket.
-struct RunGuard(MaxClient);
+struct RunGuard(Option<MaxClient>);
 
 // A cancelled upload must release its attachment-notification subscription.
 struct FileWaiter {
@@ -214,20 +157,18 @@ fn remove_owned_waiter(
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        self.0.inner.recovery.stop();
-        let client = self.0.clone();
-        tokio::spawn(async move {
-            let _lock = client.inner.connect_lock.lock().await;
-            client.inner.disconnect().await;
-        });
+        if let Some(client) = self.0.take() {
+            tokio::spawn(async move {
+                client.disconnect().await;
+            });
+        }
     }
 }
 
 impl MaxClient {
     /// Creates a disconnected client handle.
     ///
-    /// Call [`MaxClient::run`] for automatic recovery, or
-    /// [`MaxClient::connect`] to manage individual connection attempts.
+    /// Call [`MaxClient::run`] to connect and dispatch messages with automatic recovery.
     pub fn new(config: LoginConfig) -> Result<Self> {
         Self::new_with_user_agent(config, UserAgent::default())
     }
@@ -246,6 +187,7 @@ impl MaxClient {
             connect_lock: Mutex::new(()),
             run_lock: Mutex::new(()),
             recovery: recovery::Recovery::new(),
+            handler_shutdown: CancellationToken::new(),
             msg_tx: Mutex::new(None),
             state: Mutex::new(ClientState {
                 cid: -chrono_millis(),
@@ -260,30 +202,7 @@ impl MaxClient {
         Ok(MaxClient { inner })
     }
 
-    /// Connects, logs in, and starts the background tasks.
-    ///
-    /// Reconnecting aborts handlers from the previous connection. A connection
-    /// failure alone lets already admitted handlers finish.
-    ///
-    /// Messages are dispatched independently, so handlers may overlap even for
-    /// the same chat. Handler failures and panics are logged.
-    pub async fn connect<H: ChatHandler>(
-        &self,
-        handler: H,
-    ) -> Result<(LoginSession, ConnectedClient<H>)> {
-        // Manual connection management and automatic recovery cannot compete.
-        let _run = self
-            .inner
-            .run_lock
-            .try_lock()
-            .map_err(|_| Error::ClientAlreadyRunning)?;
-        self.connect_once(handler).await
-    }
-
-    async fn connect_once<H: ChatHandler>(
-        &self,
-        handler: H,
-    ) -> Result<(LoginSession, ConnectedClient<H>)> {
+    async fn connect_once(&self) -> Result<mpsc::UnboundedReceiver<IncomingMessage>> {
         let _guard = self.inner.connect_lock.lock().await;
         if self.inner.recovery.shutdown.is_cancelled() {
             return Err(Error::ConnectionClosed);
@@ -294,14 +213,10 @@ impl MaxClient {
             has_session_token,
             "Starting Max connection"
         );
-        self.inner.disconnect().await;
+        self.inner.close_connection(None).await;
         let connection = self.inner.recovery.begin_attempt()?;
-        let shutdown = Arc::new(CancellationToken::new());
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        *self.inner.msg_tx.lock().await = Some(DispatcherSender {
-            tx: Some(msg_tx),
-            shutdown: Arc::clone(&shutdown),
-        });
+        *self.inner.msg_tx.lock().await = Some(msg_tx);
 
         if let Err(err) = self
             .inner
@@ -319,7 +234,7 @@ impl MaxClient {
                 %err,
                 "Max connection failed"
             );
-            self.inner.fail(&connection).await;
+            self.inner.close_connection(Some(&connection)).await;
             return Err(err);
         }
 
@@ -330,7 +245,7 @@ impl MaxClient {
                 %err,
                 "Max connection failed"
             );
-            self.inner.fail(&connection).await;
+            self.inner.close_connection(Some(&connection)).await;
             return Err(err);
         }
 
@@ -347,7 +262,7 @@ impl MaxClient {
                     %err,
                     "Max connection failed"
                 );
-                self.inner.fail(&connection).await;
+                self.inner.close_connection(Some(&connection)).await;
                 return Err(err);
             }
         };
@@ -359,13 +274,8 @@ impl MaxClient {
         }
         self.inner.recovery.connected(&connection)?;
 
-        let connected = ConnectedClient {
-            handler,
-            incoming: msg_rx,
-            shutdown,
-        };
         tracing::info!(device_id = %self.inner.device_id, "Max connection established");
-        Ok((session, connected))
+        Ok(msg_rx)
     }
 
     /// Connects and dispatches, recovering transient failures until disconnected.
@@ -378,23 +288,28 @@ impl MaxClient {
             .run_lock
             .try_lock()
             .map_err(|_| Error::ClientAlreadyRunning)?;
-        let _guard = RunGuard(self.clone());
+        let mut guard = RunGuard(Some(self.clone()));
         let handler = Arc::new(handler);
         let mut backoff = recovery::Backoff::default();
         loop {
             let attempt = tokio::select! {
                 biased;
                 _ = self.inner.recovery.shutdown.cancelled() => break,
-                attempt = self.connect_once(Arc::clone(&handler)) => attempt,
+                attempt = self.connect_once() => attempt,
             };
             let delay = match attempt {
-                Ok((_, connected)) => {
+                Ok(incoming) => {
                     backoff.reset();
-                    tokio::select! {
-                        biased;
-                        _ = self.inner.recovery.shutdown.cancelled() => break,
-                        () = connected.run() => Some(backoff.next_delay()),
+                    dispatcher::run(
+                        self.inner.handler_shutdown.clone(),
+                        Arc::clone(&handler),
+                        incoming,
+                    )
+                    .await;
+                    if self.inner.recovery.shutdown.is_cancelled() {
+                        break;
                     }
+                    Some(backoff.next_delay())
                 }
                 Err(error) => {
                     if !recovery::should_retry_connection(&error) {
@@ -414,6 +329,7 @@ impl MaxClient {
             }
         }
         self.disconnect().await;
+        guard.0.take();
         Ok(())
     }
 
@@ -438,7 +354,7 @@ impl MaxClient {
                 };
                 if let Err(err) = result {
                     tracing::warn!(%err, "Max keepalive failed");
-                    inner.fail(&connection).await;
+                    inner.close_connection(Some(&connection)).await;
                     break;
                 }
             }
@@ -478,34 +394,11 @@ impl MaxClient {
         Ok(())
     }
 
-    /// Uploads a local file and sends it to `chat_id` with an optional caption.
-    ///
-    /// Implements the three-step flow: request an upload URL (`FILE_UPLOAD`),
-    /// HTTP `POST` the bytes, wait for the server's `NOTIF_ATTACH`
-    /// confirmation, then send a message referencing the uploaded file.
-    pub async fn send_file(
-        &self,
-        chat_id: i64,
-        path: impl AsRef<std::path::Path>,
-        caption: &str,
-    ) -> Result<()> {
-        let path = path.as_ref();
-        let bytes = tokio::fs::read(path).await?;
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_string());
-
-        self.send_file_bytes(chat_id, file_name, bytes, caption)
-            .await
-    }
-
     /// Uploads a file from an in-memory byte buffer and sends it to `chat_id`.
     ///
-    /// This follows the same Max upload flow as [`MaxClient::send_file`], but
-    /// uses the supplied bytes instead of reading from the filesystem. The
-    /// `file_name` is sent in the HTTP `Content-Disposition` header.
-    /// Reconnection releases the old attachment waiter and replays the upload.
+    /// The `file_name` is sent in the HTTP `Content-Disposition` header.
+    /// Reconnection releases the old attachment waiter and replays the upload
+    /// while preserving the message client ID used for deduplication.
     /// Cancelling the returned future prevents further replay attempts.
     pub async fn send_file_bytes<'a>(
         &self,
@@ -516,10 +409,11 @@ impl MaxClient {
     ) -> Result<()> {
         let file_name = normalized_file_name(file_name.into());
         let bytes = bytes.into().into_owned();
+        let cid = self.inner.next_cid().await;
         loop {
             let connection = self.inner.recovery.current().await?;
             match self
-                .send_uploaded_file(&connection, chat_id, &file_name, &bytes, caption)
+                .send_uploaded_file(&connection, chat_id, &file_name, &bytes, caption, cid)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -536,6 +430,7 @@ impl MaxClient {
         file_name: &str,
         bytes: &[u8],
         caption: &str,
+        cid: i64,
     ) -> Result<()> {
         let response = self
             .invoke(connection, opcode::FILE_UPLOAD, file_upload_payload())
@@ -611,7 +506,7 @@ impl MaxClient {
             }
         }
 
-        let payload = file_message_payload(chat_id, caption, file_id, self.inner.next_cid().await);
+        let payload = file_message_payload(chat_id, caption, file_id, cid);
         self.invoke(connection, opcode::MSG_SEND, payload).await?;
         Ok(())
     }
@@ -626,7 +521,8 @@ impl MaxClient {
     pub async fn disconnect(&self) {
         self.inner.recovery.stop();
         let _lock = self.inner.connect_lock.lock().await;
-        self.inner.disconnect().await;
+        self.inner.close_connection(None).await;
+        self.inner.handler_shutdown.cancel();
     }
 
     /// Sends a single keepalive ping. Mostly useful for tests; the background
@@ -655,7 +551,7 @@ impl MaxClient {
                 // A server rejection doesn't mean the socket is dead; keep it
                 // open and only disconnect on transport failures.
                 if recovery::is_transport_failure(&err) {
-                    self.inner.fail(connection).await;
+                    self.inner.close_connection(Some(connection)).await;
                 }
                 Err(err)
             }
@@ -758,20 +654,13 @@ mod tests {
         }
     }
 
-    fn dispatcher_sender(tx: mpsc::UnboundedSender<IncomingMessage>) -> DispatcherSender {
-        DispatcherSender {
-            tx: Some(tx),
-            shutdown: Arc::new(CancellationToken::new()),
-        }
-    }
-
     #[tokio::test]
     async fn disconnect_closes_internal_message_feed() {
         let client = MaxClient::new(test_config()).expect("client");
         let (tx, mut messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(dispatcher_sender(tx));
+        *client.inner.msg_tx.lock().await = Some(tx);
 
-        client.inner.disconnect().await;
+        client.inner.close_connection(None).await;
         assert!(messages.recv().await.is_none());
     }
 
@@ -816,7 +705,7 @@ mod tests {
         let task = tokio::spawn(async move {
             started_tx.send(()).unwrap();
             run_rx.await.unwrap();
-            inner.fail(&connection).await;
+            inner.close_connection(Some(&connection)).await;
             finished_tx.send(()).unwrap();
         });
         client.inner.state.lock().await.keepalive_task = Some(task);
@@ -839,13 +728,13 @@ mod tests {
         let connection = client.inner.recovery.begin_attempt().unwrap();
         client.inner.recovery.connected(&connection).unwrap();
         let (old_tx, mut old_messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(dispatcher_sender(old_tx));
+        *client.inner.msg_tx.lock().await = Some(old_tx);
 
-        client.inner.fail(&connection).await;
+        client.inner.close_connection(Some(&connection)).await;
         assert!(old_messages.recv().await.is_none());
 
         let (new_tx, mut new_messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(dispatcher_sender(new_tx));
+        *client.inner.msg_tx.lock().await = Some(new_tx);
         let message = IncomingMessage {
             chat_id: 1,
             message_id: 2,
@@ -860,9 +749,6 @@ mod tests {
             .await
             .as_ref()
             .expect("recreated sender")
-            .tx
-            .as_ref()
-            .expect("active message sender")
             .send(message.clone())
             .expect("send message");
 
