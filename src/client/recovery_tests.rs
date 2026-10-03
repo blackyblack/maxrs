@@ -337,7 +337,7 @@ fn only_temporary_authentication_service_failures_are_retried() {
 }
 
 #[tokio::test]
-async fn cancelled_upload_releases_attachment_subscription_without_stopping_client() {
+async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (client, listener) = local_client().await;
@@ -380,10 +380,10 @@ async fn cancelled_upload_releases_attachment_subscription_without_stopping_clie
         }
     });
     uploaded_rx.await.unwrap();
-    assert_eq!(client.inner.attachment_notifications.receiver_count(), 1);
+    assert_eq!(client.inner.attachment_registry.waiter_count(), 1);
     sending.abort();
     assert!(sending.await.unwrap_err().is_cancelled());
-    assert_eq!(client.inner.attachment_notifications.receiver_count(), 0);
+    assert_eq!(client.inner.attachment_registry.waiter_count(), 0);
     client
         .send_text(7, MaxMessage::new("ordinary request"))
         .await
@@ -391,6 +391,77 @@ async fn cancelled_upload_releases_attachment_subscription_without_stopping_clie
     client.disconnect().await;
     runner.await.unwrap().unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn attachment_completion_survives_an_unrelated_notification_burst() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client, listener) = local_client().await;
+    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upload_url = format!("http://{}/", http.local_addr().unwrap());
+    let (release_server, server_released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = authenticated(&listener).await;
+        let packet = next_packet(&mut socket).await;
+        assert_eq!(packet.opcode, opcode::FILE_UPLOAD);
+        respond(
+            &mut socket,
+            &packet,
+            json!({"info": [{"url": upload_url, "fileId": 100}]}),
+        )
+        .await;
+
+        let (mut upload, _) = http.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"contents") {
+            let mut buffer = [0; 4096];
+            let size = upload.read(&mut buffer).await.unwrap();
+            assert!(size > 0);
+            request.extend_from_slice(&buffer[..size]);
+        }
+
+        let attached = Packet::request(900, opcode::NOTIF_ATTACH, json!({"fileId": 100}));
+        socket
+            .send(Message::text(serde_json::to_string(&attached).unwrap()))
+            .await
+            .unwrap();
+        for file_id in 1_000..1_064 {
+            let unrelated =
+                Packet::request(file_id, opcode::NOTIF_ATTACH, json!({"fileId": file_id}));
+            socket
+                .send(Message::text(serde_json::to_string(&unrelated).unwrap()))
+                .await
+                .unwrap();
+        }
+
+        upload
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let message = next_packet(&mut socket).await;
+        assert_eq!(message.opcode, opcode::MSG_SEND);
+        assert_eq!(message.payload["message"]["attaches"][0]["fileId"], 100);
+        respond(&mut socket, &message, json!({})).await;
+        let _ = server_released.await;
+    });
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(Handler).await }
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.send_file_bytes(7, "book.fb2", b"contents".as_slice(), ""),
+    )
+    .await
+    .expect("the registered completion must not be lost")
+    .unwrap();
+
+    let _ = release_server.send(());
+    server.await.unwrap();
+    client.disconnect().await;
+    runner.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -95,7 +95,7 @@ async fn handle_server_request(
         }
         opcode::NOTIF_ATTACH => {
             if let Some(file_id) = packet.payload["fileId"].as_i64() {
-                let _ = inner.attachment_notifications.send(file_id);
+                inner.attachment_registry.complete(file_id);
             }
         }
         _ => {}

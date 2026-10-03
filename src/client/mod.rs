@@ -1,5 +1,6 @@
 //! The asynchronous Max client.
 
+mod attachment_registry;
 mod dispatcher;
 mod read_loop;
 mod recovery;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::LoginConfig;
@@ -39,9 +40,6 @@ pub trait ChatHandler: Send + Sync + 'static {
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
-// Allows short notification bursts without delaying active upload receivers.
-const ATTACHMENT_NOTIFICATION_CAPACITY: usize = 32;
-
 struct ClientState {
     cid: i64,
     own_user_id: Option<i64>,
@@ -50,7 +48,7 @@ struct ClientState {
 
 pub(crate) struct InnerClient {
     transport: Transport,
-    attachment_notifications: broadcast::Sender<i64>,
+    attachment_registry: attachment_registry::AttachmentRegistry,
     login_config: Mutex<LoginConfig>,
     connect_lock: Mutex<()>,
     run_lock: Mutex<()>,
@@ -153,7 +151,7 @@ impl MaxClient {
             .build()?;
         let inner = Arc::new(InnerClient {
             transport: Transport::new(),
-            attachment_notifications: broadcast::channel(ATTACHMENT_NOTIFICATION_CAPACITY).0,
+            attachment_registry: attachment_registry::AttachmentRegistry::default(),
             login_config: Mutex::new(config.clone()),
             connect_lock: Mutex::new(()),
             run_lock: Mutex::new(()),
@@ -406,8 +404,16 @@ impl MaxClient {
             .as_i64()
             .ok_or_else(|| Error::UnexpectedResponse("missing fileId".into()))?;
 
-        // Subscribe before uploading so an immediate NOTIF_ATTACH is not missed.
-        let mut attachment_notifications = self.inner.attachment_notifications.subscribe();
+        // Register before uploading so an immediate NOTIF_ATTACH is not missed.
+        let attachment_waiter = self
+            .inner
+            .attachment_registry
+            .register(file_id)
+            .ok_or_else(|| {
+                Error::UnexpectedResponse(format!(
+                    "duplicate active fileId in upload response: {file_id}"
+                ))
+            })?;
 
         let size = bytes.len();
         let upload = self
@@ -441,20 +447,10 @@ impl MaxClient {
         let processed = tokio::select! {
             biased;
             _ = connection.cancelled() => return Err(Error::ConnectionClosed),
-            result = tokio::time::timeout(FILE_PROCESS_TIMEOUT, async {
-                loop {
-                    match attachment_notifications.recv().await {
-                        Ok(attached_file_id) if attached_file_id == file_id => return Ok(()),
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {
-                            return Err(Error::ConnectionClosed);
-                        }
-                    }
-                }
-            }) => result,
+            result = tokio::time::timeout(FILE_PROCESS_TIMEOUT, attachment_waiter.wait()) => result,
         };
         match processed {
-            Ok(result) => result?,
+            Ok(()) => {}
             Err(_) => {
                 return Err(Error::FileProcessingTimeout(file_id));
             }
