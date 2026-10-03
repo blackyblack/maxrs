@@ -135,15 +135,15 @@ impl Drop for FileWaiter {
     fn drop(&mut self) {
         if let Ok(mut waiters) = self.inner.file_waiters.try_lock() {
             remove_owned_waiter(&mut waiters, self.file_id, &self.owner);
-        } else {
-            let inner = Arc::clone(&self.inner);
-            let owner = Arc::clone(&self.owner);
-            let file_id = self.file_id;
-            tokio::spawn(async move {
-                let mut waiters = inner.file_waiters.lock().await;
-                remove_owned_waiter(&mut waiters, file_id, &owner);
-            });
+            return;
         }
+        let inner = Arc::clone(&self.inner);
+        let owner = Arc::clone(&self.owner);
+        let file_id = self.file_id;
+        tokio::spawn(async move {
+            let mut waiters = inner.file_waiters.lock().await;
+            remove_owned_waiter(&mut waiters, file_id, &owner);
+        });
     }
 }
 
@@ -162,16 +162,19 @@ fn remove_owned_waiter(
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        if let Some(client) = self.0.take() {
-            // Make cancellation observable immediately. Socket cleanup remains
-            // asynchronous, but must not panic if the future is dropped after
-            // its runtime has already shut down.
-            client.inner.recovery.stop();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    client.disconnect().await;
-                });
-            }
+        let client = if let Some(client) = self.0.take() {
+            client
+        } else {
+            return;
+        };
+        // Make cancellation observable immediately. Socket cleanup remains
+        // asynchronous, but must not panic if the future is dropped after
+        // its runtime has already shut down.
+        client.inner.recovery.stop();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                client.disconnect().await;
+            });
         }
     }
 }
