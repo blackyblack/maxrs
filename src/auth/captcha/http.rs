@@ -14,29 +14,15 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::auth::DEFAULT_CAPTCHA_CALLBACK_PATH;
 use crate::error::{Error, Result};
 
 use super::solver::CaptchaSolver;
 
-const DEFAULT_CAPTCHA_CALLBACK_PATH: &str = "/captcha-callback";
 const DEFAULT_CALLBACK_BODY_LIMIT_BYTES: usize = 16 * 1024;
-
-#[derive(Debug, Clone)]
-pub struct HttpServerConfig {
-    pub bind_addr: String,
-}
-
-impl HttpServerConfig {
-    pub fn new(bind_addr: impl Into<String>) -> Self {
-        Self {
-            bind_addr: bind_addr.into(),
-        }
-    }
-}
 
 pub struct HttpServer {
     listener: TcpListener,
-    state: Arc<HttpState>,
 }
 
 #[must_use = "dropping the server task stops the HTTP server"]
@@ -45,41 +31,31 @@ pub struct HttpServerTask {
     shutdown: CancellationToken,
 }
 
-#[derive(Clone)]
-struct HttpState {
-    captcha_solver: Option<Arc<CaptchaSolver>>,
-}
-
 impl HttpServer {
-    pub async fn bind(config: HttpServerConfig) -> Result<Self> {
-        let listener = TcpListener::bind(&config.bind_addr).await?;
-        Ok(Self {
-            listener,
-            state: Arc::new(HttpState {
-                captcha_solver: None,
-            }),
-        })
-    }
-
-    pub fn with_captcha_solver(mut self, captcha_solver: Arc<CaptchaSolver>) -> Self {
-        Arc::make_mut(&mut self.state).captcha_solver = Some(captcha_solver);
-        self
+    pub async fn bind(bind_addr: &str) -> Result<Self> {
+        let listener = TcpListener::bind(bind_addr).await?;
+        Ok(Self { listener })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<()> {
+    pub async fn serve(
+        self,
+        solver: Arc<CaptchaSolver>,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<()> {
         tokio::pin!(shutdown);
         loop {
             let (stream, _) = tokio::select! {
                 result = self.listener.accept() => result?,
                 () = &mut shutdown => return Ok(()),
             };
-            let state = Arc::clone(&self.state);
+            let solver = Arc::clone(&solver);
             tokio::spawn(async move {
-                let service = service_fn(move |request| route_request(request, Arc::clone(&state)));
+                let service =
+                    service_fn(move |request| route_request(request, Arc::clone(&solver)));
                 if let Err(err) = http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await
@@ -90,11 +66,11 @@ impl HttpServer {
         }
     }
 
-    pub fn spawn(self) -> HttpServerTask {
+    pub fn spawn(self, solver: Arc<CaptchaSolver>) -> HttpServerTask {
         let shutdown = CancellationToken::new();
         let shutdown_signal = shutdown.clone();
         HttpServerTask {
-            handle: AbortOnDropHandle::new(tokio::spawn(self.serve(async move {
+            handle: AbortOnDropHandle::new(tokio::spawn(self.serve(solver, async move {
                 shutdown_signal.cancelled().await;
             }))),
             shutdown,
@@ -123,11 +99,11 @@ impl HttpServerTask {
 
 async fn route_request(
     request: Request<Incoming>,
-    state: Arc<HttpState>,
+    solver: Arc<CaptchaSolver>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let response = match (request.method(), request.uri().path()) {
         (&Method::POST, DEFAULT_CAPTCHA_CALLBACK_PATH) => {
-            handle_captcha_callback(request, state).await
+            handle_captcha_callback(request, solver).await
         }
         (_, DEFAULT_CAPTCHA_CALLBACK_PATH) => method_not_allowed("POST"),
         _ => json_response(
@@ -140,15 +116,8 @@ async fn route_request(
 
 async fn handle_captcha_callback(
     request: Request<Incoming>,
-    state: Arc<HttpState>,
+    solver: Arc<CaptchaSolver>,
 ) -> Response<Full<Bytes>> {
-    let Some(captcha_solver) = state.captcha_solver.as_ref() else {
-        return json_response(
-            StatusCode::NOT_FOUND,
-            serde_json::json!({ "error": "captcha solver not configured" }),
-        );
-    };
-
     let body = match read_limited_body(request.into_body()).await {
         Ok(body) => body,
         Err(BodyReadError::TooLarge) => {
@@ -164,7 +133,7 @@ async fn handle_captcha_callback(
         }
     };
 
-    match captcha_solver.handle_callback_json(body.as_ref()).await {
+    match solver.handle_callback_json(body.as_ref()).await {
         Ok(()) => json_response(StatusCode::OK, serde_json::json!({ "ok": true })),
         Err(err) => error_response(err),
     }
@@ -237,19 +206,16 @@ mod tests {
     use crate::auth::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 
     #[tokio::test]
-    async fn optional_server_forwards_captcha_callbacks() {
-        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
+    async fn server_forwards_captcha_callbacks() {
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()));
         let (tx, rx) = oneshot::channel();
         solver
             .insert_pending_for_test("challenge-1".into(), Instant::now(), tx)
             .await;
 
-        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
-            .await
-            .unwrap()
-            .with_captcha_solver(Arc::clone(&solver));
+        let server = HttpServer::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
-        let server_task = server.spawn();
+        let server_task = server.spawn(solver);
 
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -277,32 +243,24 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_server_releases_fixed_port_for_retry() {
-        let initial_server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
-            .await
-            .unwrap();
+        let initial_server = HttpServer::bind("127.0.0.1:0").await.unwrap();
         let fixed_addr = initial_server.local_addr().unwrap();
         drop(initial_server);
 
         for _ in 0..2 {
-            let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
-            let server = HttpServer::bind(HttpServerConfig::new(fixed_addr.to_string()))
-                .await
-                .unwrap()
-                .with_captcha_solver(solver);
-            let server_task = server.spawn();
+            let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()));
+            let server = HttpServer::bind(&fixed_addr.to_string()).await.unwrap();
+            let server_task = server.spawn(solver);
             server_task.shutdown().await;
         }
     }
 
     #[tokio::test]
     async fn errors_are_returned_as_json() {
-        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
-        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
-            .await
-            .unwrap()
-            .with_captcha_solver(solver);
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()));
+        let server = HttpServer::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
-        let server_task = server.spawn();
+        let server_task = server.spawn(solver);
 
         let response = reqwest::Client::builder()
             .no_proxy()
@@ -329,46 +287,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_solver_returns_json_error() {
-        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
-            .await
-            .unwrap();
-        let addr = server.local_addr().unwrap();
-        let server_task = server.spawn();
-
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .post(format!("http://{addr}/captcha-callback"))
-            .json(&json!({
-                "challengeId": "missing",
-                "status": "ok",
-                "token": "session",
-            }))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()["content-type"], "application/json");
-        assert_eq!(
-            response.text().await.unwrap(),
-            r#"{"error":"captcha solver not configured"}"#
-        );
-
-        server_task.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn oversized_callback_body_is_rejected() {
-        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap());
-        let server = HttpServer::bind(HttpServerConfig::new("127.0.0.1:0"))
-            .await
-            .unwrap()
-            .with_captcha_solver(solver);
+        let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::disabled()));
+        let server = HttpServer::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
-        let server_task = server.spawn();
+        let server_task = server.spawn(solver);
 
         let response = reqwest::Client::builder()
             .no_proxy()

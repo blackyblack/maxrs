@@ -24,7 +24,6 @@ pub mod opcode {
     pub const LOGIN: u16 = 19;
     pub const AUTH_CAPTCHA_REQUEST: u16 = 224;
     pub const MSG_SEND: u16 = 64;
-    pub const MSG_TYPING: u16 = 65;
     pub const FILE_UPLOAD: u16 = 87;
     pub const NOTIF_MESSAGE: u16 = 128;
     pub const NOTIF_ATTACH: u16 = 136;

@@ -34,13 +34,14 @@ the server does not drop the connection.
 | opcode | name          | direction       |
 | ------ | ------------- | --------------- |
 | 1      | PING          | client → server |
+| 3      | RECONNECT     | server → client |
 | 6      | SESSION_INIT  | client → server |
 | 224    | AUTH_CAPTCHA_REQUEST | client -> server |
 | 17     | AUTH_REQUEST  | client → server |
 | 18     | AUTH          | client → server |
+| 115    | AUTH_PASSWORD | client → server |
 | 19     | LOGIN         | client → server |
 | 64     | MSG_SEND      | client → server |
-| 65     | MSG_TYPING    | client → server |
 | 87     | FILE_UPLOAD   | client → server |
 | 128    | NOTIF_MESSAGE | server → client |
 | 136    | NOTIF_ATTACH  | server → client |
@@ -88,6 +89,15 @@ the server does not drop the connection.
    Response payload contains the long-lived session token at
    `tokenAttrs.LOGIN.token`.
 
+   If it contains `passwordChallenge` instead, send **AUTH_PASSWORD (115)**
+   with the challenge's `trackId` and the configured password:
+
+   ```json
+   { "trackId": "<challenge trackId>", "password": "<password>" }
+   ```
+
+   Read `tokenAttrs.LOGIN.token` from that response before LOGIN.
+
 4. **LOGIN (19)** — authenticates the socket and syncs state.
 
    ```json
@@ -107,6 +117,9 @@ the server does not drop the connection.
 
 Re-login on subsequent runs is just SESSION_INIT + LOGIN with the saved session
 token (no SMS).
+
+A server **RECONNECT (3)** request closes the current connection. The client
+reconnects and repeats SESSION_INIT + LOGIN with its saved token.
 
 ## Sending a text message — MSG_SEND (64)
 
@@ -145,12 +158,6 @@ top-level `url`); sending the url at the top level is rejected:
 
 `elements` is not echoed back in the MSG_SEND response; it appears in history
 (GET_HISTORY) and in push notifications for new messages.
-
-## Typing notification — MSG_TYPING (65)
-
-```json
-{ "chatId": 123456, "type": "TEXT" }
-```
 
 ## Sending a file — FILE_UPLOAD (87)
 
@@ -210,4 +217,3 @@ The flows above were cross-checked against:
   C# **Client-Max-Api** (WebSocket transport, SESSION_INIT/AUTH/LOGIN/MSG_SEND).
 - **vkmax** / **python-max-client** (SMS auth flow, MSG_SEND, photo upload).
 - **PyMax** (FILE_UPLOAD flow + NOTIF_ATTACH confirmation, opcode enum).
-- **openmax-server** (MSG_TYPING payload shape).

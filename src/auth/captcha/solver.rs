@@ -35,15 +35,6 @@ impl CaptchaSolverConfig {
     }
 }
 
-/// Accepted solver request metadata.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CaptchaChallenge {
-    pub challenge_id: String,
-    pub status: String,
-    pub operator_url: Option<String>,
-}
-
 /// In-memory captcha solver client and callback registry.
 pub struct CaptchaSolver {
     config: CaptchaSolverConfig,
@@ -58,17 +49,12 @@ struct PendingChallenge {
 
 impl CaptchaSolver {
     /// Creates a solver integration from configuration.
-    pub fn new(config: CaptchaSolverConfig) -> Result<Self> {
-        Ok(Self {
+    pub fn new(config: CaptchaSolverConfig) -> Self {
+        Self {
             config,
             http: reqwest::Client::new(),
             pending: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Returns true when a solver service URL is configured.
-    pub fn is_enabled(&self) -> bool {
-        self.config.solver_url.is_some()
+        }
     }
 
     /// Starts solving `captcha_url` and waits up to one hour for its callback.
@@ -247,26 +233,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn captcha_challenge_deserializes_solver_payload() {
-        let challenge: CaptchaChallenge = serde_json::from_value(json!({
-            "challengeId": "id-1",
-            "status": "pending",
-            "operatorUrl": "https://solver.example/operator",
-        }))
-        .unwrap();
-
-        assert_eq!(challenge.challenge_id, "id-1");
-        assert_eq!(challenge.status, "pending");
-        assert_eq!(
-            challenge.operator_url.as_deref(),
-            Some("https://solver.example/operator")
-        );
-    }
-
     #[tokio::test]
     async fn callback_for_unknown_challenge_is_rejected() {
-        let solver = CaptchaSolver::new(CaptchaSolverConfig::disabled()).unwrap();
+        let solver = CaptchaSolver::new(CaptchaSolverConfig::disabled());
         let err = solver
             .handle_callback_json(br#"{"challengeId":"missing","status":"ok","token":"session"}"#)
             .await

@@ -2,7 +2,7 @@
 
 `maxrs` is an unofficial asynchronous Rust client for the Max messenger. It
 supports SMS/session-token login, concurrent chat handlers, text and file
-messages, typing notifications, reconnects, and optional captcha solving.
+messages, reconnects, and optional captcha solving.
 
 This project is not affiliated with Max or VK. The internal API can change
 without notice.
@@ -29,7 +29,7 @@ The CLI loads `.env` before reading the process environment.
 - `MAX_TELEGRAM_BOT_TOKEN`, `MAX_TELEGRAM_CHAT_ID`: required with
   `MAX_OPERATOR_CHANNEL=telegram`.
 - `MAX_TELEGRAM_POLL_TIMEOUT_SECS`: Telegram SMS reply timeout. Default: `300`.
-- `MAX_SOLVER_URL`: captcha solver API URL. Default: `http://127.0.0.1:3000`.
+- `MAX_SOLVER_URL`: captcha solver API URL. When unset: `http://127.0.0.1:3000`.
   Empty disables the solver. Only used if Max rejects the captcha-free SMS
   request and requires a captcha retry.
 - `MAX_CALLBACK_BIND`: captcha callback bind address. Default: `127.0.0.1:3002`.
@@ -41,12 +41,10 @@ The CLI loads `.env` before reading the process environment.
 
 SMS auth starts without captcha and falls back to the optional
 [`max_captcha_solver`](https://github.com/blackyblack/max_captcha_solver) when
-required. Empty values disable it:
+required. An empty solver URL disables it (as in `.env.template`):
 
 ```env
 MAX_SOLVER_URL=
-MAX_CALLBACK_BIND=
-MAX_CALLBACK_URL_BASE=
 ```
 
 For a containerized solver, publish its ports and point callbacks to the host:

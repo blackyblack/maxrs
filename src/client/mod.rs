@@ -221,9 +221,8 @@ impl MaxClient {
         self.spawn_keepalive(Arc::clone(&connection)).await;
 
         let login_config = self.inner.login_config.lock().await.clone();
-        let session = match InnerClient::login(Arc::clone(&self.inner), login_config.clone()).await
-        {
-            Ok(session) => session,
+        let token = match InnerClient::login(Arc::clone(&self.inner), login_config.clone()).await {
+            Ok(token) => token,
             Err(err) => {
                 tracing::warn!(
                     device_id = %self.inner.device_id,
@@ -236,7 +235,7 @@ impl MaxClient {
             }
         };
         let mut stored_config = login_config;
-        stored_config.session_token = Some(session.token.clone());
+        stored_config.session_token = Some(token);
         *self.inner.login_config.lock().await = stored_config;
         if !self.inner.transport.is_connected().await {
             return Err(Error::ConnectionClosed);
@@ -266,7 +265,7 @@ impl MaxClient {
                 _ = self.inner.recovery.shutdown.cancelled() => break,
                 attempt = self.connect_once() => attempt,
             };
-            let delay = match attempt {
+            match attempt {
                 Ok(incoming) => {
                     let connected_at = tokio::time::Instant::now();
                     dispatcher::run(
@@ -279,23 +278,20 @@ impl MaxClient {
                         break;
                     }
                     backoff.reset_if_healthy(connected_at.elapsed());
-                    Some(backoff.next_delay())
                 }
                 Err(error) => {
                     if !recovery::should_retry_connection(&error) {
                         return Err(error);
                     }
                     tracing::warn!(%error, "Max connection attempt failed");
-                    Some(backoff.next_delay())
                 }
             };
-            if let Some(delay) = delay {
-                tracing::warn!(?delay, "Max reconnect backoff");
-                tokio::select! {
-                    biased;
-                    _ = self.inner.recovery.shutdown.cancelled() => break,
-                    () = tokio::time::sleep(delay) => {}
-                }
+            let delay = backoff.next_delay();
+            tracing::warn!(?delay, "Max reconnect backoff");
+            tokio::select! {
+                biased;
+                _ = self.inner.recovery.shutdown.cancelled() => break,
+                () = tokio::time::sleep(delay) => {}
             }
         }
         self.disconnect().await;
@@ -663,44 +659,6 @@ mod tests {
             .expect("self-abort must happen only after cleanup completes");
         assert!(messages.recv().await.is_none());
         assert!(client.inner.state.lock().await.keepalive_task.is_none());
-    }
-
-    #[tokio::test]
-    async fn message_channel_can_be_recreated_after_failure() {
-        let client = MaxClient::new(test_config()).expect("client");
-        let connection = client.inner.recovery.begin_attempt().unwrap();
-        client.inner.recovery.connected(&connection).unwrap();
-        let (old_tx, mut old_messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(old_tx);
-
-        client.inner.close_connection(Some(&connection)).await;
-        assert!(old_messages.recv().await.is_none());
-
-        let (new_tx, mut new_messages) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(new_tx);
-        let message = IncomingMessage {
-            chat_id: 1,
-            message_id: 2,
-            sender: 3,
-            text: "after reconnect".into(),
-            time: 4,
-        };
-        client
-            .inner
-            .msg_tx
-            .lock()
-            .await
-            .as_ref()
-            .expect("recreated sender")
-            .send(message.clone())
-            .expect("send message");
-
-        let received = new_messages.recv().await.expect("message");
-        assert_eq!(received.chat_id, message.chat_id);
-        assert_eq!(received.message_id, message.message_id);
-        assert_eq!(received.sender, message.sender);
-        assert_eq!(received.text, message.text);
-        assert_eq!(received.time, message.time);
     }
 
     #[test]

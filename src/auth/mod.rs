@@ -8,15 +8,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::client::InnerClient;
 use crate::error::{Error, Result};
-use crate::models::{LoginData, LoginSession};
 use crate::protocol::opcode;
 
-use self::captcha::http::{HttpServer, HttpServerConfig};
+use self::captcha::http::HttpServer;
 use self::captcha::solver::{CaptchaSolver, CaptchaSolverConfig};
 use self::operator_channels::OperatorChannel;
 
@@ -82,7 +80,7 @@ impl LoginConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             phone: env_string(ENV_PHONE),
-            password: env_password(),
+            password: env_string(ENV_PASSWORD),
             session_token: session_token_from_file(),
             captcha: AuthCaptchaConfig::from_env(),
             operator: OperatorChannel::from_env()?,
@@ -100,9 +98,7 @@ pub struct AuthCaptchaConfig {
 impl AuthCaptchaConfig {
     pub fn from_env() -> Self {
         Self {
-            solver_url: Some(
-                env_string(ENV_SOLVER_URL).unwrap_or_else(|| DEFAULT_SOLVER_URL.into()),
-            ),
+            solver_url: solver_url_from_env(env::var(ENV_SOLVER_URL).ok()),
             callback_bind: env_string(ENV_CALLBACK_BIND)
                 .unwrap_or_else(|| DEFAULT_CALLBACK_BIND.into()),
             callback_url_base: env_string(ENV_CALLBACK_URL_BASE),
@@ -141,7 +137,7 @@ impl Default for AuthCaptchaConfig {
 }
 
 impl InnerClient {
-    pub(crate) async fn login(inner: Arc<Self>, config: LoginConfig) -> Result<LoginSession> {
+    pub(crate) async fn login(inner: Arc<Self>, config: LoginConfig) -> Result<String> {
         AuthFlow::new(inner, config).login().await
     }
 }
@@ -156,10 +152,10 @@ impl AuthFlow {
         Self { inner, config }
     }
 
-    async fn login(&self) -> Result<LoginSession> {
+    async fn login(&self) -> Result<String> {
         if let Some(token) = self.config.session_token.as_deref() {
             match self.perform_login(token).await {
-                Ok(session) => return Ok(session),
+                Ok(token) => return Ok(token),
                 Err(err) if should_fallback_to_sms_login(&err) => {
                     tracing::info!(%err, "saved Max session token was rejected; starting SMS auth")
                 }
@@ -222,21 +218,20 @@ impl AuthFlow {
             .solver_url
             .as_ref()
             .ok_or(Error::CaptchaSolverDisabled)?;
-        let server =
-            HttpServer::bind(HttpServerConfig::new(&self.config.captcha.callback_bind)).await?;
+        let server = HttpServer::bind(&self.config.captcha.callback_bind).await?;
         let callback_addr = server.local_addr()?;
         let callback_url = self.config.captcha.callback_url(callback_addr);
         let solver = Arc::new(CaptchaSolver::new(CaptchaSolverConfig::new(
             solver_url.clone(),
             callback_url,
-        ))?);
-        let server_task = server.with_captcha_solver(Arc::clone(&solver)).spawn();
+        )));
+        let server_task = server.spawn(Arc::clone(&solver));
         let result = solver.solve(captcha_link).await;
         server_task.shutdown().await;
         result
     }
 
-    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<LoginSession> {
+    async fn verify_sms_code(&self, sms_token: &str, code: &str) -> Result<String> {
         let payload = json!({
             "token": sms_token,
             "verifyCode": code,
@@ -257,11 +252,7 @@ impl AuthFlow {
         self.login_with_auth_payload(&response.payload).await
     }
 
-    async fn verify_password_challenge(
-        &self,
-        challenge: &Value,
-        password: &str,
-    ) -> Result<LoginSession> {
+    async fn verify_password_challenge(&self, challenge: &Value, password: &str) -> Result<String> {
         let track_id = challenge["trackId"].as_str().ok_or_else(|| {
             Error::UnexpectedResponse("missing password challenge trackId".into())
         })?;
@@ -279,16 +270,16 @@ impl AuthFlow {
         self.login_with_auth_payload(&response.payload).await
     }
 
-    async fn login_with_auth_payload(&self, payload: &Value) -> Result<LoginSession> {
+    async fn login_with_auth_payload(&self, payload: &Value) -> Result<String> {
         let token = login_token_from_auth_payload(payload)?;
-        let session = self.perform_login(&token).await?;
-        if let Err(err) = store_session_token_file(&session.token).await {
+        let token = self.perform_login(&token).await?;
+        if let Err(err) = store_session_token_file(&token).await {
             tracing::warn!(%err, path = %session_token_path().display(), "failed to store Max session token; continuing with in-memory session");
         }
-        Ok(session)
+        Ok(token)
     }
 
-    async fn perform_login(&self, token: &str) -> Result<LoginSession> {
+    async fn perform_login(&self, token: &str) -> Result<String> {
         let payload = json!({
             "interactive": true,
             "token": token,
@@ -299,12 +290,9 @@ impl AuthFlow {
             "chatsCount": 40,
         });
         let response = self.inner.invoke(opcode::LOGIN, payload).await?;
-        let login_data = login_data_from_login_payload(&response.payload)?;
-        self.inner.set_own_user_id(login_data.own_user_id).await;
-        Ok(LoginSession {
-            token: token.to_string(),
-            login_data,
-        })
+        let user_id = user_id_from_login_payload(&response.payload)?;
+        self.inner.set_own_user_id(user_id).await;
+        Ok(token.to_string())
     }
 }
 
@@ -335,26 +323,10 @@ fn login_token_from_auth_payload(payload: &Value) -> Result<String> {
         .ok_or_else(|| Error::UnexpectedResponse("missing session token".into()))
 }
 
-#[derive(Debug, Deserialize)]
-struct LoginPayload {
-    profile: LoginProfile,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginProfile {
-    contact: LoginContact,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginContact {
-    id: i64,
-}
-
-fn login_data_from_login_payload(payload: &Value) -> Result<LoginData> {
-    let payload = serde_json::from_value::<LoginPayload>(payload.clone())?;
-    Ok(LoginData {
-        own_user_id: payload.profile.contact.id,
-    })
+fn user_id_from_login_payload(payload: &Value) -> Result<i64> {
+    payload["profile"]["contact"]["id"]
+        .as_i64()
+        .ok_or_else(|| Error::UnexpectedResponse("missing or invalid profile.contact.id".into()))
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -364,8 +336,8 @@ fn env_string(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn env_password() -> Option<String> {
-    env_string(ENV_PASSWORD)
+fn solver_url_from_env(value: Option<String>) -> Option<String> {
+    non_empty_trimmed(value.unwrap_or_else(|| DEFAULT_SOLVER_URL.into()))
 }
 
 fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {
@@ -402,6 +374,20 @@ mod tests {
         assert!(config.validate().is_ok());
         config.session_token = Some("  \n".into());
         assert!(matches!(config.validate(), Err(Error::MissingCredentials)));
+    }
+
+    #[test]
+    fn solver_url_defaults_only_when_unset() {
+        assert_eq!(
+            solver_url_from_env(None).as_deref(),
+            Some(DEFAULT_SOLVER_URL)
+        );
+        assert_eq!(solver_url_from_env(Some(String::new())), None);
+        assert_eq!(solver_url_from_env(Some("  ".into())), None);
+        assert_eq!(
+            solver_url_from_env(Some(" http://solver:3000/ ".into())).as_deref(),
+            Some("http://solver:3000/")
+        );
     }
 
     #[test]
@@ -487,21 +473,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_login_data_from_profile_contact_id() {
+    fn parses_user_id_from_profile_contact_id() {
         assert_eq!(
-            login_data_from_login_payload(&json!({
+            user_id_from_login_payload(&json!({
                 "profile": {
                     "contact": { "id": 777 }
                 }
             }))
-            .unwrap()
-            .own_user_id,
+            .unwrap(),
             777
         );
     }
 
     #[test]
-    fn rejects_login_data_without_profile_contact_id() {
-        assert!(login_data_from_login_payload(&json!({ "profile": {} })).is_err());
+    fn rejects_login_without_valid_profile_contact_id() {
+        for payload in [
+            json!({ "profile": {} }),
+            json!({ "profile": { "contact": { "id": "777" } } }),
+            json!({ "profile": { "contact": { "id": null } } }),
+        ] {
+            assert!(user_id_from_login_payload(&payload).is_err());
+        }
     }
 }

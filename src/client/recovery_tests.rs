@@ -338,8 +338,6 @@ fn only_temporary_authentication_service_failures_are_retried() {
 
 #[tokio::test]
 async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let (client, listener) = local_client().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upload_url = format!("http://{}/", http.local_addr().unwrap());
@@ -354,13 +352,7 @@ async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client(
             json!({"info": [{"url": upload_url, "fileId": 100}]}),
         )
         .await;
-        let (mut upload, _) = http.accept().await.unwrap();
-        let mut buffer = [0; 4096];
-        assert!(upload.read(&mut buffer).await.unwrap() > 0);
-        upload
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        receive_upload(&http, b"contents").await;
         uploaded.send(()).unwrap();
         let packet = next_packet(&mut socket).await;
         assert_eq!(packet.opcode, opcode::MSG_SEND);
@@ -395,7 +387,7 @@ async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client(
 
 #[tokio::test]
 async fn attachment_completion_survives_an_unrelated_notification_burst() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let (client, listener) = local_client().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -412,14 +404,7 @@ async fn attachment_completion_survives_an_unrelated_notification_burst() {
         )
         .await;
 
-        let (mut upload, _) = http.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.ends_with(b"contents") {
-            let mut buffer = [0; 4096];
-            let size = upload.read(&mut buffer).await.unwrap();
-            assert!(size > 0);
-            request.extend_from_slice(&buffer[..size]);
-        }
+        let mut upload = receive_upload_request(&http, b"contents").await;
 
         let attached = Packet::request(900, opcode::NOTIF_ATTACH, json!({"fileId": 100}));
         socket
@@ -466,8 +451,6 @@ async fn attachment_completion_survives_an_unrelated_notification_burst() {
 
 #[tokio::test]
 async fn reconnect_replays_an_in_flight_document_upload() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let (client, listener) = local_client().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upload_url = format!("http://{}/", http.local_addr().unwrap());
@@ -490,21 +473,7 @@ async fn reconnect_replays_an_in_flight_document_upload() {
         )
         .await;
 
-        let (mut upload, _) = http.accept().await.unwrap();
-        let mut request = Vec::new();
-        loop {
-            let mut buffer = [0; 4096];
-            let size = upload.read(&mut buffer).await.unwrap();
-            assert!(size > 0);
-            request.extend_from_slice(&buffer[..size]);
-            if request.ends_with(b"book contents") {
-                break;
-            }
-        }
-        upload
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        receive_upload(&http, b"book contents").await;
         let attached = Packet::request(999, opcode::NOTIF_ATTACH, json!({"fileId": 101}));
         second
             .send(Message::text(serde_json::to_string(&attached).unwrap()))
@@ -550,7 +519,7 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
             json!({"info": [{"url": upload_url, "fileId": 100}]}),
         )
         .await;
-        receive_upload(&http).await;
+        receive_upload(&http, b"book contents").await;
         first
             .send(Message::text(
                 serde_json::to_string(&Packet::request(
@@ -575,7 +544,7 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
             json!({"info": [{"url": upload_url, "fileId": 101}]}),
         )
         .await;
-        receive_upload(&http).await;
+        receive_upload(&http, b"book contents").await;
         second
             .send(Message::text(
                 serde_json::to_string(&Packet::request(
@@ -615,8 +584,11 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
     runner.await.unwrap().unwrap();
 }
 
-async fn receive_upload(listener: &TcpListener) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn receive_upload_request(
+    listener: &TcpListener,
+    expected_body: &[u8],
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncReadExt;
 
     let (mut upload, _) = listener.accept().await.unwrap();
     let mut request = Vec::new();
@@ -625,10 +597,20 @@ async fn receive_upload(listener: &TcpListener) {
         let size = upload.read(&mut buffer).await.unwrap();
         assert!(size > 0);
         request.extend_from_slice(&buffer[..size]);
-        if request.ends_with(b"book contents") {
-            break;
+        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            let body = &request[header_end + 4..];
+            if body.len() >= expected_body.len() {
+                assert_eq!(body, expected_body);
+                return upload;
+            }
         }
     }
+}
+
+async fn receive_upload(listener: &TcpListener, expected_body: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut upload = receive_upload_request(listener, expected_body).await;
     upload
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await
