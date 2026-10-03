@@ -9,13 +9,14 @@ mod transport;
 mod recovery_tests;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+#[cfg(test)]
+use tokio::sync::oneshot;
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::LoginConfig;
@@ -38,11 +39,8 @@ pub trait ChatHandler: Send + Sync + 'static {
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const FILE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
-
-struct AttachmentWaiter {
-    owner: Arc<()>,
-    sender: oneshot::Sender<()>,
-}
+// Allows short notification bursts without delaying active upload receivers.
+const ATTACHMENT_NOTIFICATION_CAPACITY: usize = 32;
 
 struct ClientState {
     cid: i64,
@@ -52,7 +50,7 @@ struct ClientState {
 
 pub(crate) struct InnerClient {
     transport: Transport,
-    file_waiters: Mutex<HashMap<i64, AttachmentWaiter>>,
+    attachment_notifications: broadcast::Sender<i64>,
     login_config: Mutex<LoginConfig>,
     connect_lock: Mutex<()>,
     run_lock: Mutex<()>,
@@ -99,7 +97,6 @@ impl InnerClient {
         }
 
         self.msg_tx.lock().await.take();
-        self.file_waiters.lock().await.clear();
         self.transport.close().await;
         if let Some(task) = self.state.lock().await.keepalive_task.take() {
             task.abort();
@@ -123,42 +120,6 @@ pub struct MaxClient {
 
 // Cancelling the recovery future must wake pending sends and clean up the socket.
 struct RunGuard(Option<MaxClient>);
-
-// A cancelled upload must release its attachment-notification subscription.
-struct FileWaiter {
-    inner: Arc<InnerClient>,
-    owner: Arc<()>,
-    file_id: i64,
-}
-
-impl Drop for FileWaiter {
-    fn drop(&mut self) {
-        if let Ok(mut waiters) = self.inner.file_waiters.try_lock() {
-            remove_owned_waiter(&mut waiters, self.file_id, &self.owner);
-            return;
-        }
-        let inner = Arc::clone(&self.inner);
-        let owner = Arc::clone(&self.owner);
-        let file_id = self.file_id;
-        tokio::spawn(async move {
-            let mut waiters = inner.file_waiters.lock().await;
-            remove_owned_waiter(&mut waiters, file_id, &owner);
-        });
-    }
-}
-
-fn remove_owned_waiter(
-    waiters: &mut HashMap<i64, AttachmentWaiter>,
-    file_id: i64,
-    owner: &Arc<()>,
-) {
-    if waiters
-        .get(&file_id)
-        .is_some_and(|waiter| Arc::ptr_eq(&waiter.owner, owner))
-    {
-        waiters.remove(&file_id);
-    }
-}
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
@@ -192,7 +153,7 @@ impl MaxClient {
             .build()?;
         let inner = Arc::new(InnerClient {
             transport: Transport::new(),
-            file_waiters: Mutex::new(HashMap::new()),
+            attachment_notifications: broadcast::channel(ATTACHMENT_NOTIFICATION_CAPACITY).0,
             login_config: Mutex::new(config.clone()),
             connect_lock: Mutex::new(()),
             run_lock: Mutex::new(()),
@@ -445,21 +406,8 @@ impl MaxClient {
             .as_i64()
             .ok_or_else(|| Error::UnexpectedResponse("missing fileId".into()))?;
 
-        // Register a waiter for the NOTIF_ATTACH confirmation before uploading.
-        let (tx, rx) = oneshot::channel();
-        let owner = Arc::new(());
-        self.inner.file_waiters.lock().await.insert(
-            file_id,
-            AttachmentWaiter {
-                owner: Arc::clone(&owner),
-                sender: tx,
-            },
-        );
-        let _waiter = FileWaiter {
-            inner: Arc::clone(&self.inner),
-            owner,
-            file_id,
-        };
+        // Subscribe before uploading so an immediate NOTIF_ATTACH is not missed.
+        let mut attachment_notifications = self.inner.attachment_notifications.subscribe();
 
         let size = bytes.len();
         let upload = self
@@ -493,13 +441,20 @@ impl MaxClient {
         let processed = tokio::select! {
             biased;
             _ = connection.cancelled() => return Err(Error::ConnectionClosed),
-            result = tokio::time::timeout(FILE_PROCESS_TIMEOUT, rx) => result,
+            result = tokio::time::timeout(FILE_PROCESS_TIMEOUT, async {
+                loop {
+                    match attachment_notifications.recv().await {
+                        Ok(attached_file_id) if attached_file_id == file_id => return Ok(()),
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(Error::ConnectionClosed);
+                        }
+                    }
+                }
+            }) => result,
         };
         match processed {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                return Err(Error::ConnectionClosed);
-            }
+            Ok(result) => result?,
             Err(_) => {
                 return Err(Error::FileProcessingTimeout(file_id));
             }
@@ -684,15 +639,9 @@ mod tests {
     #[tokio::test]
     async fn keepalive_failure_finishes_cleanup_before_self_abort() {
         let client = MaxClient::new(test_config()).expect("client");
-        let (waiter_tx, _waiter_rx) = oneshot::channel();
-        let mut waiters = client.inner.file_waiters.lock().await;
-        waiters.insert(
-            1,
-            AttachmentWaiter {
-                owner: Arc::new(()),
-                sender: waiter_tx,
-            },
-        );
+        let (message_tx, mut messages) = mpsc::unbounded_channel();
+        let mut message_sender = client.inner.msg_tx.lock().await;
+        *message_sender = Some(message_tx);
         let connection = client.inner.recovery.begin_attempt().unwrap();
         client.inner.recovery.connected(&connection).unwrap();
 
@@ -711,12 +660,12 @@ mod tests {
         started_rx.await.expect("keepalive task must start");
         run_tx.send(()).unwrap();
         tokio::task::yield_now().await;
-        drop(waiters);
+        drop(message_sender);
 
         finished_rx
             .await
             .expect("self-abort must happen only after cleanup completes");
-        assert!(client.inner.file_waiters.lock().await.is_empty());
+        assert!(messages.recv().await.is_none());
         assert!(client.inner.state.lock().await.keepalive_task.is_none());
     }
 

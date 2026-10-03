@@ -95,9 +95,7 @@ async fn handle_server_request(
         }
         opcode::NOTIF_ATTACH => {
             if let Some(file_id) = packet.payload["fileId"].as_i64() {
-                if let Some(waiter) = inner.file_waiters.lock().await.remove(&file_id) {
-                    let _ = waiter.sender.send(());
-                }
+                let _ = inner.attachment_notifications.send(file_id);
             }
         }
         _ => {}

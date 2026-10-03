@@ -337,7 +337,7 @@ fn only_temporary_authentication_service_failures_are_retried() {
 }
 
 #[tokio::test]
-async fn cancelled_upload_removes_attachment_waiter_without_stopping_client() {
+async fn cancelled_upload_releases_attachment_subscription_without_stopping_client() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (client, listener) = local_client().await;
@@ -380,13 +380,10 @@ async fn cancelled_upload_removes_attachment_waiter_without_stopping_client() {
         }
     });
     uploaded_rx.await.unwrap();
-    assert_eq!(client.inner.file_waiters.lock().await.len(), 1);
+    assert_eq!(client.inner.attachment_notifications.receiver_count(), 1);
     sending.abort();
     assert!(sending.await.unwrap_err().is_cancelled());
-    assert!(
-        client.inner.file_waiters.lock().await.is_empty(),
-        "cancelled upload leaked its attachment waiter"
-    );
+    assert_eq!(client.inner.attachment_notifications.receiver_count(), 0);
     client
         .send_text(7, MaxMessage::new("ordinary request"))
         .await
