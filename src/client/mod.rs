@@ -27,7 +27,12 @@ use self::transport::Transport;
 
 /// Handles incoming messages dispatched by [`MaxClient`].
 pub trait ChatHandler: Send + Sync + 'static {
-    /// Called for each admitted incoming message.
+    /// Called promptly for each admitted incoming message.
+    ///
+    /// The client deliberately does not limit concurrent handler futures: a
+    /// handler may need to notify the user before waiting on expensive work.
+    /// Implementations should apply their own concurrency bound around that
+    /// expensive phase after sending the initial response.
     fn on_message(&self, msg: IncomingMessage) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -158,9 +163,15 @@ fn remove_owned_waiter(
 impl Drop for RunGuard {
     fn drop(&mut self) {
         if let Some(client) = self.0.take() {
-            tokio::spawn(async move {
-                client.disconnect().await;
-            });
+            // Make cancellation observable immediately. Socket cleanup remains
+            // asynchronous, but must not panic if the future is dropped after
+            // its runtime has already shut down.
+            client.inner.recovery.stop();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    client.disconnect().await;
+                });
+            }
         }
     }
 }
@@ -295,7 +306,7 @@ impl MaxClient {
             };
             let delay = match attempt {
                 Ok(incoming) => {
-                    backoff.reset();
+                    let connected_at = tokio::time::Instant::now();
                     dispatcher::run(
                         self.inner.handler_shutdown.clone(),
                         Arc::clone(&handler),
@@ -305,6 +316,7 @@ impl MaxClient {
                     if self.inner.recovery.shutdown.is_cancelled() {
                         break;
                     }
+                    backoff.reset_if_healthy(connected_at.elapsed());
                     Some(backoff.next_delay())
                 }
                 Err(error) => {
@@ -651,6 +663,19 @@ mod tests {
 
         config.operator = crate::auth::operator_channels::OperatorChannel::Cli;
         assert!(MaxClient::new(config).is_ok());
+    }
+
+    #[test]
+    fn dropping_run_guard_stops_recovery_without_a_runtime() {
+        let client = MaxClient::new(test_config()).expect("client");
+        let connection = client.inner.recovery.begin_attempt().unwrap();
+        client.inner.recovery.connected(&connection).unwrap();
+
+        drop(RunGuard(Some(client.clone())));
+
+        assert!(!client.inner.recovery.is_connected());
+        assert!(client.inner.recovery.shutdown.is_cancelled());
+        assert!(connection.is_cancelled());
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(120);
+pub(super) const HEALTHY_CONNECTION_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) struct Connection {
     cancelled: CancellationToken,
@@ -171,6 +172,12 @@ impl Backoff {
     pub(super) fn reset(&mut self) {
         self.delay = INITIAL_RECONNECT_DELAY;
     }
+
+    pub(super) fn reset_if_healthy(&mut self, connected_for: Duration) {
+        if connected_for >= HEALTHY_CONNECTION_INTERVAL {
+            self.reset();
+        }
+    }
 }
 
 pub(super) fn is_transport_failure(error: &Error) -> bool {
@@ -185,15 +192,31 @@ pub(super) fn is_transport_failure(error: &Error) -> bool {
 }
 
 pub(super) fn should_retry_connection(error: &Error) -> bool {
-    is_transport_failure(error)
-        || matches!(
-            error,
-            Error::Http(_)
-                | Error::Io(_)
-                | Error::CaptchaSolverUnavailable { .. }
-                | Error::CaptchaTimeout { .. }
-                | Error::CaptchaFailed(_)
-                | Error::UnknownCaptchaChallenge { .. }
-                | Error::Telegram(_)
-        )
+    if is_transport_failure(error) {
+        return true;
+    }
+
+    match error {
+        Error::Http(source) | Error::CaptchaSolverUnavailable { source, .. } => {
+            crate::error::is_transient_http_error(source)
+        }
+        Error::Io(source) => is_transient_io_error(source),
+        Error::CaptchaTimeout { .. } | Error::TelegramUnavailable(_) => true,
+        _ => false,
+    }
+}
+
+fn is_transient_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }

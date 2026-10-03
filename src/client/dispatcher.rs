@@ -22,6 +22,10 @@ pub(super) async fn run<H: ChatHandler>(
             },
         };
 
+        // Start every admitted handler promptly so it can acknowledge long work
+        // before waiting. The dispatcher cannot infer that acknowledgement point
+        // from the handler future; applications should bound only their expensive
+        // work after sending the initial response.
         tokio::spawn(run_handler(shutdown.clone(), Arc::clone(&handler), message));
     }
 }

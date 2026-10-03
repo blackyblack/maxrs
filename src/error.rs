@@ -30,9 +30,17 @@ pub enum Error {
     #[error("captcha solver is not configured; set MAX_SOLVER_URL to a running max_captcha_solver service or disable captcha solving explicitly")]
     CaptchaSolverDisabled,
 
-    /// Captcha solver service could not be reached or rejected the solve request.
+    /// Captcha solver service could not be reached or failed transiently.
     #[error("captcha solver is not available at {solver_url}; start max_captcha_solver or set MAX_SOLVER_URL to a reachable solver service: {source}")]
     CaptchaSolverUnavailable {
+        solver_url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    /// Captcha solver rejected a request that should not be retried unchanged.
+    #[error("captcha solver at {solver_url} rejected the solve request: {source}")]
+    CaptchaSolverRejected {
         solver_url: String,
         #[source]
         source: reqwest::Error,
@@ -91,6 +99,10 @@ pub enum Error {
     /// Telegram Bot API returned an error response.
     #[error("telegram operator channel failed: {0}")]
     Telegram(String),
+
+    /// Telegram operator channel failed transiently or timed out.
+    #[error("telegram operator channel is temporarily unavailable: {0}")]
+    TelegramUnavailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -99,6 +111,16 @@ impl From<tungstenite::Error> for Error {
     fn from(err: tungstenite::Error) -> Self {
         Self::WebSocket(Box::new(err))
     }
+}
+
+pub(crate) fn is_transient_http_error(error: &reqwest::Error) -> bool {
+    if let Some(status) = error.status() {
+        return status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+    }
+
+    error.is_connect() || error.is_timeout() || error.is_body()
 }
 
 #[cfg(test)]

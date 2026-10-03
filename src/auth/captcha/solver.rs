@@ -114,10 +114,17 @@ impl CaptchaSolver {
 
         if let Err(err) = result {
             self.pending.lock().await.remove(&challenge_id);
-            return Err(Error::CaptchaSolverUnavailable {
-                solver_url: solver_url.clone(),
-                source: err,
-            });
+            return if crate::error::is_transient_http_error(&err) {
+                Err(Error::CaptchaSolverUnavailable {
+                    solver_url: solver_url.clone(),
+                    source: err,
+                })
+            } else {
+                Err(Error::CaptchaSolverRejected {
+                    solver_url: solver_url.clone(),
+                    source: err,
+                })
+            };
         }
 
         let remaining = DEFAULT_CHALLENGE_TIMEOUT.saturating_sub(challenge_started_at.elapsed());

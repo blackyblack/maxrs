@@ -291,11 +291,44 @@ fn connection_backoff_doubles_caps_and_resets_after_success() {
 }
 
 #[test]
-fn temporary_authentication_service_failures_are_retried() {
+fn connection_backoff_only_resets_after_a_healthy_session() {
+    let mut backoff = recovery::Backoff::default();
+    assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    assert_eq!(backoff.next_delay(), Duration::from_secs(2));
+
+    backoff.reset_if_healthy(recovery::HEALTHY_CONNECTION_INTERVAL - Duration::from_millis(1));
+    assert_eq!(backoff.next_delay(), Duration::from_secs(4));
+
+    backoff.reset_if_healthy(recovery::HEALTHY_CONNECTION_INTERVAL);
+    assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+}
+
+#[test]
+fn only_temporary_authentication_service_failures_are_retried() {
     assert!(recovery::should_retry_connection(&Error::CaptchaTimeout {
         challenge_id: "challenge".into(),
     }));
-    assert!(recovery::should_retry_connection(&Error::Telegram(
+    assert!(recovery::should_retry_connection(
+        &Error::TelegramUnavailable("timed out waiting for SMS".into())
+    ));
+    assert!(!recovery::should_retry_connection(&Error::Telegram(
+        "invalid bot token".into(),
+    )));
+    assert!(!recovery::should_retry_connection(&Error::CaptchaFailed(
+        "invalid callback".into(),
+    )));
+    assert!(!recovery::should_retry_connection(
+        &Error::UnknownCaptchaChallenge {
+            challenge_id: "stale".into(),
+        }
+    ));
+    assert!(!recovery::should_retry_connection(&Error::Io(
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad callback bind")
+    )));
+    assert!(recovery::should_retry_connection(&Error::Io(
+        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "temporary failure")
+    )));
+    assert!(!recovery::should_retry_connection(&Error::Telegram(
         "timed out waiting for SMS".into(),
     )));
     assert!(!recovery::should_retry_connection(
