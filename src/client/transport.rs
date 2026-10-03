@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::protocol::{Packet, CMD_ERROR};
 
 use super::read_loop::read_loop;
-use super::InnerClient;
+use super::{recovery::Connection, InnerClient};
 
 const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
 const ORIGIN: &str = "https://web.max.ru";
@@ -31,6 +31,8 @@ pub(super) struct Transport {
     send_order: Mutex<()>,
     sink: Mutex<Option<WsSink>>,
     state: Mutex<TransportState>,
+    #[cfg(test)]
+    ws_url: std::sync::Mutex<Option<String>>,
 }
 
 struct TransportState {
@@ -43,6 +45,8 @@ impl Transport {
     pub(super) fn new() -> Self {
         Self {
             send_order: Mutex::new(()),
+            #[cfg(test)]
+            ws_url: std::sync::Mutex::new(None),
             sink: Mutex::new(None),
             state: Mutex::new(TransportState {
                 next_seq: 1,
@@ -55,12 +59,16 @@ impl Transport {
     pub(super) async fn connect(
         &self,
         owner: &Arc<InnerClient>,
+        connection: Arc<Connection>,
         header_user_agent: &str,
     ) -> Result<()> {
         self.close().await;
         let next_seq = self.state.lock().await.next_seq;
         tracing::info!(next_seq, url = WS_URL, "Opening Max WebSocket");
-        let mut request = WS_URL.into_client_request()?;
+        let url = WS_URL.to_string();
+        #[cfg(test)]
+        let url = self.ws_url.lock().unwrap().clone().unwrap_or(url);
+        let mut request = url.into_client_request()?;
         {
             let headers = request.headers_mut();
             headers.insert("Origin", HeaderValue::from_static(ORIGIN));
@@ -71,7 +79,7 @@ impl Transport {
         let (sink, read) = stream.split();
 
         *self.sink.lock().await = Some(sink);
-        let task = tokio::spawn(read_loop(read, Arc::clone(owner)));
+        let task = tokio::spawn(read_loop(read, Arc::clone(owner), connection));
         self.state.lock().await.read_task = Some(task);
         tracing::info!(
             next_seq,
@@ -90,6 +98,11 @@ impl Transport {
             Err(_) => return Err(Error::Timeout(packet.opcode)),
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_url(&self, url: String) {
+        *self.ws_url.lock().unwrap() = Some(url);
     }
 
     pub(super) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {

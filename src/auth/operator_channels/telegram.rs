@@ -16,28 +16,24 @@ async fn request_text(config: &TelegramOperatorConfig, text: &str) -> Result<Str
     let base = format!("https://{TELEGRAM_API_HOST}/bot{}", config.bot_token);
     let mut offset = next_update_offset(&fetch_updates(&http, &base, 0, None).await?)?;
 
-    let send: Value = http
+    let send_response = http
         .post(format!("{base}/sendMessage"))
         .json(&serde_json::json!({ "chat_id": config.chat_id, "text": text }))
         .send()
-        .await?
-        .json()
         .await?;
-    if !send["ok"].as_bool().unwrap_or(false) {
-        return Err(Error::Telegram(send.to_string()));
-    }
+    let send_status = send_response.status();
+    ensure_telegram_http_status(send_status)?;
+    let send: Value = send_response.json().await?;
+    ensure_telegram_success(send_status, &send)?;
 
     let deadline = tokio::time::Instant::now() + config.poll_timeout;
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(Error::Telegram(
+            return Err(Error::TelegramUnavailable(
                 "timed out waiting for an SMS code reply from the configured Telegram chat".into(),
             ));
         }
         let resp = fetch_updates(&http, &base, 20, Some(offset)).await?;
-        if !resp["ok"].as_bool().unwrap_or(false) {
-            return Err(Error::Telegram(resp.to_string()));
-        }
         let updates = if let Some(updates) = resp["result"].as_array() {
             updates
         } else {
@@ -99,13 +95,16 @@ async fn fetch_updates(
         request = request.query(&[("offset", offset)]);
     }
 
-    request.send().await?.json().await.map_err(|e| e.into())
+    let response = request.send().await?;
+    let status = response.status();
+    ensure_telegram_http_status(status)?;
+    let payload = response.json().await?;
+    ensure_telegram_success(status, &payload)?;
+    Ok(payload)
 }
 
 fn next_update_offset(resp: &Value) -> Result<i64> {
-    if !resp["ok"].as_bool().unwrap_or(false) {
-        return Err(Error::Telegram(resp.to_string()));
-    }
+    ensure_telegram_success(reqwest::StatusCode::OK, resp)?;
 
     Ok(resp["result"]
         .as_array()
@@ -117,6 +116,31 @@ fn next_update_offset(resp: &Value) -> Result<i64> {
         })
         .map(|id| id + 1)
         .unwrap_or_default())
+}
+
+fn ensure_telegram_http_status(status: reqwest::StatusCode) -> Result<()> {
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        Err(Error::TelegramUnavailable(format!("HTTP {status}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_telegram_success(status: reqwest::StatusCode, response: &Value) -> Result<()> {
+    ensure_telegram_http_status(status)?;
+    if response["ok"].as_bool().unwrap_or(false) {
+        return Ok(());
+    }
+
+    let error_code = response["error_code"].as_u64();
+    if error_code == Some(429) || error_code.is_some_and(|code| (500..600).contains(&code)) {
+        Err(Error::TelegramUnavailable(response.to_string()))
+    } else {
+        Err(Error::Telegram(response.to_string()))
+    }
 }
 
 fn operator_text_from_update(update: &Value, chat_id: i64, bot_user_id: i64) -> Option<String> {
@@ -190,5 +214,30 @@ mod tests {
             next_update_offset(&json!({ "ok": true, "result": [] })).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn distinguishes_permanent_and_temporary_bot_api_errors() {
+        assert!(matches!(
+            ensure_telegram_success(
+                reqwest::StatusCode::UNAUTHORIZED,
+                &json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+            ),
+            Err(Error::Telegram(_))
+        ));
+        assert!(matches!(
+            ensure_telegram_success(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                &json!({"ok": false, "error_code": 429, "description": "Too Many Requests"}),
+            ),
+            Err(Error::TelegramUnavailable(_))
+        ));
+        assert!(matches!(
+            ensure_telegram_success(
+                reqwest::StatusCode::BAD_GATEWAY,
+                &json!({"ok": false, "error_code": 502, "description": "Bad Gateway"}),
+            ),
+            Err(Error::TelegramUnavailable(_))
+        ));
     }
 }

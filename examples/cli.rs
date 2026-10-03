@@ -7,11 +7,7 @@ use maxrs::models::IncomingMessage;
 struct PrintHandler;
 
 impl ChatHandler for PrintHandler {
-    async fn on_message(
-        &self,
-        _client: &MaxClient,
-        msg: IncomingMessage,
-    ) -> Result<(), maxrs::error::Error> {
+    async fn on_message(&self, msg: IncomingMessage) -> Result<(), maxrs::error::Error> {
         let text = if msg.text.trim().is_empty() {
             "[non-text message]"
         } else {
@@ -42,17 +38,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let login_config = LoginConfig::from_env()?;
     let client = MaxClient::new(login_config)?;
-    let (session, connected) = client.connect(PrintHandler).await?;
-    println!("Logged in. Session token is stored in {SESSION_TOKEN_FILE} when refreshed.");
-    tracing::debug!(token = %session.token, "logged in to Max");
+    println!("Session token is stored in {SESSION_TOKEN_FILE} when refreshed.");
     println!("Listening for incoming messages (Ctrl-C to quit)...");
 
-    let run = connected.run();
-    tokio::pin!(run);
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = &mut run => {
-            tracing::warn!("connection closed");
+    // Drop the pinned runner before disconnecting so a cancelled connection
+    // attempt cannot keep holding the connection lock during shutdown.
+    {
+        let run = client.run(PrintHandler);
+        tokio::pin!(run);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            result = &mut run => result?,
         }
     }
     client.disconnect().await;

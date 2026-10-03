@@ -23,6 +23,7 @@ thiserror = "1"
 tracing = { version = "0.1", features = ["log"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 dotenv = "0.15"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

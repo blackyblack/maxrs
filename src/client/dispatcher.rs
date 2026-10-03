@@ -1,135 +1,47 @@
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
-#[cfg(test)]
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::models::IncomingMessage;
 
-use super::{ChatHandler, MaxClient};
-
-pub(super) struct DispatcherRoot {
-    shutdown: CancellationToken,
-    busy: Mutex<HashSet<i64>>,
-    #[cfg(test)]
-    freed: Notify,
-}
-
-impl DispatcherRoot {
-    pub(super) fn new() -> Self {
-        Self {
-            shutdown: CancellationToken::new(),
-            busy: Mutex::new(HashSet::new()),
-            #[cfg(test)]
-            freed: Notify::new(),
-        }
-    }
-
-    fn remove_busy(&self, chat_id: i64) {
-        self.busy
-            .lock()
-            .expect("dispatcher busy set poisoned")
-            .remove(&chat_id);
-        #[cfg(test)]
-        self.freed.notify_waiters();
-    }
-
-    pub(super) fn abort(&self) {
-        self.shutdown.cancel();
-    }
-}
-
-struct BusyEntry {
-    root: Arc<DispatcherRoot>,
-    chat_id: i64,
-}
-
-impl Drop for BusyEntry {
-    fn drop(&mut self) {
-        self.root.remove_busy(self.chat_id);
-    }
-}
-
-#[cfg(test)]
-impl DispatcherRoot {
-    async fn wait_chat_free(&self, chat_id: i64) {
-        loop {
-            let notified = self.freed.notified();
-            if !self
-                .busy
-                .lock()
-                .expect("dispatcher busy set poisoned")
-                .contains(&chat_id)
-            {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
+use super::ChatHandler;
 
 pub(super) async fn run<H: ChatHandler>(
-    root: Arc<DispatcherRoot>,
-    client: MaxClient,
-    handler: H,
+    shutdown: CancellationToken,
+    handler: Arc<H>,
     mut incoming: mpsc::UnboundedReceiver<IncomingMessage>,
 ) {
-    let handler = Arc::new(handler);
-
     loop {
         let message = tokio::select! {
             biased;
-            _ = root.shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => break,
             message = incoming.recv() => match message {
                 Some(message) => message,
                 None => break,
             },
         };
 
-        let admitted = {
-            let mut busy = root.busy.lock().expect("dispatcher busy set poisoned");
-            if busy.contains(&message.chat_id) {
-                false
-            } else {
-                busy.insert(message.chat_id);
-                true
-            }
-        };
-
-        if !admitted {
-            tracing::warn!(
-                chat_id = message.chat_id,
-                message_id = message.message_id,
-                "dropping message because its chat is busy"
-            );
-            continue;
-        }
-
-        tokio::spawn(run_handler(
-            Arc::clone(&root),
-            client.clone(),
-            Arc::clone(&handler),
-            message,
-        ));
+        // Start every admitted handler promptly so it can acknowledge long work
+        // before waiting. The dispatcher cannot infer that acknowledgement point
+        // from the handler future; applications should bound only their expensive
+        // work after sending the initial response.
+        tokio::spawn(run_handler(shutdown.clone(), Arc::clone(&handler), message));
     }
 }
 
 async fn run_handler<H: ChatHandler>(
-    root: Arc<DispatcherRoot>,
-    client: MaxClient,
+    shutdown: CancellationToken,
     handler: Arc<H>,
     message: IncomingMessage,
 ) {
     let chat_id = message.chat_id;
     let message_id = message.message_id;
-    let busy = BusyEntry { root, chat_id };
 
     tokio::select! {
         biased;
-        _ = busy.root.shutdown.cancelled() => {}
-        result = handler.on_message(&client, message) => {
+        _ = shutdown.cancelled() => {}
+        result = handler.on_message(message) => {
             if let Err(err) = result {
                 tracing::warn!(chat_id, message_id, %err, "message handler failed");
             }
@@ -141,18 +53,30 @@ async fn run_handler<H: ChatHandler>(
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::Mutex;
 
     use tokio::sync::Semaphore;
 
     use crate::auth::LoginConfig;
+    use crate::client::MaxClient;
     use crate::error::{Error, Result};
 
     use super::*;
 
     type HandlerFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-    type HandlerCallback = dyn Fn(&MaxClient, IncomingMessage) -> HandlerFuture + Send + Sync;
+    type HandlerCallback = dyn Fn(IncomingMessage) -> HandlerFuture + Send + Sync;
 
     struct TestHandler(Arc<HandlerCallback>);
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
 
     impl TestHandler {
         fn new(on_message: Arc<HandlerCallback>) -> Self {
@@ -161,12 +85,8 @@ mod tests {
     }
 
     impl ChatHandler for TestHandler {
-        fn on_message(
-            &self,
-            client: &MaxClient,
-            message: IncomingMessage,
-        ) -> impl Future<Output = Result<()>> + Send {
-            (self.0)(client, message)
+        fn on_message(&self, message: IncomingMessage) -> impl Future<Output = Result<()>> + Send {
+            (self.0)(message)
         }
     }
 
@@ -174,7 +94,7 @@ mod tests {
         MaxClient::new(LoginConfig {
             phone: None,
             password: None,
-            session_token: None,
+            session_token: Some("test-token".into()),
             captcha: crate::auth::AuthCaptchaConfig {
                 solver_url: None,
                 callback_bind: "127.0.0.1:0".into(),
@@ -195,37 +115,21 @@ mod tests {
         }
     }
 
-    fn connected(
-        root: Arc<DispatcherRoot>,
-        client: MaxClient,
-        handler: TestHandler,
-        incoming: mpsc::UnboundedReceiver<IncomingMessage>,
-    ) -> super::super::ConnectedClient<TestHandler> {
-        super::super::ConnectedClient {
-            client,
-            handler,
-            incoming,
-            dispatcher: root,
-        }
-    }
-
     async fn serve(
         handler: TestHandler,
     ) -> (
         mpsc::UnboundedSender<IncomingMessage>,
-        Arc<DispatcherRoot>,
+        CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
-        let client = client();
-        let root = Arc::new(DispatcherRoot::new());
+        let root = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();
-        let connected = connected(Arc::clone(&root), client, handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
         (tx, root, run_task)
     }
 
-    fn stop(root: &DispatcherRoot) {
-        root.abort();
+    fn stop(root: &CancellationToken) {
+        root.cancel();
     }
 
     #[tokio::test]
@@ -233,7 +137,7 @@ mod tests {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
@@ -253,16 +157,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_message_is_dropped_and_chat_runs_again_after_completion() {
+    async fn same_chat_message_is_dispatched_while_previous_is_pending() {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
-                if message.chat_id == 1 {
+                if message.message_id == 1 {
                     gate.acquire().await.unwrap().forget();
                 }
                 Ok(())
@@ -273,39 +177,38 @@ mod tests {
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         tx.send(message(1, 2)).unwrap();
-        tx.send(message(2, 99)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(99));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("new message should be dispatched while the previous handler is pending"),
+            Some(2)
+        );
         gate.add_permits(1);
-        root.wait_chat_free(1).await;
-
-        tx.send(message(1, 3)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(3));
         stop(&root);
     }
 
     #[tokio::test]
-    async fn erroring_handler_frees_chat() {
+    async fn erroring_handler_does_not_stop_dispatch() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
                 Err(Error::UnexpectedResponse("expected test error".into()))
             })
         }));
-        let (tx, root, _run_task) = serve(handler).await;
+        let (tx, _root, _run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
-        root.wait_chat_free(1).await;
         tx.send(message(1, 2)).unwrap();
         assert_eq!(started_rx.recv().await, Some(2));
     }
 
     #[tokio::test]
-    async fn panicking_handler_frees_chat() {
+    async fn panicking_handler_does_not_stop_dispatch() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |message| {
             let started_tx = started_tx.clone();
             Box::pin(async move {
                 started_tx.send(message.message_id).unwrap();
@@ -315,11 +218,10 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, _run_task) = serve(handler).await;
+        let (tx, _root, _run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
-        root.wait_chat_free(1).await;
         tx.send(message(1, 2)).unwrap();
         assert_eq!(started_rx.recv().await, Some(2));
     }
@@ -331,7 +233,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -348,7 +250,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, run_task) = serve(handler).await;
+        let (tx, _root, run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
@@ -356,7 +258,6 @@ mod tests {
         run_task.await.unwrap();
         gate.add_permits(1);
         finished_rx.await.unwrap();
-        root.wait_chat_free(1).await;
     }
 
     #[tokio::test]
@@ -366,7 +267,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |_, _| {
+        let handler = TestHandler::new(Arc::new(move |_| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -383,7 +284,7 @@ mod tests {
                 Ok(())
             })
         }));
-        let (tx, root, run_task) = serve(handler).await;
+        let (tx, _root, run_task) = serve(handler).await;
 
         tx.send(message(1, 1)).unwrap();
         started_rx.recv().await.unwrap();
@@ -395,17 +296,16 @@ mod tests {
         finished_rx
             .await
             .expect("cancelling run must not abort an accepted handler");
-        root.wait_chat_free(1).await;
     }
 
     #[tokio::test]
-    async fn connection_failure_does_not_cancel_accepted_handler() {
+    async fn reconnect_does_not_cancel_accepted_handler() {
         let gate = Arc::new(Semaphore::new(0));
         let handler_gate = Arc::clone(&gate);
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let handler = TestHandler::new(Arc::new(move |message| {
             let gate = Arc::clone(&handler_gate);
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
@@ -423,87 +323,87 @@ mod tests {
             })
         }));
         let client = client();
-        let root = Arc::new(DispatcherRoot::new());
+        let connection = client.inner.recovery.begin_attempt().unwrap();
+        client.inner.recovery.connected(&connection).unwrap();
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            root: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(2, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         drop(tx);
-        client.inner.fail().await;
+        client.inner.close_connection(Some(&connection)).await;
         run_task.await.unwrap();
+        client.inner.close_connection(None).await;
 
         gate.add_permits(1);
         finished_rx
             .await
-            .expect("connection failure must not abort accepted handler");
-        root.wait_chat_free(2).await;
+            .expect("reconnect must not abort accepted handler");
     }
 
     #[tokio::test]
     async fn disconnect_after_connection_failure_still_aborts_handler() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let (aborted_tx, aborted_rx) = tokio::sync::oneshot::channel();
+        let aborted_tx = Arc::new(Mutex::new(Some(aborted_tx)));
+        let handler = TestHandler::new(Arc::new(move |message| {
             let started_tx = started_tx.clone();
+            let aborted_tx = Arc::clone(&aborted_tx);
             Box::pin(async move {
+                let _aborted = DropSignal(aborted_tx.lock().unwrap().take());
                 started_tx.send(message.message_id).unwrap();
                 std::future::pending::<()>().await;
                 Ok(())
             })
         }));
         let client = client();
-        let root = Arc::new(DispatcherRoot::new());
+        let connection = client.inner.recovery.begin_attempt().unwrap();
+        client.inner.recovery.connected(&connection).unwrap();
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            root: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(3, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         drop(tx);
-        client.inner.fail().await;
+        client.inner.close_connection(Some(&connection)).await;
         run_task.await.unwrap();
 
         client.disconnect().await;
-        root.wait_chat_free(3).await;
+        aborted_rx.await.expect("disconnect must abort the handler");
     }
 
     #[tokio::test]
     async fn disconnect_stops_run_aborts_handler_and_rejects_new_messages() {
         let gate = Arc::new(Semaphore::new(0));
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let handler = TestHandler::new(Arc::new(move |_, message| {
+        let (aborted_tx, aborted_rx) = tokio::sync::oneshot::channel();
+        let aborted_tx = Arc::new(Mutex::new(Some(aborted_tx)));
+        let handler = TestHandler::new(Arc::new(move |message| {
             let gate = Arc::clone(&gate);
             let started_tx = started_tx.clone();
+            let aborted_tx = Arc::clone(&aborted_tx);
             Box::pin(async move {
+                let _aborted = DropSignal(aborted_tx.lock().unwrap().take());
                 started_tx.send(message.message_id).unwrap();
                 gate.acquire().await.unwrap().forget();
                 Ok(())
             })
         }));
         let client = client();
-        let root = Arc::new(DispatcherRoot::new());
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            root: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
-        let run_task = tokio::spawn(connected.run());
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(1, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         client.disconnect().await;
         run_task.await.unwrap();
-        root.wait_chat_free(1).await;
+        aborted_rx.await.expect("disconnect must abort the handler");
         assert!(tx.send(message(2, 2)).is_err());
         assert!(started_rx.try_recv().is_err());
     }
@@ -513,8 +413,10 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
         let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |client, _| {
-            let client = client.clone();
+        let client = client();
+        let handler_client = client.clone();
+        let handler = TestHandler::new(Arc::new(move |_| {
+            let client = handler_client.clone();
             let started_tx = started_tx.clone();
             let finished_tx = Arc::clone(&finished_tx);
             Box::pin(async move {
@@ -530,17 +432,12 @@ mod tests {
                 Ok(())
             })
         }));
-        let client = client();
-        let root = Arc::new(DispatcherRoot::new());
+        let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(super::super::DispatcherSender {
-            tx: Some(tx.clone()),
-            root: Arc::clone(&root),
-        });
-        let connected = connected(Arc::clone(&root), client.clone(), handler, rx);
+        *client.inner.msg_tx.lock().await = Some(tx.clone());
         let state_owner = client.clone();
         let state_guard = state_owner.inner.state.lock().await;
-        let run_task = tokio::spawn(connected.run());
+        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(1, 1)).unwrap();
         started_rx.recv().await.unwrap();
@@ -555,6 +452,5 @@ mod tests {
         finished_rx
             .await
             .expect("handler must finish disconnect cleanup before it is aborted");
-        root.wait_chat_free(1).await;
     }
 }

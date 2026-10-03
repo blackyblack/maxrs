@@ -60,6 +60,25 @@ pub struct LoginConfig {
 }
 
 impl LoginConfig {
+    /// Validates that saved-token login or interactive SMS login is possible.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let present = |value: &Option<String>| {
+            value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        };
+        if present(&self.session_token) {
+            return Ok(());
+        }
+        if !present(&self.phone) {
+            return Err(Error::MissingCredentials);
+        }
+        if matches!(self.operator, OperatorChannel::None) {
+            return Err(Error::NoOperatorChannel);
+        }
+        Ok(())
+    }
+
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             phone: env_string(ENV_PHONE),
@@ -362,6 +381,28 @@ fn normalize_callback_addr(callback_addr: SocketAddr) -> SocketAddr {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn login_config_requires_credentials_and_an_sms_operator() {
+        let mut config = LoginConfig {
+            phone: None,
+            password: None,
+            session_token: None,
+            captcha: AuthCaptchaConfig::disabled(),
+            operator: OperatorChannel::None,
+        };
+        assert!(matches!(config.validate(), Err(Error::MissingCredentials)));
+        config.phone = Some("+79990000000".into());
+        assert!(matches!(config.validate(), Err(Error::NoOperatorChannel)));
+        config.operator = OperatorChannel::Cli;
+        assert!(config.validate().is_ok());
+        config.phone = None;
+        config.operator = OperatorChannel::None;
+        config.session_token = Some("saved-token".into());
+        assert!(config.validate().is_ok());
+        config.session_token = Some("  \n".into());
+        assert!(matches!(config.validate(), Err(Error::MissingCredentials)));
+    }
 
     #[test]
     fn trims_session_token_file_contents() {
