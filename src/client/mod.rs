@@ -170,12 +170,8 @@ impl MaxClient {
     ///
     /// Call [`MaxClient::run`] to connect and dispatch messages with automatic recovery.
     pub fn new(config: LoginConfig) -> Result<Self> {
-        Self::new_with_user_agent(config, UserAgent::default())
-    }
-
-    /// Like [`MaxClient::new`] but with a custom [`UserAgent`].
-    pub fn new_with_user_agent(config: LoginConfig, user_agent: UserAgent) -> Result<Self> {
         config.validate()?;
+        let user_agent = UserAgent::default();
         let header_user_agent = user_agent.header_user_agent.clone();
         let http = reqwest::Client::builder()
             .user_agent(header_user_agent)
@@ -382,18 +378,6 @@ impl MaxClient {
         }
     }
 
-    /// Sends a "typing..." notification to `chat_id`.
-    pub async fn send_typing(&self, chat_id: i64) -> Result<()> {
-        let connection = self.inner.recovery.current().await?;
-        let payload = json!({
-            "chatId": chat_id,
-            "type": "TEXT",
-        });
-        self.invoke(&connection, opcode::MSG_TYPING, payload)
-            .await?;
-        Ok(())
-    }
-
     /// Uploads a file from an in-memory byte buffer and sends it to `chat_id`.
     ///
     /// The `file_name` is sent in the HTTP `Content-Disposition` header.
@@ -511,11 +495,6 @@ impl MaxClient {
         Ok(())
     }
 
-    /// Returns whether the logged-in connection is available for application messages.
-    pub async fn is_connected(&self) -> bool {
-        self.inner.recovery.is_connected()
-    }
-
     /// Stops recovery, wakes pending sends, and aborts dispatch and handlers.
     /// Shutdown is terminal for this handle and all its clones.
     pub async fn disconnect(&self) {
@@ -523,15 +502,6 @@ impl MaxClient {
         let _lock = self.inner.connect_lock.lock().await;
         self.inner.close_connection(None).await;
         self.inner.handler_shutdown.cancel();
-    }
-
-    /// Sends a single keepalive ping. Mostly useful for tests; the background
-    /// task pings automatically.
-    pub async fn ping(&self) -> Result<()> {
-        let connection = self.inner.recovery.current().await?;
-        self.invoke(&connection, opcode::PING, json!({ "interactive": false }))
-            .await?;
-        Ok(())
     }
 
     async fn invoke(

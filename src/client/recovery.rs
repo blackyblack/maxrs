@@ -130,6 +130,7 @@ impl Recovery {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn is_connected(&self) -> bool {
         matches!(
             *self.state.lock().expect("Max recovery state"),

@@ -31,7 +31,7 @@ async fn local_client() -> (MaxClient, TcpListener) {
 
 async fn wait_for_connection(client: &MaxClient, expected: bool) {
     tokio::time::timeout(Duration::from_secs(2), async {
-        while client.is_connected().await != expected {
+        while client.inner.recovery.is_connected() != expected {
             tokio::task::yield_now().await;
         }
     })
@@ -92,7 +92,7 @@ async fn next_packet(
 #[tokio::test]
 async fn run_reconnects_and_pending_send_uses_same_handle_and_saved_token() {
     let (client, listener) = local_client().await;
-    assert!(!client.is_connected().await);
+    assert!(!client.inner.recovery.is_connected());
     let (first_ready, first_started) = oneshot::channel();
     let (close_first, close_requested) = oneshot::channel();
     let server = tokio::spawn(async move {
@@ -125,7 +125,7 @@ async fn run_reconnects_and_pending_send_uses_same_handle_and_saved_token() {
     .unwrap();
     client.disconnect().await;
     runner.await.unwrap().unwrap();
-    assert!(!client.is_connected().await);
+    assert!(!client.inner.recovery.is_connected());
     server.abort();
 }
 
@@ -225,7 +225,7 @@ async fn permanent_send_error_does_not_retry_or_disconnect() {
     });
     let result = client.send_text(7, MaxMessage::new("invalid")).await;
     assert!(matches!(result, Err(Error::Server { .. })));
-    assert!(client.is_connected().await);
+    assert!(client.inner.recovery.is_connected());
     client
         .send_text(7, MaxMessage::new("second"))
         .await
@@ -256,7 +256,7 @@ async fn disconnect_wakes_waiting_sends_and_stops_recovery() {
     ));
     runner.await.unwrap().unwrap();
     drop(socket);
-    assert!(!client.is_connected().await);
+    assert!(!client.inner.recovery.is_connected());
 }
 
 #[tokio::test]
@@ -546,7 +546,7 @@ async fn runner_rejects_competing_run_without_stopping_owner() {
         client.run(Handler).await,
         Err(Error::ClientAlreadyRunning)
     ));
-    assert!(!client.is_connected().await);
+    assert!(!client.inner.recovery.is_connected());
     client.disconnect().await;
     runner.await.unwrap().unwrap();
     drop(socket);
