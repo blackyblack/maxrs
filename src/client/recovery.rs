@@ -1,152 +1,142 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use serde_json::Value;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use super::{attachment_registry::AttachmentRegistry, transport::Transport};
 use crate::error::{Error, Result};
+use crate::protocol::Packet;
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(120);
 pub(super) const HEALTHY_CONNECTION_INTERVAL: Duration = Duration::from_secs(60);
 
-pub(super) struct Connection {
-    cancelled: CancellationToken,
+/// Resources belong to one socket generation, including during authentication.
+pub(crate) struct Connection {
+    pub(super) transport: Transport,
+    pub(super) attachment_registry: AttachmentRegistry,
+    pub(super) cancellation: CancellationToken,
+    own_user_id: Mutex<Option<i64>>,
 }
 
 impl Connection {
-    fn new() -> Self {
+    fn new(cancellation: CancellationToken) -> Self {
         Self {
-            cancelled: CancellationToken::new(),
+            transport: Transport::new(),
+            attachment_registry: AttachmentRegistry::default(),
+            cancellation,
+            own_user_id: Mutex::new(None),
         }
     }
 
     pub(super) async fn cancelled(&self) {
-        self.cancelled.cancelled().await;
+        self.cancellation.cancelled().await;
     }
 
-    fn cancel(&self) {
-        self.cancelled.cancel();
+    pub(super) fn cancel(&self) {
+        self.cancellation.cancel();
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.is_cancelled()
+        self.cancellation.is_cancelled()
+    }
+
+    pub(crate) fn set_own_user_id(&self, id: i64) {
+        *self.own_user_id.lock().expect("session user id") = Some(id);
+    }
+
+    pub(super) fn own_user_id(&self) -> Option<i64> {
+        *self.own_user_id.lock().expect("session user id")
+    }
+
+    pub(crate) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancelled() => return Err(Error::ConnectionClosed),
+            result = self.transport.invoke(opcode, payload) => result,
+        };
+        if result.as_ref().is_err_and(is_transport_failure) {
+            self.cancel();
+        }
+        result
     }
 }
 
+#[derive(Clone)]
 enum State {
-    Disconnected(Option<Arc<Connection>>),
-    Connected(Arc<Connection>),
+    Offline,
+    Ready(Arc<Connection>),
     Stopped,
 }
 
-impl State {
-    fn connection(&self) -> Option<&Arc<Connection>> {
-        match self {
-            Self::Disconnected(connection) => connection.as_ref(),
-            Self::Connected(connection) => Some(connection),
-            Self::Stopped => None,
-        }
-    }
-}
-
 pub(super) struct Recovery {
-    state: Mutex<State>,
-    changed: Notify,
+    state: watch::Sender<State>,
     pub(super) shutdown: CancellationToken,
 }
 
 impl Recovery {
     pub(super) fn new() -> Self {
         Self {
-            state: Mutex::new(State::Disconnected(None)),
-            changed: Notify::new(),
+            state: watch::channel(State::Offline).0,
             shutdown: CancellationToken::new(),
         }
     }
 
     pub(super) fn begin_attempt(&self) -> Result<Arc<Connection>> {
-        let connection = Arc::new(Connection::new());
-        let mut state = self.state.lock().expect("Max recovery state");
-        if matches!(*state, State::Stopped) {
-            connection.cancel();
+        if self.shutdown.is_cancelled() {
             return Err(Error::ConnectionClosed);
         }
-        if let Some(previous) = state.connection() {
-            previous.cancel();
-        }
-        *state = State::Disconnected(Some(Arc::clone(&connection)));
-        self.changed.notify_waiters();
-        Ok(connection)
+        Ok(Arc::new(Connection::new(self.shutdown.child_token())))
     }
 
+    // Only the runner publishes readiness and takes a session offline.
     pub(super) fn connected(&self, connection: &Arc<Connection>) -> Result<()> {
-        let mut state = self.state.lock().expect("Max recovery state");
-        let is_current = state
-            .connection()
-            .is_some_and(|current| Arc::ptr_eq(current, connection));
-        if self.shutdown.is_cancelled() || connection.is_cancelled() || !is_current {
-            return Err(Error::ConnectionClosed);
-        }
-        *state = State::Connected(Arc::clone(connection));
-        self.changed.notify_waiters();
-        Ok(())
-    }
-
-    pub(super) fn disconnect(&self, current: Option<&Arc<Connection>>) -> bool {
-        let mut state = self.state.lock().expect("Max recovery state");
-        if let Some(current) = current {
-            let is_current = state
-                .connection()
-                .is_some_and(|connection| Arc::ptr_eq(connection, current));
-            if !is_current {
+        let published = self.state.send_if_modified(|state| {
+            if matches!(state, State::Stopped) || connection.is_cancelled() {
                 return false;
             }
+            *state = State::Ready(Arc::clone(connection));
+            true
+        });
+        if published {
+            Ok(())
+        } else {
+            Err(Error::ConnectionClosed)
         }
-        if matches!(*state, State::Stopped) {
-            return current.is_none();
-        }
-        if let Some(connection) = state.connection() {
-            connection.cancel();
-        }
-        *state = State::Disconnected(None);
-        self.changed.notify_waiters();
-        true
+    }
+
+    pub(super) fn offline(&self) {
+        self.state.send_if_modified(|state| {
+            if matches!(state, State::Stopped) {
+                return false;
+            }
+            *state = State::Offline;
+            true
+        });
     }
 
     pub(super) async fn current(&self) -> Result<Arc<Connection>> {
+        let mut state = self.state.subscribe();
         loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
-                let state = self.state.lock().expect("Max recovery state");
-                match &*state {
-                    State::Connected(connection) => return Ok(Arc::clone(connection)),
-                    State::Stopped => return Err(Error::ConnectionClosed),
-                    State::Disconnected(_) => {}
-                }
+            match state.borrow_and_update().clone() {
+                State::Ready(connection) if !connection.is_cancelled() => return Ok(connection),
+                State::Stopped => return Err(Error::ConnectionClosed),
+                _ => {}
             }
-            notified.await;
+            state.changed().await.map_err(|_| Error::ConnectionClosed)?;
         }
     }
 
     #[cfg(test)]
     pub(super) fn is_connected(&self) -> bool {
-        matches!(
-            *self.state.lock().expect("Max recovery state"),
-            State::Connected(_)
-        )
+        matches!(&*self.state.borrow(), State::Ready(connection) if !connection.is_cancelled())
     }
 
     pub(super) fn stop(&self) {
-        let mut state = self.state.lock().expect("Max recovery state");
-        if let Some(connection) = state.connection() {
-            connection.cancel();
-        }
-        *state = State::Stopped;
         self.shutdown.cancel();
-        self.changed.notify_waiters();
+        self.state.send_replace(State::Stopped);
     }
 }
 

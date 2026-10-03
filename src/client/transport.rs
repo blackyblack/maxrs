@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,10 +17,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use crate::error::{Error, Result};
 use crate::protocol::{Packet, CMD_ERROR};
 
-use super::read_loop::read_loop;
-use super::{recovery::Connection, InnerClient};
-
-const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
+pub(super) const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
 const ORIGIN: &str = "https://web.max.ru";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -31,43 +29,31 @@ pub(super) struct Transport {
     send_order: Mutex<()>,
     sink: Mutex<Option<WsSink>>,
     state: Mutex<TransportState>,
-    #[cfg(test)]
-    ws_url: std::sync::Mutex<Option<String>>,
 }
 
 struct TransportState {
     next_seq: u32,
     pending: HashMap<u32, oneshot::Sender<Packet>>,
-    read_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Transport {
     pub(super) fn new() -> Self {
         Self {
             send_order: Mutex::new(()),
-            #[cfg(test)]
-            ws_url: std::sync::Mutex::new(None),
             sink: Mutex::new(None),
             state: Mutex::new(TransportState {
                 next_seq: 1,
                 pending: HashMap::new(),
-                read_task: None,
             }),
         }
     }
 
     pub(super) async fn connect(
         &self,
-        owner: &Arc<InnerClient>,
-        connection: Arc<Connection>,
+        url: &str,
         header_user_agent: &str,
-    ) -> Result<()> {
-        self.close().await;
-        let next_seq = self.state.lock().await.next_seq;
-        tracing::info!(next_seq, url = WS_URL, "Opening Max WebSocket");
-        let url = WS_URL.to_string();
-        #[cfg(test)]
-        let url = self.ws_url.lock().unwrap().clone().unwrap_or(url);
+    ) -> Result<futures_util::stream::SplitStream<WsStream>> {
+        tracing::info!(url, "Opening Max WebSocket");
         let mut request = url.into_client_request()?;
         {
             let headers = request.headers_mut();
@@ -79,14 +65,11 @@ impl Transport {
         let (sink, read) = stream.split();
 
         *self.sink.lock().await = Some(sink);
-        let task = tokio::spawn(read_loop(read, Arc::clone(owner), connection));
-        self.state.lock().await.read_task = Some(task);
         tracing::info!(
-            next_seq,
             status = %response.status(),
             "Max WebSocket opened"
         );
-        Ok(())
+        Ok(read)
     }
 
     pub(super) async fn send(&self, packet: &Packet) -> Result<()> {
@@ -98,11 +81,6 @@ impl Transport {
             Err(_) => return Err(Error::Timeout(packet.opcode)),
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_test_url(&self, url: String) {
-        *self.ws_url.lock().unwrap() = Some(url);
     }
 
     pub(super) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
@@ -194,22 +172,9 @@ impl Transport {
         }
     }
 
-    pub(super) async fn is_connected(&self) -> bool {
-        let has_sink = self.sink.lock().await.is_some();
-        let state = self.state.lock().await;
-        has_sink
-            && state
-                .read_task
-                .as_ref()
-                .is_some_and(|task| !task.is_finished())
-    }
-
     pub(super) async fn close(&self) {
         {
             let mut state = self.state.lock().await;
-            if let Some(task) = state.read_task.take() {
-                task.abort();
-            }
             state.pending.clear();
         }
         self.sink.lock().await.take();
@@ -534,5 +499,55 @@ mod tests {
             .receive_response(Packet::response(2, 20, json!({ "ok": true })))
             .await;
         assert_eq!(waiting.await.unwrap().unwrap().payload["ok"], true);
+    }
+    #[tokio::test]
+    async fn cancelled_runner_finishes_reader_teardown_under_contention() {
+        use crate::client::recovery_tests::{
+            authenticated, local_client, wait_for_connection, Handler,
+        };
+
+        let (client, listener) = local_client().await;
+        let runner = tokio::spawn({
+            let client = client.clone();
+            async move { client.run(Handler).await }
+        });
+        let mut socket = authenticated(&listener).await;
+        wait_for_connection(&client, true).await;
+        let connection = client.inner.recovery.current().await.unwrap();
+        let sink = connection.transport.sink.lock().await;
+        socket.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection.cancelled())
+            .await
+            .unwrap();
+        let sending = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .send_text(7, crate::models::MaxMessage::new("waiting"))
+                    .await
+            }
+        });
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), sending)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(Error::ConnectionClosed)
+        ));
+        let disconnect = client.disconnect();
+        tokio::pin!(disconnect);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut disconnect)
+                .await
+                .is_err()
+        );
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(1), disconnect)
+            .await
+            .expect("supervisor must finish teardown after releasing the sink");
+        assert!(connection.transport.sink.lock().await.is_none());
+        assert!(connection.transport.state.lock().await.pending.is_empty());
     }
 }

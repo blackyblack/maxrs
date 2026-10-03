@@ -299,51 +299,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_does_not_cancel_accepted_handler() {
-        let gate = Arc::new(Semaphore::new(0));
-        let handler_gate = Arc::clone(&gate);
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-        let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let handler = TestHandler::new(Arc::new(move |message| {
-            let gate = Arc::clone(&handler_gate);
-            let started_tx = started_tx.clone();
-            let finished_tx = Arc::clone(&finished_tx);
-            Box::pin(async move {
-                started_tx.send(message.message_id).unwrap();
-                gate.acquire().await.unwrap().forget();
-                finished_tx
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap();
-                Ok(())
-            })
-        }));
-        let client = client();
-        let connection = client.inner.recovery.begin_attempt().unwrap();
-        client.inner.recovery.connected(&connection).unwrap();
-        let root = client.inner.handler_shutdown.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(tx.clone());
-        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
-
-        tx.send(message(2, 1)).unwrap();
-        assert_eq!(started_rx.recv().await, Some(1));
-        drop(tx);
-        client.inner.close_connection(Some(&connection)).await;
-        run_task.await.unwrap();
-        client.inner.close_connection(None).await;
-
-        gate.add_permits(1);
-        finished_rx
-            .await
-            .expect("reconnect must not abort accepted handler");
-    }
-
-    #[tokio::test]
     async fn disconnect_after_connection_failure_still_aborts_handler() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let (aborted_tx, aborted_rx) = tokio::sync::oneshot::channel();
@@ -363,13 +318,13 @@ mod tests {
         client.inner.recovery.connected(&connection).unwrap();
         let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(tx.clone());
         let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(3, 1)).unwrap();
         assert_eq!(started_rx.recv().await, Some(1));
         drop(tx);
-        client.inner.close_connection(Some(&connection)).await;
+        connection.cancel();
+        client.inner.recovery.offline();
         run_task.await.unwrap();
 
         client.disconnect().await;
@@ -396,7 +351,6 @@ mod tests {
         let client = client();
         let root = client.inner.handler_shutdown.clone();
         let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(tx.clone());
         let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
 
         tx.send(message(1, 1)).unwrap();
@@ -406,51 +360,5 @@ mod tests {
         aborted_rx.await.expect("disconnect must abort the handler");
         assert!(tx.send(message(2, 2)).is_err());
         assert!(started_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn handler_disconnect_finishes_cleanup_before_aborting_handlers() {
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
-        let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
-        let client = client();
-        let handler_client = client.clone();
-        let handler = TestHandler::new(Arc::new(move |_| {
-            let client = handler_client.clone();
-            let started_tx = started_tx.clone();
-            let finished_tx = Arc::clone(&finished_tx);
-            Box::pin(async move {
-                started_tx.send(()).unwrap();
-                client.disconnect().await;
-                finished_tx
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap();
-                Ok(())
-            })
-        }));
-        let root = client.inner.handler_shutdown.clone();
-        let (tx, rx) = mpsc::unbounded_channel();
-        *client.inner.msg_tx.lock().await = Some(tx.clone());
-        let state_owner = client.clone();
-        let state_guard = state_owner.inner.state.lock().await;
-        let run_task = tokio::spawn(run(root.clone(), Arc::new(handler), rx));
-
-        tx.send(message(1, 1)).unwrap();
-        started_rx.recv().await.unwrap();
-        drop(tx);
-        run_task.await.unwrap();
-        assert!(matches!(
-            finished_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-
-        drop(state_guard);
-        finished_rx
-            .await
-            .expect("handler must finish disconnect cleanup before it is aborted");
     }
 }

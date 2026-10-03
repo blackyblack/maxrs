@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::client::InnerClient;
+use crate::client::Connection;
 use crate::error::{Error, Result};
 use crate::protocol::opcode;
 
@@ -136,20 +136,20 @@ impl Default for AuthCaptchaConfig {
     }
 }
 
-impl InnerClient {
-    pub(crate) async fn login(inner: Arc<Self>, config: LoginConfig) -> Result<String> {
-        AuthFlow::new(inner, config).login().await
+impl Connection {
+    pub(crate) async fn login(connection: Arc<Self>, config: LoginConfig) -> Result<String> {
+        AuthFlow::new(connection, config).login().await
     }
 }
 
 struct AuthFlow {
-    inner: Arc<InnerClient>,
+    connection: Arc<Connection>,
     config: LoginConfig,
 }
 
 impl AuthFlow {
-    fn new(inner: Arc<InnerClient>, config: LoginConfig) -> Self {
-        Self { inner, config }
+    fn new(connection: Arc<Connection>, config: LoginConfig) -> Self {
+        Self { connection, config }
     }
 
     async fn login(&self) -> Result<String> {
@@ -191,7 +191,10 @@ impl AuthFlow {
         captcha_token: Option<&str>,
     ) -> Result<String> {
         let payload = sms_auth_request_payload(phone, captcha_token);
-        let response = self.inner.invoke(opcode::AUTH_REQUEST, payload).await?;
+        let response = self
+            .connection
+            .invoke(opcode::AUTH_REQUEST, payload)
+            .await?;
         response.payload["token"]
             .as_str()
             .map(|s| s.to_string())
@@ -204,7 +207,7 @@ impl AuthFlow {
             "identifier": phone,
         });
         let response = self
-            .inner
+            .connection
             .invoke(opcode::AUTH_CAPTCHA_REQUEST, payload)
             .await?;
         let captcha_link = response.payload["link"].as_str().unwrap_or_default();
@@ -237,7 +240,7 @@ impl AuthFlow {
             "verifyCode": code,
             "authTokenType": "CHECK_CODE",
         });
-        let response = self.inner.invoke(opcode::AUTH, payload).await?;
+        let response = self.connection.invoke(opcode::AUTH, payload).await?;
         if response.payload["passwordChallenge"].is_object() {
             let password = self
                 .config
@@ -257,7 +260,7 @@ impl AuthFlow {
             Error::UnexpectedResponse("missing password challenge trackId".into())
         })?;
         let response = self
-            .inner
+            .connection
             .invoke(
                 opcode::AUTH_PASSWORD,
                 json!({
@@ -289,9 +292,9 @@ impl AuthFlow {
             "draftsSync": 0,
             "chatsCount": 40,
         });
-        let response = self.inner.invoke(opcode::LOGIN, payload).await?;
+        let response = self.connection.invoke(opcode::LOGIN, payload).await?;
         let user_id = user_id_from_login_payload(&response.payload)?;
-        self.inner.set_own_user_id(user_id).await;
+        self.connection.set_own_user_id(user_id);
         Ok(token.to_string())
     }
 }
