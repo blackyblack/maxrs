@@ -1,68 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::{attachment_registry::AttachmentRegistry, transport::Transport};
+use super::connection::{is_transport_failure, Connection};
 use crate::error::{Error, Result};
-use crate::protocol::Packet;
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(120);
 pub(super) const HEALTHY_CONNECTION_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Resources belong to one socket generation, including during authentication.
-pub(crate) struct Connection {
-    pub(super) transport: Transport,
-    pub(super) attachment_registry: AttachmentRegistry,
-    pub(super) cancellation: CancellationToken,
-    own_user_id: Mutex<Option<i64>>,
-}
-
-impl Connection {
-    fn new(cancellation: CancellationToken) -> Self {
-        Self {
-            transport: Transport::new(),
-            attachment_registry: AttachmentRegistry::default(),
-            cancellation,
-            own_user_id: Mutex::new(None),
-        }
-    }
-
-    pub(super) async fn cancelled(&self) {
-        self.cancellation.cancelled().await;
-    }
-
-    pub(super) fn cancel(&self) {
-        self.cancellation.cancel();
-    }
-
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
-
-    pub(crate) fn set_own_user_id(&self, id: i64) {
-        *self.own_user_id.lock().expect("session user id") = Some(id);
-    }
-
-    pub(super) fn own_user_id(&self) -> Option<i64> {
-        *self.own_user_id.lock().expect("session user id")
-    }
-
-    pub(crate) async fn invoke(&self, opcode: u16, payload: Value) -> Result<Packet> {
-        let result = tokio::select! {
-            biased;
-            _ = self.cancelled() => return Err(Error::ConnectionClosed),
-            result = self.transport.invoke(opcode, payload) => result,
-        };
-        if result.as_ref().is_err_and(is_transport_failure) {
-            self.cancel();
-        }
-        result
-    }
-}
 
 #[derive(Clone)]
 enum State {
@@ -168,17 +115,6 @@ impl Backoff {
             self.reset();
         }
     }
-}
-
-pub(super) fn is_transport_failure(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::WebSocket(_)
-            | Error::WebSocketConnectTimeout
-            | Error::Timeout(_)
-            | Error::DuplicateSequence(_)
-            | Error::ConnectionClosed
-    )
 }
 
 pub(super) fn should_retry_connection(error: &Error) -> bool {

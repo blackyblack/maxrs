@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 #[derive(Default)]
-pub(super) struct AttachmentRegistry {
+pub struct AttachmentRegistry {
     waiters: Arc<Mutex<HashMap<i64, Registration>>>,
 }
 

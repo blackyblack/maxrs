@@ -25,7 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub(super) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
 
-pub(super) struct Transport {
+pub struct Transport {
     send_order: Mutex<()>,
     sink: Mutex<Option<WsSink>>,
     state: Mutex<TransportState>,

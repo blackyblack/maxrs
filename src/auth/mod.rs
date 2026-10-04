@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::client::Connection;
+use crate::client::connection::Connection;
 use crate::error::{Error, Result};
 use crate::protocol::opcode;
 

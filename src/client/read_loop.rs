@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::models::IncomingMessage;
 use crate::protocol::{opcode, Packet};
 
-use super::recovery::Connection;
+use super::connection::Connection;
 use super::transport::WsStream;
 
 const SECURITY_SERVICE_USER_ID: i64 = 543_835;

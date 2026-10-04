@@ -1,6 +1,7 @@
 //! The asynchronous Max client.
 
 mod attachment_registry;
+pub(crate) mod connection;
 mod dispatcher;
 mod read_loop;
 mod recovery;
@@ -28,7 +29,7 @@ use crate::protocol::opcode;
 #[cfg(test)]
 use crate::protocol::Packet;
 
-pub(crate) use self::recovery::Connection;
+use self::connection::Connection;
 
 /// Handles incoming messages dispatched by [`MaxClient`].
 pub trait ChatHandler: Send + Sync + 'static {
@@ -259,7 +260,7 @@ impl MaxClient {
             let connection = self.inner.recovery.current().await?;
             match connection.invoke(opcode::MSG_SEND, payload.clone()).await {
                 Ok(_) => return Ok(()),
-                Err(error) if recovery::is_transport_failure(&error) => {}
+                Err(error) if connection::is_transport_failure(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -288,7 +289,7 @@ impl MaxClient {
                 .await
             {
                 Ok(()) => return Ok(()),
-                Err(error) if recovery::is_transport_failure(&error) => {}
+                Err(error) if connection::is_transport_failure(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -296,7 +297,7 @@ impl MaxClient {
 
     async fn send_uploaded_file(
         &self,
-        connection: &Arc<recovery::Connection>,
+        connection: &Arc<Connection>,
         chat_id: i64,
         file_name: &str,
         bytes: &[u8],
