@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-struct Handler;
+pub(super) struct Handler;
 
 impl ChatHandler for Handler {
     async fn on_message(&self, _message: IncomingMessage) -> Result<()> {
@@ -22,14 +22,14 @@ fn config() -> LoginConfig {
     }
 }
 
-async fn local_client() -> (MaxClient, TcpListener) {
+pub(super) async fn local_client() -> (MaxClient, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = MaxClient::new(config()).unwrap();
     client.set_test_url(format!("ws://{}/", listener.local_addr().unwrap()));
     (client, listener)
 }
 
-async fn wait_for_connection(client: &MaxClient, expected: bool) {
+pub(super) async fn wait_for_connection(client: &MaxClient, expected: bool) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while client.inner.recovery.is_connected() != expected {
             tokio::task::yield_now().await;
@@ -52,7 +52,7 @@ async fn respond(
         .unwrap();
 }
 
-async fn authenticated(
+pub(super) async fn authenticated(
     listener: &TcpListener,
 ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
     let (socket, _) = listener.accept().await.unwrap();
@@ -338,8 +338,6 @@ fn only_temporary_authentication_service_failures_are_retried() {
 
 #[tokio::test]
 async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let (client, listener) = local_client().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upload_url = format!("http://{}/", http.local_addr().unwrap());
@@ -354,13 +352,7 @@ async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client(
             json!({"info": [{"url": upload_url, "fileId": 100}]}),
         )
         .await;
-        let (mut upload, _) = http.accept().await.unwrap();
-        let mut buffer = [0; 4096];
-        assert!(upload.read(&mut buffer).await.unwrap() > 0);
-        upload
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        receive_upload(&http, b"contents").await;
         uploaded.send(()).unwrap();
         let packet = next_packet(&mut socket).await;
         assert_eq!(packet.opcode, opcode::MSG_SEND);
@@ -380,10 +372,11 @@ async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client(
         }
     });
     uploaded_rx.await.unwrap();
-    assert_eq!(client.inner.attachment_registry.waiter_count(), 1);
+    let connection = client.inner.recovery.current().await.unwrap();
+    assert_eq!(connection.attachment_registry.waiter_count(), 1);
     sending.abort();
     assert!(sending.await.unwrap_err().is_cancelled());
-    assert_eq!(client.inner.attachment_registry.waiter_count(), 0);
+    assert_eq!(connection.attachment_registry.waiter_count(), 0);
     client
         .send_text(7, MaxMessage::new("ordinary request"))
         .await
@@ -395,7 +388,7 @@ async fn cancelled_upload_unregisters_attachment_waiter_without_stopping_client(
 
 #[tokio::test]
 async fn attachment_completion_survives_an_unrelated_notification_burst() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let (client, listener) = local_client().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -412,14 +405,7 @@ async fn attachment_completion_survives_an_unrelated_notification_burst() {
         )
         .await;
 
-        let (mut upload, _) = http.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.ends_with(b"contents") {
-            let mut buffer = [0; 4096];
-            let size = upload.read(&mut buffer).await.unwrap();
-            assert!(size > 0);
-            request.extend_from_slice(&buffer[..size]);
-        }
+        let mut upload = receive_upload_request(&http, b"contents").await;
 
         let attached = Packet::request(900, opcode::NOTIF_ATTACH, json!({"fileId": 100}));
         socket
@@ -466,8 +452,6 @@ async fn attachment_completion_survives_an_unrelated_notification_burst() {
 
 #[tokio::test]
 async fn reconnect_replays_an_in_flight_document_upload() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let (client, listener) = local_client().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upload_url = format!("http://{}/", http.local_addr().unwrap());
@@ -490,21 +474,7 @@ async fn reconnect_replays_an_in_flight_document_upload() {
         )
         .await;
 
-        let (mut upload, _) = http.accept().await.unwrap();
-        let mut request = Vec::new();
-        loop {
-            let mut buffer = [0; 4096];
-            let size = upload.read(&mut buffer).await.unwrap();
-            assert!(size > 0);
-            request.extend_from_slice(&buffer[..size]);
-            if request.ends_with(b"book contents") {
-                break;
-            }
-        }
-        upload
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        receive_upload(&http, b"book contents").await;
         let attached = Packet::request(999, opcode::NOTIF_ATTACH, json!({"fileId": 101}));
         second
             .send(Message::text(serde_json::to_string(&attached).unwrap()))
@@ -550,7 +520,7 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
             json!({"info": [{"url": upload_url, "fileId": 100}]}),
         )
         .await;
-        receive_upload(&http).await;
+        receive_upload(&http, b"book contents").await;
         first
             .send(Message::text(
                 serde_json::to_string(&Packet::request(
@@ -575,7 +545,7 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
             json!({"info": [{"url": upload_url, "fileId": 101}]}),
         )
         .await;
-        receive_upload(&http).await;
+        receive_upload(&http, b"book contents").await;
         second
             .send(Message::text(
                 serde_json::to_string(&Packet::request(
@@ -615,8 +585,11 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
     runner.await.unwrap().unwrap();
 }
 
-async fn receive_upload(listener: &TcpListener) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn receive_upload_request(
+    listener: &TcpListener,
+    expected_body: &[u8],
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncReadExt;
 
     let (mut upload, _) = listener.accept().await.unwrap();
     let mut request = Vec::new();
@@ -625,10 +598,20 @@ async fn receive_upload(listener: &TcpListener) {
         let size = upload.read(&mut buffer).await.unwrap();
         assert!(size > 0);
         request.extend_from_slice(&buffer[..size]);
-        if request.ends_with(b"book contents") {
-            break;
+        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            let body = &request[header_end + 4..];
+            if body.len() >= expected_body.len() {
+                assert_eq!(body, expected_body);
+                return upload;
+            }
         }
     }
+}
+
+async fn receive_upload(listener: &TcpListener, expected_body: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut upload = receive_upload_request(listener, expected_body).await;
     upload
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .await
@@ -651,4 +634,226 @@ async fn runner_rejects_competing_run_without_stopping_owner() {
     client.disconnect().await;
     runner.await.unwrap().unwrap();
     drop(socket);
+}
+
+#[tokio::test]
+async fn old_session_cannot_complete_requests_or_attachments_on_its_replacement() {
+    let (client, listener) = local_client().await;
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(Handler).await }
+    });
+    let first = authenticated(&listener).await;
+    wait_for_connection(&client, true).await;
+    let old = client.inner.recovery.current().await.unwrap();
+    drop(first);
+    let mut second = tokio::time::timeout(Duration::from_secs(3), authenticated(&listener))
+        .await
+        .unwrap();
+    wait_for_connection(&client, true).await;
+    let current = client.inner.recovery.current().await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &current));
+
+    let waiter = current.attachment_registry.register(42).unwrap();
+    old.attachment_registry.complete(42);
+    assert_eq!(current.attachment_registry.waiter_count(), 1);
+    let mut sending = tokio::spawn({
+        let client = client.clone();
+        async move { client.send_text(7, MaxMessage::new("new session")).await }
+    });
+    let packet = next_packet(&mut second).await;
+    old.transport
+        .receive_response(Packet::response(packet.seq, packet.opcode, json!({})))
+        .await;
+    old.cancel();
+    old.transport.close().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut sending)
+            .await
+            .is_err()
+    );
+    assert!(!current.is_cancelled());
+    assert!(matches!(
+        old.invoke(opcode::PING, json!({})).await,
+        Err(Error::ConnectionClosed)
+    ));
+    respond(&mut second, &packet, json!({})).await;
+    sending.await.unwrap().unwrap();
+    current.attachment_registry.complete(42);
+    waiter.wait().await;
+    client.disconnect().await;
+    runner.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn lost_socket_cancels_captcha_authentication_and_reconnects() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Bytes, service::service_fn, Response};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let solver = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = config();
+    config.session_token = None;
+    config.phone = Some("+79990000000".into());
+    config.operator = OperatorChannel::Cli;
+    config.captcha.solver_url = Some(format!("http://{}", solver.local_addr().unwrap()));
+    config.captcha.callback_bind = "127.0.0.1:0".into();
+    let client = MaxClient::new(config).unwrap();
+    client.set_test_url(format!("ws://{}/", listener.local_addr().unwrap()));
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let solver_task = tokio::spawn({
+        let requested = Arc::clone(&requested);
+        async move {
+            let (stream, _) = solver.accept().await.unwrap();
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                        let requested = Arc::clone(&requested);
+                        async move {
+                            assert_eq!(request.uri().path(), "/solve");
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            let payload: Value = serde_json::from_slice(&body).unwrap();
+                            assert!(payload["callbackUrl"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with("/captcha-callback"));
+                            requested.notify_one();
+                            // Accept, but never deliver a captcha callback.
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(202)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(Handler).await }
+    });
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut first = accept_async(stream).await.unwrap();
+    let init = next_packet(&mut first).await;
+    assert_eq!(init.opcode, opcode::SESSION_INIT);
+    respond(&mut first, &init, json!({})).await;
+    let mut sms = next_packet(&mut first).await;
+    assert_eq!(sms.opcode, opcode::AUTH_REQUEST);
+    sms.cmd = crate::protocol::CMD_ERROR;
+    sms.payload = json!({"error": "captcha required"});
+    first
+        .send(Message::text(serde_json::to_string(&sms).unwrap()))
+        .await
+        .unwrap();
+    let captcha = next_packet(&mut first).await;
+    assert_eq!(captcha.opcode, opcode::AUTH_CAPTCHA_REQUEST);
+    respond(
+        &mut first,
+        &captcha,
+        json!({"link": "https://captcha.example/challenge"}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), requested.notified())
+        .await
+        .unwrap();
+    first.close(None).await.unwrap();
+    drop(first);
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .expect("reconnect must not wait for the one-hour captcha timeout")
+        .unwrap();
+    let mut second = accept_async(stream).await.unwrap();
+    assert_eq!(next_packet(&mut second).await.opcode, opcode::SESSION_INIT);
+    client.disconnect().await;
+    runner.await.unwrap().unwrap();
+    solver_task.abort();
+}
+
+#[tokio::test]
+async fn accepted_handler_survives_reconnect_and_can_request_shutdown() {
+    struct ReplyHandler {
+        client: MaxClient,
+        release: Arc<tokio::sync::Semaphore>,
+        events: mpsc::UnboundedSender<&'static str>,
+    }
+    struct Finished(mpsc::UnboundedSender<&'static str>);
+    impl Drop for Finished {
+        fn drop(&mut self) {
+            let _ = self.0.send("finished");
+        }
+    }
+    impl ChatHandler for ReplyHandler {
+        async fn on_message(&self, message: IncomingMessage) -> Result<()> {
+            let _finished = Finished(self.events.clone());
+            self.events.send("started").unwrap();
+            self.release.acquire().await.unwrap().forget();
+            self.client
+                .send_text(message.chat_id, MaxMessage::new("reply after reconnect"))
+                .await?;
+            self.events.send("replied").unwrap();
+            self.client.disconnect().await;
+            Ok(())
+        }
+    }
+    let (client, listener) = local_client().await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (events, mut received) = mpsc::unbounded_channel();
+    let handler = ReplyHandler {
+        client: client.clone(),
+        release: Arc::clone(&release),
+        events,
+    };
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(handler).await }
+    });
+    let mut first = authenticated(&listener).await;
+    first
+        .send(Message::text(
+            serde_json::to_string(&Packet::request(
+                100,
+                opcode::NOTIF_MESSAGE,
+                json!({"chatId": 7, "message": {"id": 10, "sender": 99, "text": "request"}}),
+            ))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_packet(&mut first).await.cmd,
+        crate::protocol::CMD_RESPONSE
+    );
+    assert_eq!(received.recv().await, Some("started"));
+    drop(first);
+    let mut second = tokio::time::timeout(Duration::from_secs(3), authenticated(&listener))
+        .await
+        .unwrap();
+    release.add_permits(1);
+    let reply = tokio::time::timeout(Duration::from_secs(1), next_packet(&mut second))
+        .await
+        .unwrap();
+    assert_eq!(reply.payload["message"]["text"], "reply after reconnect");
+    respond(&mut second, &reply, json!({})).await;
+    assert_eq!(received.recv().await, Some("replied"));
+    tokio::time::timeout(Duration::from_secs(1), runner)
+        .await
+        .expect("a handler must be able to stop the runner without deadlock")
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.recv().await, Some("finished"));
+    // Shutdown has released the socket even though the client handle remains alive.
+    let closed = tokio::time::timeout(Duration::from_secs(1), second.next())
+        .await
+        .unwrap();
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
 }

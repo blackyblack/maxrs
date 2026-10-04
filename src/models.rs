@@ -61,22 +61,6 @@ pub struct IncomingMessage {
     pub time: i64,
 }
 
-/// The data that client needs from a successful `LOGIN`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoginData {
-    /// Logged-in user id.
-    pub own_user_id: i64,
-}
-
-/// The result of a successful login.
-#[derive(Debug, Clone)]
-pub struct LoginSession {
-    /// Long-lived session token. Keep it to re-login without SMS.
-    pub token: String,
-    /// Parsed `LOGIN` response data used by the client.
-    pub login_data: LoginData,
-}
-
 /// Outgoing text message with optional Max formatter elements.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaxMessage {

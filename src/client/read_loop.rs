@@ -2,21 +2,23 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::models::IncomingMessage;
 use crate::protocol::{opcode, Packet};
 
+use super::connection::Connection;
 use super::transport::WsStream;
-use super::{recovery::Connection, InnerClient};
 
 const SECURITY_SERVICE_USER_ID: i64 = 543_835;
 
 pub(super) async fn read_loop(
     mut read: futures_util::stream::SplitStream<WsStream>,
-    inner: Arc<InnerClient>,
+    messages: mpsc::UnboundedSender<IncomingMessage>,
     connection: Arc<Connection>,
 ) {
+    let _failure = connection.cancellation.clone().drop_guard();
     loop {
         let Some(frame) = read.next().await else {
             tracing::warn!("Max WebSocket stream ended without a close frame");
@@ -40,13 +42,11 @@ pub(super) async fn read_loop(
         };
 
         if packet.is_request() {
-            handle_server_request(&inner, &connection, packet).await;
+            handle_server_request(&connection, &messages, packet).await;
         } else {
-            inner.transport.receive_response(packet).await;
+            connection.transport.receive_response(packet).await;
         }
     }
-
-    inner.close_connection(Some(&connection)).await;
 }
 
 fn frame_text(
@@ -68,14 +68,14 @@ fn frame_text(
 }
 
 async fn handle_server_request(
-    inner: &Arc<InnerClient>,
     connection: &Arc<Connection>,
+    messages: &mpsc::UnboundedSender<IncomingMessage>,
     packet: Packet,
 ) {
     match packet.opcode {
         opcode::RECONNECT => {
             tracing::warn!("Max server requested reconnect");
-            inner.close_connection(Some(connection)).await;
+            connection.cancel();
         }
         opcode::NOTIF_MESSAGE => {
             if let Some(message) = parse_incoming(&packet.payload) {
@@ -85,17 +85,15 @@ async fn handle_server_request(
                     packet.opcode,
                     json!({ "chatId": message.chat_id, "messageId": message.message_id }),
                 );
-                let _ = inner.transport.send(&ack).await;
-                if !is_filtered_incoming_message(&message, inner.own_user_id().await) {
-                    if let Some(tx) = inner.msg_tx.lock().await.as_ref() {
-                        let _ = tx.send(message);
-                    }
+                let _ = connection.transport.send(&ack).await;
+                if !is_filtered_incoming_message(&message, connection.own_user_id()) {
+                    let _ = messages.send(message);
                 }
             }
         }
         opcode::NOTIF_ATTACH => {
             if let Some(file_id) = packet.payload["fileId"].as_i64() {
-                inner.attachment_registry.complete(file_id);
+                connection.attachment_registry.complete(file_id);
             }
         }
         _ => {}

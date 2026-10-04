@@ -41,8 +41,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Session token is stored in {SESSION_TOKEN_FILE} when refreshed.");
     println!("Listening for incoming messages (Ctrl-C to quit)...");
 
-    // Drop the pinned runner before disconnecting so a cancelled connection
-    // attempt cannot keep holding the connection lock during shutdown.
+    // Dropping run requests shutdown; disconnect waits for teardown.
     {
         let run = client.run(PrintHandler);
         tokio::pin!(run);
