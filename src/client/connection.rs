@@ -14,6 +14,7 @@ pub struct Connection {
     pub attachment_registry: AttachmentRegistry,
     pub cancellation: CancellationToken,
     own_user_id: Mutex<Option<i64>>,
+    pub last_heartbeat: Mutex<Option<tokio::time::Instant>>,
 }
 
 pub fn is_transport_failure(error: &Error) -> bool {
@@ -34,6 +35,7 @@ impl Connection {
             attachment_registry: AttachmentRegistry::default(),
             cancellation,
             own_user_id: Mutex::new(None),
+            last_heartbeat: Mutex::new(None),
         }
     }
 
