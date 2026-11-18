@@ -39,7 +39,7 @@ impl Default for UserAgent {
             os_version: "Linux".to_string(),
             device_name: "Chrome".to_string(),
             header_user_agent: BROWSER_USER_AGENT.to_string(),
-            app_version: "26.8.4".to_string(),
+            app_version: "26.11.9".to_string(),
             screen: "1080x1920 1.0x".to_string(),
             timezone: "Europe/Moscow".to_string(),
         }

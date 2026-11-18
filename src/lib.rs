@@ -1,5 +1,5 @@
 //! `maxrs` — a small asynchronous Rust client for the **Max** messenger,
-//! talking to the web WebSocket API at `wss://ws-api.oneme.ru/websocket`.
+//! talking to the web WebSocket API at `wss://api.oneme.ru/websocket`.
 //!
 //! # Example
 //!

@@ -24,8 +24,8 @@ pub(super) async fn read_loop(
             tracing::warn!("Max WebSocket stream ended without a close frame");
             break;
         };
-        let text = match frame_text(frame) {
-            Ok(Some(text)) => text,
+        let bytes = match frame_bytes(frame) {
+            Ok(Some(bytes)) => bytes,
             Ok(None) => continue,
             Err(reason) => {
                 tracing::warn!(%reason, "Max WebSocket read loop stopped");
@@ -33,11 +33,11 @@ pub(super) async fn read_loop(
             }
         };
 
-        let packet: Packet = match serde_json::from_str(&text) {
+        let packet: Packet = match Packet::decode(&bytes) {
             Ok(packet) => packet,
             Err(err) => {
                 tracing::warn!(%err, "failed to parse frame");
-                continue;
+                break;
             }
         };
 
@@ -49,12 +49,12 @@ pub(super) async fn read_loop(
     }
 }
 
-fn frame_text(
+fn frame_bytes(
     frame: Result<Message, tokio_tungstenite::tungstenite::Error>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     match frame {
-        Ok(Message::Text(text)) => Ok(Some(text.to_string())),
-        Ok(Message::Binary(bytes)) => Ok(String::from_utf8(bytes.to_vec()).ok()),
+        Ok(Message::Text(_)) => Err("unexpected MAX text frame".into()),
+        Ok(Message::Binary(bytes)) => Ok(Some(bytes)),
         Ok(Message::Close(Some(close))) => Err(format!(
             "Max WebSocket peer closed the connection: code={}, reason={}",
             close.code, close.reason
@@ -73,6 +73,12 @@ async fn handle_server_request(
     packet: Packet,
 ) {
     match packet.opcode {
+        opcode::PING => {
+            let _ = connection
+                .transport
+                .send(&Packet::response(packet.seq, packet.opcode, Value::Null))
+                .await;
+        }
         opcode::RECONNECT => {
             tracing::warn!("Max server requested reconnect");
             connection.cancel();
@@ -139,7 +145,7 @@ mod tests {
         };
 
         assert_eq!(
-            frame_text(Ok(Message::Close(Some(close)))),
+            frame_bytes(Ok(Message::Close(Some(close)))),
             Err("Max WebSocket peer closed the connection: code=1001, reason=maintenance".into())
         );
     }
@@ -147,7 +153,7 @@ mod tests {
     #[test]
     fn websocket_read_errors_are_preserved_for_logging() {
         assert_eq!(
-            frame_text(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)),
+            frame_bytes(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)),
             Err("Max WebSocket read failed: Connection closed normally".into())
         );
     }

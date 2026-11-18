@@ -6,25 +6,28 @@ guide (see *Sources* below).
 
 ## Transport
 
-- Endpoint: `wss://ws-api.oneme.ru/websocket`
+- Endpoint: `wss://api.oneme.ru/websocket`
 - Required header: `Origin: https://web.max.ru`
 - A browser-like `User-Agent` header is also sent.
 
 ## Frame format
 
-Every message is a JSON object:
+The [MAX web client](https://web.max.ru/) version 26.11.9 sends binary WebSocket
+messages. Each message starts with a 10-byte header in network byte order.
 
-```json
-{ "ver": 11, "cmd": 0, "seq": 1, "opcode": 6, "payload": { } }
-```
+| Offset | Bytes | Meaning |
+| ------ | ----- | ------- |
+| 0 | 1 | Wire version 10 |
+| 1 | 1 | Command (0 request, 1 response, 3 error) |
+| 2 | 2 | Sequence, starting at zero for a new connection |
+| 4 | 2 | Opcode |
+| 6 | 1 | LZ4 size multiplier, zero for uncompressed payload |
+| 7 | 3 | Transmitted payload length |
 
-| field   | type | meaning |
-| ------- | ---- | ------- |
-| `ver`   | int  | protocol version, currently `11` |
-| `cmd`   | int  | `0` request, `1` response, `3` error |
-| `seq`   | int  | incrementing id; responses echo the request's `seq` |
-| `opcode`| int  | operation code |
-| `payload`| obj | operation-specific body |
+An empty payload has length zero. Other payloads use MessagePack. Compressed
+payloads use a raw LZ4 block with a decoded size bounded by the transmitted
+length times the multiplier. Some IDs are MessagePack extension type 1
+containing a packed integer. Payload examples below use JSON notation.
 
 Keepalive: send `PING` (opcode 1) `{"interactive": false}` roughly every 30s so
 the server does not drop the connection.
@@ -51,7 +54,7 @@ the server does not drop the connection.
 1. **SESSION_INIT (6)**
 
    ```json
-   { "userAgent": { "deviceType": "WEB", "...": "..." }, "deviceId": "<uuid>" }
+   { "userAgent": { "deviceType": "WEB", "...": "..." }, "deviceId": "<uuid>", "clientSessionId": 1795000000000 }
    ```
 
    Some web auth attempts perform **AUTH_CAPTCHA_REQUEST (224)** before

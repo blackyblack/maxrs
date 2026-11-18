@@ -45,8 +45,10 @@ async fn respond(
     payload: Value,
 ) {
     socket
-        .send(Message::text(
-            serde_json::to_string(&Packet::response(packet.seq, packet.opcode, payload)).unwrap(),
+        .send(Message::binary(
+            Packet::response(packet.seq, packet.opcode, payload)
+                .encode()
+                .unwrap(),
         ))
         .await
         .unwrap();
@@ -78,8 +80,8 @@ async fn next_packet(
 ) -> Packet {
     loop {
         let message = socket.next().await.unwrap().unwrap();
-        if message.is_text() {
-            let packet: Packet = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        if message.is_binary() {
+            let packet: Packet = Packet::decode(&message.into_data()).unwrap();
             if packet.opcode == opcode::PING {
                 respond(socket, &packet, json!({})).await;
                 continue;
@@ -211,7 +213,7 @@ async fn permanent_send_error_does_not_retry_or_disconnect() {
         packet.cmd = crate::protocol::CMD_ERROR;
         packet.payload = json!({"error": "chat not found"});
         socket
-            .send(Message::text(serde_json::to_string(&packet).unwrap()))
+            .send(Message::binary(packet.encode().unwrap()))
             .await
             .unwrap();
         let next = next_packet(&mut socket).await;
@@ -409,14 +411,14 @@ async fn attachment_completion_survives_an_unrelated_notification_burst() {
 
         let attached = Packet::request(900, opcode::NOTIF_ATTACH, json!({"fileId": 100}));
         socket
-            .send(Message::text(serde_json::to_string(&attached).unwrap()))
+            .send(Message::binary(attached.encode().unwrap()))
             .await
             .unwrap();
         for file_id in 1_000..1_064 {
             let unrelated =
                 Packet::request(file_id, opcode::NOTIF_ATTACH, json!({"fileId": file_id}));
             socket
-                .send(Message::text(serde_json::to_string(&unrelated).unwrap()))
+                .send(Message::binary(unrelated.encode().unwrap()))
                 .await
                 .unwrap();
         }
@@ -477,7 +479,7 @@ async fn reconnect_replays_an_in_flight_document_upload() {
         receive_upload(&http, b"book contents").await;
         let attached = Packet::request(999, opcode::NOTIF_ATTACH, json!({"fileId": 101}));
         second
-            .send(Message::text(serde_json::to_string(&attached).unwrap()))
+            .send(Message::binary(attached.encode().unwrap()))
             .await
             .unwrap();
         let packet = next_packet(&mut second).await;
@@ -522,13 +524,10 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
         .await;
         receive_upload(&http, b"book contents").await;
         first
-            .send(Message::text(
-                serde_json::to_string(&Packet::request(
-                    998,
-                    opcode::NOTIF_ATTACH,
-                    json!({"fileId": 100}),
-                ))
-                .unwrap(),
+            .send(Message::binary(
+                Packet::request(998, opcode::NOTIF_ATTACH, json!({"fileId": 100}))
+                    .encode()
+                    .unwrap(),
             ))
             .await
             .unwrap();
@@ -547,13 +546,10 @@ async fn reconnect_replays_a_file_message_with_the_same_cid() {
         .await;
         receive_upload(&http, b"book contents").await;
         second
-            .send(Message::text(
-                serde_json::to_string(&Packet::request(
-                    999,
-                    opcode::NOTIF_ATTACH,
-                    json!({"fileId": 101}),
-                ))
-                .unwrap(),
+            .send(Message::binary(
+                Packet::request(999, opcode::NOTIF_ATTACH, json!({"fileId": 101}))
+                    .encode()
+                    .unwrap(),
             ))
             .await
             .unwrap();
@@ -749,7 +745,7 @@ async fn lost_socket_cancels_captcha_authentication_and_reconnects() {
     sms.cmd = crate::protocol::CMD_ERROR;
     sms.payload = json!({"error": "captcha required"});
     first
-        .send(Message::text(serde_json::to_string(&sms).unwrap()))
+        .send(Message::binary(sms.encode().unwrap()))
         .await
         .unwrap();
     let captcha = next_packet(&mut first).await;
@@ -816,12 +812,13 @@ async fn accepted_handler_survives_reconnect_and_can_request_shutdown() {
     });
     let mut first = authenticated(&listener).await;
     first
-        .send(Message::text(
-            serde_json::to_string(&Packet::request(
+        .send(Message::binary(
+            Packet::request(
                 100,
                 opcode::NOTIF_MESSAGE,
                 json!({"chatId": 7, "message": {"id": 10, "sender": 99, "text": "request"}}),
-            ))
+            )
+            .encode()
             .unwrap(),
         ))
         .await
@@ -900,7 +897,7 @@ async fn health_tracks_authenticated_heartbeat_disconnect_and_runner_cancellatio
         .unwrap()
         .unwrap()
         .unwrap();
-    let packet: Packet = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    let packet: Packet = Packet::decode(&message.into_data()).unwrap();
     assert_eq!(packet.opcode, opcode::PING);
     assert_eq!(packet.payload, json!({"interactive": false}));
     assert_eq!(
@@ -949,7 +946,7 @@ async fn health_clears_when_keepalive_is_not_acknowledged() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let packet: Packet = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    let packet: Packet = Packet::decode(&message.into_data()).unwrap();
     assert_eq!(packet.opcode, opcode::PING);
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(21)).await;

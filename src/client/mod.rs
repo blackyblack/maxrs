@@ -50,6 +50,7 @@ struct InnerClient {
     recovery: recovery::Recovery,
     handler_shutdown: CancellationToken,
     cid: Mutex<i64>,
+    client_session_id: i64,
     device_id: String,
     user_agent: UserAgent,
     http: reqwest::Client,
@@ -131,6 +132,7 @@ impl MaxClient {
             recovery: recovery::Recovery::new(),
             handler_shutdown: CancellationToken::new(),
             cid: Mutex::new(-chrono_millis()),
+            client_session_id: chrono_millis(),
             device_id: uuid::Uuid::new_v4().to_string(),
             user_agent,
             http,
@@ -164,7 +166,11 @@ impl MaxClient {
         connection
             .invoke(
                 opcode::SESSION_INIT,
-                session_init_payload(&self.inner.user_agent, &self.inner.device_id),
+                session_init_payload(
+                    &self.inner.user_agent,
+                    &self.inner.device_id,
+                    self.inner.client_session_id,
+                ),
             )
             .await?;
         attempt.tasks.spawn(keepalive(Arc::clone(&connection)));
@@ -412,9 +418,13 @@ async fn keepalive(connection: Arc<Connection>) {
     }
 }
 
-fn session_init_payload(user_agent: &UserAgent, device_id: &str) -> Value {
+fn session_init_payload(user_agent: &UserAgent, device_id: &str, client_session_id: i64) -> Value {
+    let mut agent = json!(user_agent);
+    agent["pushDeviceType"] = json!("WEBPUSH");
+    agent["isPwa"] = json!(false);
     json!({
-        "userAgent": user_agent,
+        "userAgent": agent,
+        "clientSessionId": client_session_id,
         "deviceId": device_id,
     })
 }
@@ -627,15 +637,16 @@ mod tests {
     #[test]
     fn session_init_payload_uses_supplied_device_id() {
         let user_agent = UserAgent::default();
-        let payload = session_init_payload(&user_agent, "stable-device-id");
+        let payload = session_init_payload(&user_agent, "stable-device-id", 1234);
 
+        assert_eq!(payload["clientSessionId"], 1234);
         assert_eq!(payload["deviceId"], "stable-device-id");
         assert_eq!(payload["userAgent"]["deviceType"], user_agent.device_type);
         assert_eq!(
             payload["userAgent"]["headerUserAgent"],
             user_agent.header_user_agent
         );
-        assert_eq!(payload["userAgent"]["appVersion"], "26.8.4");
+        assert_eq!(payload["userAgent"]["appVersion"], "26.11.9");
         assert_eq!(payload["userAgent"]["locale"], "ru");
         assert_eq!(payload["userAgent"]["deviceLocale"], "ru");
         assert_eq!(payload["userAgent"]["osVersion"], "Linux");

@@ -17,7 +17,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use crate::error::{Error, Result};
 use crate::protocol::{Packet, CMD_ERROR};
 
-pub(super) const WS_URL: &str = "wss://ws-api.oneme.ru/websocket";
+pub(super) const WS_URL: &str = "wss://api.oneme.ru/websocket";
 const ORIGIN: &str = "https://web.max.ru";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -42,7 +42,7 @@ impl Transport {
             send_order: Mutex::new(()),
             sink: Mutex::new(None),
             state: Mutex::new(TransportState {
-                next_seq: 1,
+                next_seq: 0,
                 pending: HashMap::new(),
             }),
         }
@@ -73,10 +73,10 @@ impl Transport {
     }
 
     pub(super) async fn send(&self, packet: &Packet) -> Result<()> {
-        let text = serde_json::to_string(packet)?;
+        let bytes = packet.encode()?;
         let mut sink = self.sink.lock().await;
         let sink = sink.as_mut().ok_or(Error::ConnectionClosed)?;
-        match tokio::time::timeout(DEFAULT_TIMEOUT, sink.send(Message::text(text))).await {
+        match tokio::time::timeout(DEFAULT_TIMEOUT, sink.send(Message::binary(bytes))).await {
             Ok(result) => result?,
             Err(_) => return Err(Error::Timeout(packet.opcode)),
         }
@@ -88,7 +88,10 @@ impl Transport {
         let seq = {
             let mut state = self.state.lock().await;
             let seq = state.next_seq;
-            state.next_seq = state.next_seq.wrapping_add(1);
+            state.next_seq = seq
+                .checked_add(1)
+                .filter(|seq| *seq <= i16::MAX as u32)
+                .ok_or(Error::ConnectionClosed)?;
             seq
         };
         let rx = self.register_and_send(seq, opcode, payload).await?;
@@ -227,13 +230,29 @@ mod tests {
         (transport, server)
     }
 
+    #[tokio::test]
+    async fn sends_binary_ping_frame() {
+        let (transport, mut server) = connected_transport().await;
+        transport
+            .send(&Packet::request(
+                1,
+                crate::protocol::opcode::PING,
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let frame = server.next().await.unwrap().unwrap();
+        assert!(frame.is_binary());
+        assert_eq!(frame.into_data(), [10, 0, 0, 1, 0, 1, 0, 0, 0, 0]);
+    }
+
     async fn next_request(server: &mut ServerStream) -> Packet {
         let message = tokio::time::timeout(Duration::from_secs(1), server.next())
             .await
             .expect("request timed out")
             .expect("stream closed")
             .expect("websocket error");
-        serde_json::from_str(message.to_text().unwrap()).unwrap()
+        Packet::decode(&message.into_data()).unwrap()
     }
 
     #[tokio::test]
@@ -325,7 +344,7 @@ mod tests {
         }
         assert_eq!(
             requests.iter().map(|packet| packet.seq).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![0, 1, 2, 3]
         );
 
         for packet in requests.into_iter().rev() {
