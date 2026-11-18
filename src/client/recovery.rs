@@ -76,6 +76,13 @@ impl Recovery {
         }
     }
 
+    pub(super) fn ready_connection(&self) -> Option<Arc<Connection>> {
+        match &*self.state.borrow() {
+            State::Ready(connection) if !connection.is_cancelled() => Some(Arc::clone(connection)),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn is_connected(&self) -> bool {
         matches!(&*self.state.borrow(), State::Ready(connection) if !connection.is_cancelled())

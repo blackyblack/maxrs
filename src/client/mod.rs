@@ -170,6 +170,7 @@ impl MaxClient {
         attempt.tasks.spawn(keepalive(Arc::clone(&connection)));
         let token = Connection::login(Arc::clone(&connection), config.clone()).await?;
         config.session_token = Some(token);
+        *connection.last_heartbeat.lock().expect("heartbeat") = Some(tokio::time::Instant::now());
         self.inner.recovery.connected(&connection)?;
         tracing::info!(device_id = %self.inner.device_id, "Max connection established");
         attempt.connected_at = Some(tokio::time::Instant::now());
@@ -247,6 +248,18 @@ impl MaxClient {
     #[cfg(test)]
     fn set_test_url(&self, url: String) {
         *self.inner.ws_url.lock().unwrap() = Some(url);
+    }
+
+    /// Latest authenticated login or acknowledged keepalive on the current connection.
+    /// Returns `None` while disconnected, authenticating, or stopped.
+    pub fn last_heartbeat(&self) -> Option<tokio::time::Instant> {
+        let connection = self.inner.recovery.ready_connection()?;
+        let heartbeat = *connection.last_heartbeat.lock().expect("heartbeat");
+        if connection.is_cancelled() {
+            None
+        } else {
+            heartbeat
+        }
     }
 
     /// Sends a text message to `chat_id`.
@@ -395,6 +408,7 @@ async fn keepalive(connection: Arc<Connection>) {
             tracing::warn!(%err, "Max keepalive failed");
             return;
         }
+        *connection.last_heartbeat.lock().expect("heartbeat") = Some(tokio::time::Instant::now());
     }
 }
 

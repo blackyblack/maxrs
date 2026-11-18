@@ -857,3 +857,105 @@ async fn accepted_handler_survives_reconnect_and_can_request_shutdown() {
         None | Some(Err(_)) | Some(Ok(Message::Close(_)))
     ));
 }
+
+#[tokio::test]
+async fn health_tracks_authenticated_heartbeat_disconnect_and_runner_cancellation() {
+    let (client, listener) = local_client().await;
+    assert!(client.last_heartbeat().is_none());
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(Handler).await }
+    });
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut socket = accept_async(socket).await.unwrap();
+    let init = next_packet(&mut socket).await;
+    assert_eq!(init.opcode, opcode::SESSION_INIT);
+    assert!(
+        client.last_heartbeat().is_none(),
+        "socket alone is not healthy"
+    );
+    respond(&mut socket, &init, json!({})).await;
+    let login_request = next_packet(&mut socket).await;
+    assert_eq!(login_request.opcode, opcode::LOGIN);
+    assert!(
+        client.last_heartbeat().is_none(),
+        "login must be acknowledged"
+    );
+    respond(
+        &mut socket,
+        &login_request,
+        json!({"profile": {"contact": {"id": 42}}}),
+    )
+    .await;
+    wait_for_connection(&client, true).await;
+    let login = client
+        .last_heartbeat()
+        .expect("authenticated login is healthy");
+
+    tokio::time::pause();
+    tokio::time::advance(KEEPALIVE_INTERVAL).await;
+    tokio::time::resume();
+    let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let packet: Packet = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    assert_eq!(packet.opcode, opcode::PING);
+    assert_eq!(packet.payload, json!({"interactive": false}));
+    assert_eq!(
+        client.last_heartbeat(),
+        Some(login),
+        "sending is not acknowledgement"
+    );
+    respond(&mut socket, &packet, json!({})).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.last_heartbeat() == Some(login) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(client.last_heartbeat().unwrap() > login);
+
+    socket.close(None).await.unwrap();
+    drop(socket);
+    wait_for_connection(&client, false).await;
+    assert!(client.last_heartbeat().is_none());
+    let _socket = authenticated(&listener).await;
+    wait_for_connection(&client, true).await;
+    assert!(client.last_heartbeat().is_some());
+    runner.abort();
+    let _ = runner.await;
+    assert!(client.last_heartbeat().is_none());
+    client.disconnect().await;
+}
+
+#[tokio::test]
+async fn health_clears_when_keepalive_is_not_acknowledged() {
+    let (client, listener) = local_client().await;
+    let runner = tokio::spawn({
+        let client = client.clone();
+        async move { client.run(Handler).await }
+    });
+    let mut socket = authenticated(&listener).await;
+    wait_for_connection(&client, true).await;
+    assert!(client.last_heartbeat().is_some());
+    tokio::time::pause();
+    tokio::time::advance(KEEPALIVE_INTERVAL).await;
+    tokio::time::resume();
+    let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let packet: Packet = serde_json::from_str(message.to_text().unwrap()).unwrap();
+    assert_eq!(packet.opcode, opcode::PING);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(21)).await;
+    tokio::time::resume();
+    wait_for_connection(&client, false).await;
+    assert!(client.last_heartbeat().is_none());
+    client.disconnect().await;
+    runner.await.unwrap().unwrap();
+}
